@@ -26,6 +26,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "chain"))
+import config  # noqa: E402
 from config import CFG as CONF  # noqa: E402  pr-chain.toml: paths.work etc.
 
 WORK = CONF.work
@@ -160,7 +161,7 @@ def running_chains():
 def read_prs_at_once():
     """flow.json limits.prs_at_once: how many PRs pick marks free (the loop's threads only add build slots above it)."""
     try:
-        v = json.loads((ROOT / "chain" / "flow.json").read_text())["limits"]["prs_at_once"]["value"]
+        v = config.load_flow()["limits"]["prs_at_once"]["value"]
         return v if v != -1 else None
     except (OSError, ValueError, KeyError, TypeError):
         return None
@@ -173,14 +174,14 @@ def read_threads():
         return 1
 
 
-PROMPT_DIR = PC / "prompts"
+PROMPT_DIR = config.PROMPTS_USER  # Save Prompt writes here; the kit copy stays the default
 PROMPT_USE = {"review.md": "review and audit agents", "review-fix.md": "added to the review brief: the reviewer fixes what it fails",
               "fix.md": "plain fixer (red CI, conflicts, gate findings, your comments)", "ui-review.md": "UI screenshot reviewer",
               "addendum.md": "merge-only addendum after main moves", "build.md": "issue builder", "scout.md": "issue scout"}
 
 
 def prompt_files():
-    return sorted(f for f in PROMPT_DIR.glob("*.md") if f.is_file())
+    return [config.prompt_file(n) for n in config.prompt_names()]
 
 
 def config_state():
@@ -277,9 +278,9 @@ def apply_config(body):
     if "save_prompt" in body:  # a stage brief; the old text is kept in prompts/.history, and no {{SLOT}} may disappear
         c = body["save_prompt"] if isinstance(body["save_prompt"], dict) else {}
         name, text = c.get("name"), c.get("text")
-        f = PROMPT_DIR / str(name)
-        if not isinstance(name, str) or f not in prompt_files():
+        if not isinstance(name, str) or name not in config.prompt_names():
             return False, "unknown prompt file"
+        f = config.prompt_file(name)
         if not isinstance(text, str) or not text.strip():
             return False, "a prompt cannot be empty"
         old = f.read_text()
@@ -287,9 +288,9 @@ def apply_config(body):
         if gone:
             return False, "the chain fills these slots and they are missing now: " + ", ".join(gone)
         hist = PROMPT_DIR / ".history"
-        hist.mkdir(exist_ok=True)
+        hist.mkdir(parents=True, exist_ok=True)
         (hist / f"{name}.{time.strftime('%Y%m%d-%H%M%S')}").write_text(old)
-        write_atomic(f, text if text.endswith("\n") else text + "\n")
+        write_atomic(PROMPT_DIR / name, text if text.endswith("\n") else text + "\n")  # the user's copy; the kit's stays as shipped
         return True, f"prompt saved: {name} (old copy in prompts/.history)"
     if "save_command" in body:
         c = body["save_command"] if isinstance(body["save_command"], dict) else {}
@@ -567,7 +568,7 @@ tok_cache = {}
 spend_cache = {"key": None, "runs": []}
 
 
-RATES_FILE = ROOT / "chain" / "rates.json"
+RATES_FILE = next((f for f in (config.PROMPTS_USER.parent / "rates.json",) if config.PROMPTS_USER != config.PROMPTS_BASE and f.exists()), ROOT / "chain" / "rates.json")  # your copy beside the config wins
 CODEX_SID = re.compile(r"session id:\s*([0-9a-f-]{36})")
 rates_cache = {"at": 0.0, "key": None, "data": {}}
 rollouts = {"at": 0.0, "map": {}}
@@ -1758,7 +1759,7 @@ class H(BaseHTTPRequestHandler):
             body, ctype = json.dumps(data).encode(), "application/json"
         elif self.path.split("?")[0].rstrip("/") == "/api/flow":  # the chain's program (pr-chain/flow.json); the wiki draws it
             try:
-                data = json.loads((ROOT / "chain" / "flow.json").read_text())
+                data = config.load_flow()
             except Exception as e:
                 data = {"error": str(e)[:300]}
             body, ctype = json.dumps(data).encode(), "application/json"

@@ -57,6 +57,7 @@ from pathlib import Path
 os.environ.setdefault("KIT_AGENT", "pr-chain")
 ROOT = Path(__file__).resolve().parents[1]          # the pr-chain-kit repo root
 sys.path.insert(0, str(ROOT / "chain"))
+import config  # noqa: E402
 from config import CFG, kit_env_defaults  # noqa: E402  one pr-chain.toml holds every project value
 kit_env_defaults()                                 # KIT_* env defaults from the toml, before kit reads them
 os.environ.setdefault("KIT_WORK", str(CFG.work))
@@ -65,7 +66,7 @@ import kit  # noqa: E402
 import chain_engine  # noqa: E402  the chain runs flow.json (chain/ENGINE.md)
 
 CHAIN = ROOT / "chain"                          # the engine folder: flow.json, prompts/, models.json, ...
-PROMPTS = CHAIN / "prompts"
+PROMPTS = config.PROMPTS_BASE  # read prompts through config.prompt_file(): a user-edited copy wins
 WORK = kit.WORK
 # Every chain worktree lives in one folder, so disk use is in one place.
 WT_ROOT = CFG.worktree_root
@@ -115,7 +116,7 @@ MARK = "<!-- pr-chain:"                     # every comment the chain posts star
 SHOTS_BRANCH = "pr-chain-shots"             # orphan branch that only holds screenshots for human-gate comments
 SHOTS_REPO = WORK / "shots-repo"
 HUMAN_LABEL = CFG.human_label
-FLOW = json.loads((CHAIN / "flow.json").read_text())  # the step graph: every node, outcome and end state; limits come from here
+FLOW = config.load_flow()  # the step graph: every node, outcome and end state; limits come from here
 LIM = {k: math.inf if v["value"] < 0 else v["value"] for k, v in FLOW["limits"].items()}  # -1 = no limit; test_flow.py keeps them in sync
 CAPS = {k: math.inf if v < 0 else v for k, v in FLOW["agent_calls"].items()}  # tool calls per stage, told to the agent in its brief
 _t = float(os.environ.get("CHAIN_AGENT_TIMEOUT") or LIM["agent_timeout_minutes"] * 60)
@@ -873,14 +874,14 @@ def src_path(wt):
 
 
 def render(tpl, **kv):
-    text = (PROMPTS / tpl).read_text()
+    text = config.prompt_file(tpl).read_text()
     for k, v in {"{{ENV}}": "".join(f" {a}={b}" for a, b in CFG.agent_env.items()),   # extra env from pr-chain.toml [agent]
                  "{{RULES_DOC}}": CFG.rules_doc,                                      # the repo's own contributor rules
                  "{{FE}}": CFG.ui_frontend_dir, "{{FRAG_DIR}}": CFG.fragment_dir,
                  "{{PW_CACHE}}": (f"PLAYWRIGHT_BROWSERS_PATH={CFG.playwright_browsers} " if CFG.playwright_browsers else "")}.items():
         text = text.replace(k, v)
     if "{{GUIDE}}" in text:  # the shared field guide every stage gets; it uses the same placeholders as the briefs
-        guide = (PROMPTS / "field-guide.md").read_text().strip()
+        guide = config.prompt_file("field-guide.md").read_text().strip()
         if CFG.field_guide and CFG.field_guide.exists():  # the per-project section: repo map, local check commands
             guide += "\n\n" + CFG.field_guide.read_text().strip()
         text = text.replace("{{GUIDE}}", guide)
@@ -1071,7 +1072,7 @@ def post_verdict(pr, kind, head, main, vp):
 
 def judged_by_current_rules(vp):
     """True when no prompt or field-guide file (generic or per-project) changed after the verdict file was written."""
-    files = list(PROMPTS.glob("*.md")) + ([CFG.field_guide] if CFG.field_guide and CFG.field_guide.exists() else [])
+    files = [config.prompt_file(n) for n in config.prompt_names()] + ([CFG.field_guide] if CFG.field_guide and CFG.field_guide.exists() else [])
     return vp.stat().st_mtime >= max(f.stat().st_mtime for f in files)
 
 

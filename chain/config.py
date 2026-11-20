@@ -9,6 +9,7 @@ defaults; examples/kollab/pr-chain.toml reproduces the original hard-coded setup
 from __future__ import annotations
 
 import os
+import json
 import tomllib
 from pathlib import Path
 
@@ -53,6 +54,7 @@ class Cfg:
         trip = data.get("tripwire", {})
         proj = data.get("project", {})
         notify = data.get("notify", {})
+        self.limits = dict(data.get("limits", {}))  # overrides flow.json limits.<name>.value, e.g. prs_at_once = 12
 
         self.slug = os.environ.get("KIT_REPO") or repo.get("slug", "owner/name")
         self.owner, self.name = self.slug.split("/", 1)
@@ -107,6 +109,33 @@ CFG_PATH = _cfg_path()
 if os.environ.get("PR_CHAIN_CONFIG") and not CFG_PATH.exists():
     raise SystemExit(f"PR_CHAIN_CONFIG points at {CFG_PATH}, which does not exist")
 CFG = Cfg(tomllib.loads(CFG_PATH.read_text()) if CFG_PATH.exists() else {})
+
+
+FLOW_FILE = Path(os.environ.get("PR_CHAIN_FLOW") or CHAIN_DIR / "flow.json")  # PR_CHAIN_FLOW: try a variant
+PROMPTS_BASE = CHAIN_DIR / "prompts"
+# Prompt edits (board Save Prompt) go beside the config, so an installed kit keeps them across upgrades and a prompt
+# nobody edited still updates with the kit. From a clone (config inside the kit) edits go to chain/prompts itself.
+PROMPTS_USER = PROMPTS_BASE if ROOT in CFG_PATH.resolve().parents else CFG_PATH.resolve().parent / "prompts"
+
+
+def prompt_file(name: str) -> Path:
+    """The prompt the chain uses: the user's edited copy when there is one, else the kit's."""
+    mine = PROMPTS_USER / name
+    return mine if mine.is_file() else PROMPTS_BASE / name
+
+
+def prompt_names() -> list:
+    return sorted({f.name for d in (PROMPTS_BASE, PROMPTS_USER) if d.is_dir() for f in d.glob("*.md") if f.is_file()})
+
+
+def load_flow() -> dict:
+    """flow.json with pr-chain.toml [limits] applied on top (the flow itself always comes from the kit)."""
+    flow = json.loads(FLOW_FILE.read_text())
+    for k, v in CFG.limits.items():
+        if k not in flow["limits"]:
+            raise SystemExit(f"pr-chain.toml [limits] {k}: not a flow.json limit (known: {', '.join(sorted(flow['limits']))})")
+        flow["limits"][k]["value"] = v
+    return flow
 
 
 def kit_env_defaults():

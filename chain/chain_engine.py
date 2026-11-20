@@ -8,7 +8,8 @@ from types import SimpleNamespace
 
 import chain_steps
 
-FLOW_PATH = Path(os.environ.get("PR_CHAIN_FLOW") or Path(__file__).resolve().with_name("flow.json"))  # PR_CHAIN_FLOW: try a variant
+import config  # noqa: E402
+FLOW_PATH = config.FLOW_FILE  # PR_CHAIN_FLOW: try a variant; [limits] in pr-chain.toml applies on top
 
 
 class Live:
@@ -45,7 +46,7 @@ def check(flow):
 
 def run(g, pr, a, from_gate=False, approved=None, seed=None, flow=None):
     pc = Live(g)
-    flow = flow or json.loads(FLOW_PATH.read_text())
+    flow = flow or config.load_flow()
     problems = check(flow)
     if problems:
         return pc.die(pr, "ERROR", "flow.json: " + "; ".join(problems)[:300])

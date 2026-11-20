@@ -60,14 +60,15 @@ check("carried: a later FAIL voids the PASS -> None", pc.carried_pass(900, merge
 check("carried: a PR with no verdicts -> None", pc.carried_pass(901, merged), None)
 
 # ---- A2b. a stored FAIL is replayed only while no prompt or field-guide file is newer than it (#1055, 11-16)
-pd = tmp / "prompts"; pd.mkdir(); real_prompts, pc.PROMPTS = pc.PROMPTS, pd
+pd = tmp / "prompts"; pd.mkdir(); real_prompts = (pc.config.PROMPTS_BASE, pc.config.PROMPTS_USER)
+pc.config.PROMPTS_BASE = pc.config.PROMPTS_USER = pd
 (pd / "field-guide.md").write_text("g\n"); os.utime(pd / "field-guide.md", (_t.time() - 100,) * 2)
 v_old, v_new = tmp / "v-old.md", tmp / "v-new.md"
 for f, age in ((v_old, 200), (v_new, 50)):
     f.write_text("FAIL\nhead x\n"); os.utime(f, (_t.time() - age,) * 2)
 check("stale FAIL (older than the guide) is judged again", pc.judged_by_current_rules(v_old), False)
 check("FAIL written after the last prompt edit is replayed", pc.judged_by_current_rules(v_new), True)
-pc.PROMPTS = real_prompts
+pc.config.PROMPTS_BASE, pc.config.PROMPTS_USER = real_prompts
 
 # ---- A3. file_followups: one issue per distinct item, priority label from the P level, never filed twice
 calls, real_sh = [], pc.sh

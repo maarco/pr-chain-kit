@@ -38,6 +38,8 @@ writes `~/.config/pr-chain/pr-chain.toml`, and checks that `gh`, `git` and an ag
 |---|---|
 | Your config | `~/.config/pr-chain/pr-chain.toml` (`PR_CHAIN_CONFIG` overrides it) |
 | Model choice per stage | `~/.config/pr-chain/models.json`, `commands.json`, `profiles.json` |
+| Prompts you edit on the board | `~/.config/pr-chain/prompts/<name>.md`; prompts you never edited keep updating with the kit |
+| Limits (PRs at once, rounds...) | `[limits]` in your `pr-chain.toml` |
 | Run history, per-PR state, agent logs | `~/.local/state/pr-chain/work` |
 | One checkout of your repo per stage | `~/.local/state/pr-chain/wt`, removed when a chain ends |
 | The kit's own files | `pr-chain path` prints it |
@@ -55,7 +57,8 @@ nohup pr-chain loop &              # run continuously
 (With `uvx`, put `uvx pr-chain` where these say `pr-chain`.)
 
 Working from a clone instead: run `python3 -B bin/pr-chain ...` and put your config in
-`pr-chain.local.toml` at the repo root. It is gitignored and wins over `~/.config/pr-chain/`.
+`pr-chain.local.toml` at the repo root. It is gitignored and wins over `~/.config/pr-chain/`. From a clone, board
+prompt edits go straight into `chain/prompts/`.
 
 ## What your repo needs
 
@@ -74,7 +77,7 @@ Working from a clone instead: run `python3 -B bin/pr-chain ...` and put your con
 | `[agent] require_sandbox` | Reviewers run under macOS `sandbox-exec` with writes to the checkout denied. On Linux set this to `false`: then a reviewer that changed the worktree has its verdict thrown out. |
 | `[ui] enabled` | `false` skips UI review, screenshots and the app stack. |
 | `[notify] command` | Pages you when the loop is down, called with one message argument. |
-| `chain/flow.json` | Every stage, limit and end state. `limits.prs_at_once` caps how many PRs run at once. With `uvx` it lives inside the package: edits there are lost on upgrade. |
+| `[limits]` | Overrides any limit in `chain/flow.json`, e.g. `prs_at_once = 3` (PRs worked on at once) or `max_rounds = 4`. An unknown name is an error. |
 
 Agents run unattended with permission prompts off (`--dangerously-skip-permissions` /
 `--dangerously-bypass-approvals-and-sandbox` in `chain/commands.json`). Run the chain on a machine

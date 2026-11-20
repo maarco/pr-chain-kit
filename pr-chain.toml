@@ -67,5 +67,11 @@ settings_file = ""
 # paths/ports. The generic guide (chain/prompts/field-guide.md) plus this file is what every stage reads.
 field_guide = ""
 
+[limits]
+# Overrides for chain/flow.json limits (the names are the keys of its "limits" block). Kept here so an upgrade of
+# the kit never loses them, while the flow itself stays the kit's current version. -1 means no limit.
+# prs_at_once = 3        # PRs the chain works on at the same time
+# max_rounds = 4         # review/fix rounds per run
+
 [notify]
 command = ""                         # pages you when the loop is down (called with one message argument); empty = off

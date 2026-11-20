@@ -107,7 +107,7 @@ check("limits: -1 reads as no limit", [k for k, v in limits.items() if v["value"
 check("agent timeout -1 means no timeout", (limits.get("agent_timeout_minutes", {}).get("value"), getattr(pc, "AGENT_TIMEOUT", "missing")), (-1, None))
 check("engine: --max-rounds -1 is no limit", chain_engine.limit_of(types.SimpleNamespace(a=types.SimpleNamespace(max_rounds=-1), pc=pc), "max_rounds"), math.inf)
 (tmp / "p").mkdir(); (tmp / "p" / "t.md").write_text("{{CALLS_RULE}}")
-pc.PROMPTS = tmp / "p"
+pc.config.PROMPTS_BASE = pc.config.PROMPTS_USER = tmp / "p"
 check("brief: no limit says so, never 'inf tool calls'", pc.render("t.md", CALLS=math.inf, CALLS_SOFT=math.inf).startswith("No tool-call limit"), True)
 check("brief: a set budget still reads as a number", pc.render("t.md", CALLS=80, CALLS_SOFT=72).startswith("You have 80 tool calls. At 72"), True)
 check("no brief states its own call budget: every one uses {{CALLS_RULE}}", sorted(f.name for f in (root / "chain/prompts").glob("*.md")

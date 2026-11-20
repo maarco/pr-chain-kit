@@ -75,3 +75,21 @@ whose `[accounts] authors` are those two public accounts; no other personal data
   `pick` listed 3 PRs and named a next target. A dry `run` there needs a local checkout and was not done.
 - Tests now run against `chain/tests/test-config.toml` (the kollab example with neutral accounts `owner`/`bot`):
   13/13 pass.
+
+## 4. Installed package (uvx)
+
+Built with `uv build`, run with `uvx --from dist/pr_chain-0.1.0-py3-none-any.whl pr-chain ...` and a scratch
+`XDG_CONFIG_HOME` / `XDG_STATE_HOME`:
+
+```
+pr-chain init                      # wrote ~/.config/pr-chain/pr-chain.toml + models/commands/profiles.json
+pr-chain pick                      # rc=0, read the configured repo
+pr-chain run <pr> --dry-run        # RESULT: NOT-OURS for a PR by an account not in [accounts] authors
+pr-chain board 8796                # /, /prs, /wiki, /config and /three/three.module.js all 200
+[limits] prs_at_once = 5           # board /api/config reports prs_at_once 5
+POST /api/config save_prompt fix.md
+  -> ~/.config/pr-chain/prompts/fix.md holds the edit, old text in prompts/.history/
+  -> the packaged chain/prompts/fix.md is unchanged
+```
+
+`chain/tests/test_user_overrides.py` covers the same rules without a build.

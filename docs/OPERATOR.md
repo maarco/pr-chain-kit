@@ -2,22 +2,25 @@
 
 One PR at a time. Every stage is a NEW agent, so nothing reviews or fixes its own work. The script (not
 the agents) pushes, posts and merges. This guide is the generic version of the operator skill the chain
-was run with in production; paths below are this repo's layout, and every project-specific value lives in
-`pr-chain.toml` (see `chain/config.py`).
+was run with in production. Commands are written `pr-chain ...` (installed with `uvx`/`uv tool install`); from
+a clone use `python3 -B bin/pr-chain ...`. Every project-specific value lives in one `pr-chain.toml` (see
+`chain/config.py`); kit paths below are relative to the kit (`pr-chain path` prints it).
 
 ## Where it lives
 
 | Thing | Path |
 |---|---|
+| The command | `pr-chain` (`pr_chain_kit/cli.py`): `init`, `board`, `loop`, `janitor`, `path`; anything else goes to `bin/pr-chain` |
 | The script | `bin/pr-chain` |
 | Continuous runner | `bin/pr-chain-loop` |
 | Read-only web board | `bin/pr-chain-board` → http://127.0.0.1:8790 |
-| Prompts, model config, rates, tests, board pages | `chain/` (`prompts/`, `models.json`, `commands.json`, `rates.json`, `tests/`, `board/`) |
+| Prompts, model config, rates, tests, board pages | the kit's `chain/` (`prompts/`, `models.json`, `commands.json`, `rates.json`, `tests/`, `board/`) |
+| Your changes (kept across upgrades) | beside your config: `models.json`, `commands.json`, `profiles.json` (`[paths] models_file`), `prompts/<name>.md` (edited prompts), `rates.json`, and `[limits]` inside `pr-chain.toml` |
 | What every agent is told | `chain/prompts/field-guide.md` plus the per-project file `pr-chain.toml [project] field_guide` points to |
-| Every limit, label, end state and agent budget | `chain/flow.json` (`limits`, `labels`, `end_states`, `agent_calls`, `intake`, `nodes`) |
+| Every limit, label, end state and agent budget | `chain/flow.json` (`limits`, `labels`, `end_states`, `agent_calls`, `intake`, `nodes`); `[limits]` in `pr-chain.toml` overrides any `limits` value |
 | Flow engine, built and OFF | `chain/chain_engine.py`, `chain_steps.py`, design `chain/ENGINE.md` |
-| Config | `pr-chain.toml` (env `PR_CHAIN_CONFIG`), worked example `examples/kollab/` |
-| All run state | the `[paths] work` folder (ledger.jsonl, prs/<n>/, logs/, focus.json) |
+| Config | `PR_CHAIN_CONFIG`, else `pr-chain.local.toml` in a clone, else `~/.config/pr-chain/pr-chain.toml` (written by `pr-chain init`); template `pr-chain.toml`, worked example `examples/kollab/` |
+| All run state | the `[paths] work` folder, default `~/.local/state/pr-chain/work` (ledger.jsonl, prs/<n>/, logs/, focus.json); worktrees in `~/.local/state/pr-chain/wt` |
 | Shared helpers | `agent-kit/` (`kit.py`, `land/fold.py`, `land/land_pr.py`, `land/changelog_merge.py`) |
 | Worktree cleanup for non-chain lanes | `bin/worktree-janitor` |
 | Design history and known weak spots | `docs/design.md` |
@@ -45,7 +48,7 @@ was run with in production; paths below are this repo's layout, and every projec
 
 ## What each agent is told
 
-A brief is the stage's file in `chain/prompts/` with `field-guide.md` (plus the per-project guide from
+A brief is the stage's file in `chain/prompts/` (or your edited copy in `prompts/` beside your config, which wins) with `field-guide.md` (plus the per-project guide from
 `pr-chain.toml`) inlined where the file says `{{GUIDE}}`. `addendum.md` and `scout.md` carry no guide.
 The brief an agent actually got is `brief.md` in its round folder under `<work>/prs/<n>/`.
 
@@ -88,37 +91,41 @@ audit. Suffixes `.old<digits>` / `.stale<digits>` are earlier tries kept for the
 ## Commands
 
 ```bash
-python3 -B bin/pr-chain pick                 # which PR is next and who owns the rest (--all shows skipped rows)
-python3 -B bin/pr-chain run 970 --land       # the loop: review/fix/audit/UI/CI/merge
-python3 -B bin/pr-chain land 970 --land      # skip review/fix: gate + land at the current head
-python3 -B bin/pr-chain resume               # PRs waiting on a person
-python3 -B bin/pr-chain status               # one line per PR the chain has touched
-python3 -B bin/pr-chain models               # effective model per stage and its source
-python3 -B bin/pr-chain clean 970            # remove leftover worktrees (never --force)
+pr-chain init                 # write ~/.config/pr-chain/pr-chain.toml and check gh, git and an agent CLI
+pr-chain pick                 # which PR is next and who owns the rest (--all shows skipped rows)
+pr-chain run 970 --land       # the loop: review/fix/audit/UI/CI/merge
+pr-chain land 970 --land      # skip review/fix: gate + land at the current head
+pr-chain resume               # PRs waiting on a person
+pr-chain status               # one line per PR the chain has touched
+pr-chain models               # effective model per stage and its source
+pr-chain clean 970            # remove leftover worktrees (never --force)
+pr-chain path                 # where the kit's own files live
 ```
 
 - `run <pr>` without `--land` stops at `READY`. `--dry-run` launches nothing.
 - `auto` takes the first free PR; with none it builds the first free issue into a DRAFT PR; with none it
   scouts. A `NO-BUILD` file in the work folder switches issue building off.
-- Model for a stage: CLI flag > env `PR_CHAIN_<ROLE>_MODEL` > `chain/models.json` > built-in default. The shipped `chain/models.json` uses Claude CLI commands (Sonnet for work stages, Opus for the gate); the kollab setup (Codex) is `examples/kollab/models.json`, picked with `PR_CHAIN_MODELS_FILE=examples/kollab/models.json`.
+- Model for a stage: CLI flag > env `PR_CHAIN_<ROLE>_MODEL` > the models file (`[paths] models_file`, env `PR_CHAIN_MODELS_FILE`; `pr-chain init` copies the kit's to `~/.config/pr-chain/`) > built-in default. The shipped `chain/models.json` uses Claude CLI commands (Sonnet for work stages, Opus for the gate); the kollab setup (Codex) is `examples/kollab/models.json`.
   A `cmd:<name>` value runs the full command stored under that name in `chain/commands.json` (must
-  contain `<brief.md>`; editable on the board /config page; profiles in `chain/profiles.json`).
+  contain `<brief.md>`; editable on the board /config page; profiles in `profiles.json`). Both sit beside the models file.
 
 ## Loop and board
 
 Check one copy of each is enough: `pgrep -fl "pr-chain-loop|pr-chain-board"`.
 
 ```bash
-nohup python3 -B bin/pr-chain-loop >> "<work>/logs/loop.log" 2>&1 &
-nohup python3 -B bin/pr-chain-board 8790 >> "<work>/logs/board.log" 2>&1 &
+nohup pr-chain loop >> "<work>/logs/loop.log" 2>&1 &
+nohup pr-chain board 8790 >> "<work>/logs/board.log" 2>&1 &
 ```
 
 - Start the loop from a shell whose `python3` is your system interpreter, not an activated project venv.
 - Each loop lap: `resume`, `pick`, `run <first FREE PR> --land`; no free PR → `auto` if a slot is free,
   else look again in 10 minutes. A PR is tried at most twice per 6 hours.
 - Threads: `<work>/board-config.json` `{"threads": 1..4}`, editable on the board. `pick` marks only
-  `flow.json` `limits.prs_at_once` PRs free; with `prs_at_once` 1, threads above 1 run nothing.
-- The board (pages `/`, `/prs`, `/issues`, `/spend`, `/wiki`; JSON under `/api/`) never writes to GitHub.
+  `limits.prs_at_once` PRs free (set it with `[limits] prs_at_once` in `pr-chain.toml`); with 1, threads above 1 run nothing.
+- The board (pages `/`, `/prs`, `/issues`, `/spend`, `/wiki`, `/config`; JSON under `/api/`) never writes to GitHub.
+  Save Prompt on `/wiki` writes your copy in `prompts/` beside your config (old text in `prompts/.history/`);
+  from a clone it edits `chain/prompts/` directly.
 
 ## Guards
 

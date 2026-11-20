@@ -5,7 +5,7 @@ description of it. Editing flow.json changes the chain without a Python change.
 
 ## What lives where
 
-| flow.json (the operator edits) | Python (`pr-chain/steps.py`) |
+| flow.json (the kit's program; `[limits]` in pr-chain.toml overrides its limits) | Python (`pr-chain/steps.py`) |
 |---|---|
 | which step runs next, for every outcome | the body of each step kind: run an agent, merge main, read CI, merge |
 | entry points (run, land, approved, seed) | each step returns one outcome word, plus a reason when it ends the run |
