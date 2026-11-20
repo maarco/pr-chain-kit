@@ -1,12 +1,28 @@
 [project]
 name = "pr-chain"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Walk GitHub pull requests through review, fix, audit, UI review, CI and merge, with a fresh AI agent per stage"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = []
+keywords = ["github", "pull-requests", "code-review", "ai-agents", "ci"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Topic :: Software Development :: Quality Assurance",
+]
+
+[project.urls]
+Homepage = "https://github.com/OWNER/pr-chain-kit"
+Issues = "https://github.com/OWNER/pr-chain-kit/issues"
+Changelog = "https://github.com/OWNER/pr-chain-kit/blob/main/CHANGELOG.md"
 
 [project.scripts]
 pr-chain = "pr_chain_kit.cli:main"
@@ -14,6 +30,9 @@ pr-chain = "pr_chain_kit.cli:main"
 [build-system]
 requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "pr_chain_kit/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["pr_chain_kit"]

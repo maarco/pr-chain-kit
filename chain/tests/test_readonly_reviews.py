@@ -82,12 +82,31 @@ try:
     pc.cfg_snapshot = lambda: {}
     pc.cfg_damage = lambda before, after: ([], [])
     pc.ledger = lambda **row: None
-    result = pc.run_agent("gate", "test-model", output / "brief.md", stage_wt, output, 1)
-    check("review runner completes its bounded probe", result["rc"], 0)
-    check("reviewer cannot write to the main checkout", protected_paths[0].exists(), False)
-    check("reviewer cannot write to its pinned worktree", protected_paths[1].exists(), False)
-    check("tracked symlink cannot escape the source write deny", (external / "escaped.txt").exists(), False)
-    check("reviewer can write its verdict outside source trees", verdict.read_text(), "PASS\n")
+    # Linux has no sandbox-exec; PR_CHAIN_TEST_NO_SANDBOX=1 runs that path on macOS too.
+    if os.environ.get("PR_CHAIN_TEST_NO_SANDBOX"):
+        _which = shutil.which
+        shutil.which = lambda name, *a, **k: None if name == "sandbox-exec" else _which(name, *a, **k)
+    if shutil.which("sandbox-exec"):
+        result = pc.run_agent("gate", "test-model", output / "brief.md", stage_wt, output, 1)
+        check("review runner completes its bounded probe", result["rc"], 0)
+        check("reviewer cannot write to the main checkout", protected_paths[0].exists(), False)
+        check("reviewer cannot write to its pinned worktree", protected_paths[1].exists(), False)
+        check("tracked symlink cannot escape the source write deny", (external / "escaped.txt").exists(), False)
+        check("reviewer can write its verdict outside source trees", verdict.read_text(), "PASS\n")
+    else:
+        result = pc.run_agent("gate", "test-model", output / "brief.md", stage_wt, output, 1)
+        check("no sandbox-exec: the reviewer refuses to start (fail closed)", (result["rc"], "require_sandbox" in result.get("sandbox_error", "")), (125, True))
+        check("no sandbox-exec: nothing was written", any(p.exists() for p in protected_paths) or verdict.exists(), False)
+        pc.CFG.require_sandbox = False
+        result = pc.run_agent("gate", "test-model", output / "brief.md", stage_wt, output, 1)
+        pc.CFG.require_sandbox = True
+        check("require_sandbox = false: the reviewer runs unsandboxed", result["rc"], 0)
+        check("require_sandbox = false: the post-run check sees its write to the worktree",
+              pc.read_only_worktree_changed(stage_wt, stage_head), True)
+        for f in protected_paths[:2]:
+            f.unlink(missing_ok=True)
+        (external / "escaped.txt").unlink(missing_ok=True)
+        verdict.unlink(missing_ok=True)
     check("read-only worktree starts clean at its head", pc.read_only_worktree_changed(stage_wt, stage_head), False)
     (stage_wt / "untracked-review-write.py").write_text("unexpected\n")
     check("untracked reviewer edits are detected", pc.read_only_worktree_changed(stage_wt, stage_head), True)

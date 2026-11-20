@@ -108,6 +108,11 @@ for t in chain/tests/test_*.py; do python3 -B "$t"; done
 Scratch git repos and stubs only: no `gh`, no agents, no network. Checks that need a real kollab
 checkout skip themselves unless `KOLLAB_CHECKOUT` points at one.
 
+## Contributing
+
+Issues and pull requests are welcome: see `CONTRIBUTING.md` for setup, the rules for a PR and how releases
+work. Changes per version are in `CHANGELOG.md`.
+
 ## License
 
 MIT, see `LICENSE`. `vendor/three/` is three.js, also MIT.
