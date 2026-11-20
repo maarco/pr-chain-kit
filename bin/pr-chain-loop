@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""pr-chain-loop: run pr-chain continuously, up to `threads` PRs at a time.
+
+Each lap: stop if the STOP file in the work folder exists -> `pr-chain resume` (lands PRs a person approved; only
+when no chain is out, this loop's or any other) -> `pr-chain pick` -> start `pr-chain run <free PR> --land`
+for every free slot up to the thread count -> reap finished chains -> nap. PRs that ended at their current
+head (NEEDS-HUMAN, waiting at the human gate, merged) are not FREE, so they are skipped until a person or a
+new push changes them. With a slot left and no free PR it builds a free issue into a draft PR (`pr-chain auto`), unless
+issue building is off (WORK/NO-BUILD, the board /config toggle). An `auto` that ends having built nothing (empty or
+scout-skipped RESULT) starts no new one for IDLE seconds; PR launches are never delayed by that backoff.
+No free PR and no free slot: sleep 10
+minutes (30 s when chains are still out). A PR is tried at most twice per 6 hours (guards a retry loop).
+
+Threads: the board-config.json in the work folder ({"threads": 1..4}), editable on the board /config page.
+Read fresh every lap; the count may go up and down live. Fewer threads never kills a running chain: extra
+chains finish and are not replaced. Every live pr-chain process counts against the threads, including
+chains an earlier loop or a person started.
+Stop it: `pr-chain stop` (creates the STOP file; the lap in flight ends after its current stage).
+Logs: <work>/logs/loop.log (this loop and `resume`). Each chain appends its own output to
+<work>/logs/run-<pr>.log (a file, not a pipe, so a loop restart no longer kills the chains it
+started).   Board: pr-chain-board (http://127.0.0.1:8790)
+"""
+import ast
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "chain"))
+from config import CFG as CONF  # noqa: E402  pr-chain.toml: paths.work etc.
+
+WORK = CONF.work
+CHAIN = str(Path(__file__).resolve().with_name("pr-chain"))
+CFG = Path(os.environ.get("PR_CHAIN_BOARD_CONFIG") or (CONF.board_config or WORK / "board-config.json"))
+STOP = WORK / "STOP"
+ROW = re.compile(r"^\s*(\d+)\s+\d+\s+\S+\s+\S+\s+\S+\s+FREE\s*$")
+IDLE = 20  # seconds between looks when nothing is free (was 10 min; 11-14)
+tries = {}  # pr -> [timestamps]
+
+
+def say(msg):
+    print(f"[{time.strftime('%H:%M:%S')}] loop: {msg}", flush=True)
+
+
+def threads():
+    """Max concurrent chains, from the board config; 1 when the file is missing or bad."""
+    try:
+        return max(1, min(4, int(json.loads(CFG.read_text())["threads"])))
+    except Exception:
+        return 1
+
+
+def chains_out():
+    """Live pr-chain chain processes, this loop's or not (a chain an earlier loop started keeps running)."""
+    out = subprocess.run(["/usr/bin/pgrep", "-f", r"bin/pr-chain (auto|run|land|resume|issue|scout)"],
+                         capture_output=True, text=True).stdout
+    return len(out.split())
+
+
+def spawn(*args):
+    return subprocess.Popen([sys.executable, "-B", CHAIN, *args], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+
+def follow(p, out):
+    for line in p.stdout:
+        out.append(line)
+        if not line.startswith(("  ", "   PR")) or "next target" in line:
+            print(line, end="", flush=True)
+    p.wait()
+
+
+def spawn_logged(log, *args):
+    """Start a chain that appends its output to `log`; returns (process, log size before it started).
+    A file, not a pipe: nothing read the pipe, so RESULT lines were lost, and a loop restart broke it."""
+    log.parent.mkdir(parents=True, exist_ok=True)
+    pos = log.stat().st_size if log.exists() else 0
+    with open(log, "a") as fh:
+        p = subprocess.Popen([sys.executable, "-B", CHAIN, *args], stdout=fh, stderr=subprocess.STDOUT)
+    return p, pos
+
+
+def last_result(log, pos):
+    """The last RESULT line a run wrote after `pos` in its log, or None."""
+    try:
+        with open(log, "rb") as fh:
+            fh.seek(pos)
+            res = re.findall(r"^RESULT: (.*)$", fh.read().decode(errors="replace"), re.M)
+    except OSError:
+        return None
+    return res[-1] if res else None
+
+
+def built_nothing(result):
+    """True when an auto run's RESULT shows no work: an empty list, or only stage entries marked skipped."""
+    try:
+        items = ast.literal_eval(result)
+    except (ValueError, SyntaxError):
+        return False  # unparseable RESULT: assume it worked, so the backoff never stalls a real build
+    return isinstance(items, list) and (not items or all("skipped" in str(e).lower() for e in items))
+
+
+def ended(pr, p, log, pos):
+    """How a chain ended: the last RESULT line it wrote after `pos`, plus STATE.json's why when they agree."""
+    res = last_result(log, pos)
+    if res is None:
+        return f"with no result line (exit {p.returncode}; see {log})"
+    try:
+        st = json.loads((WORK / "prs" / str(pr) / "STATE.json").read_text())
+    except Exception:
+        st = {}
+    why = str(st.get("why") or "")[:100]
+    return f"{res}: {why}" if why and st.get("status") == res else res
+
+
+def pick_free():
+    table = subprocess.run([sys.executable, "-B", CHAIN, "pick"], capture_output=True, text=True).stdout
+    now = time.time()
+    free = []
+    for line in table.splitlines():
+        m = ROW.match(line)
+        if not m:
+            continue
+        n = int(m.group(1))
+        tries[n] = [t for t in tries.get(n, []) if now - t < 6 * 3600]  # kept for the log only
+        free.append(n)  # pr-chain's own RESTING backoff and retry caps decide when a PR runs again (11-14)
+    return free
+
+
+def nap(secs):
+    end = time.time() + secs
+    while time.time() < end and not STOP.exists():
+        time.sleep(5)
+
+
+def main():
+    say("started")
+    running = {}  # pr -> [process, its run log, log size when it started]
+    last_others = 0
+    last_resume = 0.0
+    next_auto = 0.0  # earliest time a new `auto` may start after one ended having built nothing (11-16)
+    while not STOP.exists():
+        for pr in [n for n, v in running.items() if v[0].poll() is not None]:
+            p, log, pos = running.pop(pr)
+            say(f"#{pr} ended {ended(pr, p, log, pos)}")
+            if str(pr).startswith("build"):  # an empty auto backs off for IDLE s; one that worked clears it
+                if built_nothing(last_result(log, pos)):
+                    next_auto = time.time() + IDLE
+                    say(f"no buildable issue; next build look in {IDLE // 2} min")  # once per backoff, not per lap
+                else:
+                    next_auto = 0.0
+        if STOP.exists():
+            break
+        limit = threads()
+        # resume (approved PRs, WAITING-CI, refused merges) runs beside the chains, at most every 3 min: it has its own lock
+        # and lands each PR under that PR's claim. It used to wait for every chain to end, so approvals sat for hours (11-14).
+        if "resume" not in running and time.time() - last_resume > 180:
+            log = WORK / "logs" / "resume.log"
+            p, pos = spawn_logged(log, "resume")
+            running["resume"] = [p, log, pos]
+            last_resume = time.time()
+        started = []
+        # keep one slot for `auto` while no build runs: auto builds a free p0/p1 issue before lower-priority PRs (2026-11-15)
+        building = any(str(k).startswith("build") for k in running) or (WORK / "NO-BUILD").exists()
+        pr_limit = limit - 1 if limit > 1 and not building else limit
+        while (n_out := max(len(running), chains_out())) < pr_limit:
+            free = [n for n in pick_free() if n not in running and n not in started]
+            if not free:
+                break
+            target = free[0]
+            tries[target].append(time.time())
+            log = WORK / "logs" / f"run-{target}.log"
+            say(f"next PR #{target} (chain {n_out + 1}/{limit}; output: {log})")
+            p, pos = spawn_logged(log, "run", str(target), "--land")
+            running[target] = [p, log, pos]
+            started.append(target)
+            time.sleep(2)  # let the new chain take its claim before the next pick
+        # no free PR but a slot left: build an issue into a draft PR (one build at a time), unless building is switched off
+        builds = [k for k in running if str(k).startswith("build")]
+        slot = next((f"build{i}" for i in (1, 2, 3) if f"build{i}" not in running), None)  # at most 3 builds at once
+        if max(len(running), chains_out()) < limit and slot and not (WORK / "NO-BUILD").exists() and time.time() >= next_auto:
+            log = WORK / "logs" / f"run-{slot}.log"  # one new build per lap, so two builds never pick the same issue at once
+            say(f"auto slot: an urgent issue, else the next free PR, else a free issue ({len(builds) + 1}/3, output: {log})")
+            p, pos = spawn_logged(log, "auto", "--land")  # a built PR that passes goes on to CI and the merge, like any PR
+            running[slot] = [p, log, pos]
+        others = max(0, chains_out() - len(running))
+        if others and others != last_others:
+            say(f"{others} chain(s) this loop did not start still out; they count against the {limit} thread(s)")
+        last_others = others
+        if running or others:
+            nap(10)
+        else:
+            say(f"no free PR; next look in {IDLE // 10} min")
+            nap(IDLE)
+    say("STOP file present; stopped")
+
+
+if __name__ == "__main__":
+    main()

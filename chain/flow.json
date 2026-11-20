@@ -1,0 +1,869 @@
+{
+ "about": "The chain's program. bin/pr-chain loads this file and runs it (pr-chain/chain_engine.py): start at `start`, run each node's `do` step, follow `next[outcome]` to the next node or an end state. Change the order, the routing, a limit, a label or a role here and the chain changes; a new kind of step needs one function in pr-chain/chain_steps.py. See ENGINE.md. Any limit or budget set to -1 means no limit.",
+ "start": "stop_check",
+ "needs_person_label": "chain/needs-person",
+ "labels": {
+  "chain/resting": "pr-chain paused this PR; it retries on its own (see the PR's last verdict)",
+  "chain/stuck": "pr-chain stopped: same area keeps failing; a new push restarts it",
+  "chain/needs-person": "pr-chain gave up; remove this label to let it try again"
+ },
+ "limits": {
+  "max_rounds": {
+   "value": 4,
+   "what": "review/fix rounds per run"
+  },
+  "max_audits": {
+   "value": 2,
+   "what": "gate attempts per run"
+  },
+  "max_ui": {
+   "value": 3,
+   "what": "UI review failures per run"
+  },
+  "drift_tries": {
+   "value": 3,
+   "what": "times one stage folds main in again"
+  },
+  "land_fix_cap": {
+   "value": 2,
+   "what": "landing fixes per head on an approved PR"
+  },
+  "land_tries": {
+   "value": 3,
+   "what": "times resume lands a LAND-STOPPED PR again per head"
+  },
+  "retry_cap": {
+   "value": 3,
+   "what": "runs ending in a machine-caused state per head"
+  },
+  "rest_stop": {
+   "value": 6,
+   "what": "rests across all heads before the redesign agent"
+  },
+  "redesign_tries": {
+   "value": 2,
+   "what": "redesign agents before STUCK"
+  },
+  "rest_hours_max": {
+   "value": 8,
+   "what": "rest back-off doubles 1, 2, 4 hours up to this many"
+  },
+  "head_min_age_minutes": {
+   "value": 45,
+   "what": "a head someone else pushed is left alone this long"
+  },
+  "prs_at_once": {
+   "value": 3,
+   "what": "PRs the chain works on at once; one stays in focus through its CI waits until it merges or parks on a person or a rest"
+  },
+  "max_open_prs": {
+   "value": 20,
+   "what": "the builder opens no new PR while this many chain PRs are open; CI is shared, so more PRs only lengthen the queue"
+  },
+  "stuck_lifts_max": {
+   "value": 2,
+   "what": "times a new push lifts STUCK before NEEDS-PERSON"
+  },
+  "ci_wait_max_minutes": {
+   "value": 60,
+   "what": "minutes a head may wait for CI before the review; then a fixer gets it"
+  },
+  "max_steps": {
+   "value": 400,
+   "what": "nodes one run may enter before it ends as ERROR (no flow can loop forever)"
+  },
+  "agent_timeout_minutes": {
+   "value": -1,
+   "what": "minutes one agent may run before it is killed; -1 = no timeout"
+  }
+ },
+ "agent_calls": {
+  "review": -1,
+  "gate": -1,
+  "addendum": -1,
+  "fix": -1,
+  "build": -1,
+  "scout": -1,
+  "ui": -1,
+  "redesign": -1
+ },
+ "nodes": {
+  "stop_check": {
+   "do": "stop_file",
+   "next": {
+    "stop": "STOPPED",
+    "go": "claim"
+   }
+  },
+  "claim": {
+   "do": "claim",
+   "next": {
+    "claimed": "CLAIMED",
+    "ok": "start_run"
+   }
+  },
+  "start_run": {
+   "do": "start_run",
+   "next": {
+    "ok": "pr_open"
+   }
+  },
+  "pr_open": {
+   "do": "pr_open",
+   "next": {
+    "closed": "CLOSED",
+    "not_ours": "NOT-OURS",
+    "ok": "lift_check"
+   }
+  },
+  "lift_check": {
+   "do": "lift_or_release",
+   "next": {
+    "ok": "mode",
+    "needs_person": "NEEDS-PERSON"
+   }
+  },
+  "mode": {
+   "do": "mode",
+   "next": {
+    "run": "approval_check",
+    "land": "land_audit",
+    "approved": "land_try"
+   }
+  },
+  "approval_check": {
+   "do": "standing_approval",
+   "next": {
+    "approved": "land_try",
+    "none": "rest_check"
+   }
+  },
+  "rest_check": {
+   "do": "rest_check",
+   "next": {
+    "below": "ui_seed",
+    "redesign": "redesign",
+    "stuck": "stuck_report"
+   }
+  },
+  "redesign": {
+   "do": "agent_redesign",
+   "kind": "agent",
+   "args": {
+    "role": "redesign"
+   },
+   "next": {
+    "landed": "ui_seed",
+    "failed": "stuck_report"
+   }
+  },
+  "stuck_report": {
+   "do": "stuck_report",
+   "next": {
+    "done": "STUCK"
+   }
+  },
+  "ui_seed": {
+   "do": "ui_seed",
+   "next": {
+    "ok": "round_setup"
+   }
+  },
+  "round_setup": {
+   "do": "round_setup",
+   "next": {
+    "ok": "round"
+   }
+  },
+  "round": {
+   "do": "pass",
+   "count": "rounds",
+   "limit": "max_rounds",
+   "on_limit": "RESTING",
+   "why": "round cap: no audited PASS after {limit} rounds; the last fix is pushed and not reviewed yet; nothing to do by hand, the loop runs this PR again once its head is 45 min old",
+   "next": {
+    "ok": "round_stop"
+   }
+  },
+  "round_stop": {
+   "do": "stop_file",
+   "next": {
+    "stop": "STOPPED",
+    "go": "seed_check"
+   }
+  },
+  "seed_check": {
+   "do": "seed",
+   "next": {
+    "seed": "same_findings",
+    "none": "fold",
+    "dry": "DRY"
+   }
+  },
+  "fold": {
+   "do": "fold_main",
+   "next": {
+    "clean": "ci_red",
+    "tests_red": "same_findings",
+    "conflict": "same_findings",
+    "dry": "DRY"
+   }
+  },
+  "ci_red": {
+   "do": "ci_red",
+   "next": {
+    "red": "same_findings",
+    "not_red": "merge_gates",
+    "dry": "DRY"
+   }
+  },
+  "merge_gates": {
+   "do": "merge_gates",
+   "next": {
+    "fails": "same_findings",
+    "ok": "ci_pending",
+    "dry": "DRY"
+   }
+  },
+  "ci_pending": {
+   "do": "ci_pending_review",
+   "next": {
+    "pending": "WAITING-CI",
+    "settled": "carry_gate"
+   }
+  },
+  "carry_gate": {
+   "do": "carry_gate",
+   "next": {
+    "same_head": "after_pass",
+    "moved": "carry_cover",
+    "none": "carry_review"
+   }
+  },
+  "carry_cover": {
+   "do": "agent_cover",
+   "kind": "agent",
+   "args": {
+    "role": "gate"
+   },
+   "next": {
+    "pass": "after_pass",
+    "fail": "same_findings",
+    "behind": "drift",
+    "no_verdict": "NO-VERDICT"
+   }
+  },
+  "carry_review": {
+   "do": "carry_review",
+   "next": {
+    "yes": "after_pass",
+    "no": "review"
+   }
+  },
+  "review": {
+   "do": "agent_review",
+   "kind": "agent",
+   "args": {
+    "role": "review"
+   },
+   "next": {
+    "pass": "after_pass",
+    "fail": "same_findings",
+    "behind": "drift",
+    "no_verdict": "NO-VERDICT",
+    "dry": "DRY"
+   }
+  },
+  "drift": {
+   "do": "pass",
+   "count": "drift",
+   "limit": "drift_tries",
+   "on_limit": "MAIN-MOVING",
+   "why": "main moved {count} times before a review could start; rerun the chain",
+   "next": {
+    "ok": "round_stop"
+   }
+  },
+  "after_pass": {
+   "do": "after_pass",
+   "next": {
+    "audit": "audit",
+    "skip": "ui_needed"
+   }
+  },
+  "audit": {
+   "do": "agent_audit",
+   "kind": "agent",
+   "args": {
+    "role": "gate"
+   },
+   "count": "audits",
+   "limit": "max_audits",
+   "on_limit": "RESTING",
+   "why": "the audit failed {limit} times",
+   "next": {
+    "pass": "ui_needed",
+    "fail": "same_findings",
+    "conflict": "audit_conflict",
+    "behind": "MAIN-MOVING",
+    "no_verdict": "NO-VERDICT"
+   }
+  },
+  "audit_conflict": {
+   "do": "pass",
+   "uncount": "audits",
+   "next": {
+    "ok": "round"
+   }
+  },
+  "ui_needed": {
+   "do": "ui_needed",
+   "next": {
+    "no": "ready",
+    "yes": "ui_review"
+   }
+  },
+  "ui_review": {
+   "do": "agent_ui_review",
+   "kind": "agent",
+   "args": {
+    "role": "ui"
+   },
+   "next": {
+    "pass": "ui_pass",
+    "fail": "ui_fix",
+    "stack_down": "BUILD-FAILED",
+    "no_verdict": "UI-NO-VERDICT"
+   }
+  },
+  "ui_fix": {
+   "do": "agent_ui_fix",
+   "kind": "agent",
+   "args": {
+    "role": "fix"
+   },
+   "count": "ui_fails",
+   "limit": "max_ui",
+   "on_limit": "RESTING",
+   "why": "the UI review failed {count} times",
+   "next": {
+    "fixed": "ui_review",
+    "nothing": "RESTING"
+   }
+  },
+  "ui_pass": {
+   "do": "ui_pass",
+   "next": {
+    "done": "ready",
+    "moved": "ui_audit"
+   }
+  },
+  "ui_audit": {
+   "do": "agent_audit_after_ui",
+   "kind": "agent",
+   "args": {
+    "role": "gate"
+   },
+   "next": {
+    "pass": "ready",
+    "fail": "same_findings",
+    "behind": "MAIN-MOVING",
+    "no_verdict": "NO-VERDICT"
+   }
+  },
+  "same_findings": {
+   "do": "same_findings",
+   "next": {
+    "same": "RESTING",
+    "new": "fix"
+   }
+  },
+  "fix": {
+   "do": "agent_fix",
+   "kind": "agent",
+   "args": {
+    "role": "fix"
+   },
+   "next": {
+    "fixed": "round",
+    "disputed": "round",
+    "evidence": "round",
+    "flaky_rerun": "round_stop",
+    "blocked_policy": "POLICY-HOLD",
+    "nothing": "RESTING"
+   }
+  },
+  "ready": {
+   "do": "pass",
+   "next": {
+    "ok": "land_try"
+   }
+  },
+  "land_audit": {
+   "do": "agent_land_audit",
+   "kind": "agent",
+   "args": {
+    "role": "gate"
+   },
+   "next": {
+    "skip": "land_try",
+    "pass": "land_try",
+    "fold_conflict": "RESTING",
+    "fail": "RESTING",
+    "behind": "MAIN-MOVING",
+    "no_verdict": "NO-VERDICT"
+   }
+  },
+  "land_try": {
+   "do": "land_try",
+   "count": "land_laps",
+   "next": {
+    "stop": "STOPPED",
+    "conflict": "RESTING",
+    "moved": "land_cover",
+    "same": "ui_final_check"
+   }
+  },
+  "land_cover": {
+   "do": "agent_land_cover",
+   "kind": "agent",
+   "args": {
+    "role": "gate"
+   },
+   "next": {
+    "retry": "land_try",
+    "pass": "ui_carry",
+    "fail_approved": "land_fix",
+    "fail": "RESTING",
+    "behind": "MAIN-MOVING",
+    "no_verdict": "NO-VERDICT"
+   }
+  },
+  "land_fix": {
+   "do": "agent_land_fix",
+   "kind": "agent",
+   "args": {
+    "role": "fix"
+   },
+   "next": {
+    "again": "land_try",
+    "cap": "RESTING",
+    "nothing": "RESTING",
+    "pushed_code": "RESTING"
+   }
+  },
+  "ui_carry": {
+   "do": "ui_carry",
+   "next": {
+    "ok": "ui_final_check"
+   }
+  },
+  "ui_final_check": {
+   "do": "ui_final_needed",
+   "next": {
+    "yes": "ui_final",
+    "no": "mark_ready"
+   }
+  },
+  "ui_final": {
+   "do": "agent_ui_final",
+   "kind": "agent",
+   "args": {
+    "role": "ui"
+   },
+   "next": {
+    "pass": "mark_ready",
+    "fail": "RESTING",
+    "no_verdict": "UI-NO-VERDICT"
+   }
+  },
+  "mark_ready": {
+   "do": "mark_ready",
+   "next": {
+    "human_gate": "human_gate",
+    "no_land": "READY",
+    "land": "ci_pending_land"
+   }
+  },
+  "human_gate": {
+   "do": "human_gate",
+   "next": {
+    "posted": "AWAIT-HUMAN",
+    "no_shots": "RESTING"
+   }
+  },
+  "ci_pending_land": {
+   "do": "ci_pending_land",
+   "next": {
+    "pending": "WAITING-CI",
+    "settled": "wait_ci"
+   }
+  },
+  "wait_ci": {
+   "do": "wait_ci",
+   "next": {
+    "green": "land",
+    "head_moved_retry": "land_try",
+    "red": "CI-RED",
+    "timeout": "CI-TIMEOUT",
+    "head_moved": "CI-HEAD-MOVED"
+   }
+  },
+  "land": {
+   "do": "land",
+   "next": {
+    "merged": "MERGED",
+    "retry": "land_try",
+    "check_red": "CI-RED",
+    "refused": "LAND-STOPPED"
+   }
+  }
+ },
+ "end_states": {
+  "MERGED": {
+   "group": "finished",
+   "means": "landed on main",
+   "then": "worktrees cleaned, human-approved and chain/* labels removed"
+  },
+  "READY": {
+   "group": "waiting",
+   "means": "review and gate passed, run had no --land",
+   "then": "resume lands it",
+   "resume": {
+    "rerun_as_land": "land_audit"
+   }
+  },
+  "AWAIT-HUMAN": {
+   "group": "waiting",
+   "means": "UI PR passed, screenshots posted",
+   "then": "label human-approved lands it, a comment goes to a fixer",
+   "resume": {
+    "label_human_approved": "land_try",
+    "person_comment": "seed_check",
+    "head_moved": "stop_check"
+   }
+  },
+  "WAITING-CI": {
+   "group": "waiting",
+   "means": "required checks still running",
+   "then": "slot freed; resume continues when none is pending",
+   "resume": {
+    "ci_done_before_review": "stop_check",
+    "ci_never_finished": "seed_check",
+    "ci_done_after_gate": "land_try",
+    "head_moved": "stop_check"
+   }
+  },
+  "RESTING": {
+   "group": "parked",
+   "label": "chain/resting",
+   "means": "agents could not finish this run",
+   "then": "back after the rest back-off; a new head resets the back-off"
+  },
+  "MAIN-MOVING": {
+   "group": "parked",
+   "retryable": true,
+   "means": "main moved too often for a stage to start",
+   "then": "retried at the same head"
+  },
+  "NO-VERDICT": {
+   "group": "parked",
+   "retryable": true,
+   "means": "agent wrote no PASS or FAIL",
+   "then": "retried at the same head"
+  },
+  "UI-NO-VERDICT": {
+   "group": "parked",
+   "retryable": true,
+   "means": "UI agent wrote no PASS or FAIL",
+   "then": "retried at the same head"
+  },
+  "BUILD-FAILED": {
+   "group": "parked",
+   "retryable": true,
+   "means": "builder or UI stack failed",
+   "then": "retried at the same head"
+  },
+  "ERROR": {
+   "group": "parked",
+   "retryable": true,
+   "means": "script exception",
+   "then": "retried at the same head"
+  },
+  "CI-RED": {
+   "group": "parked",
+   "retryable": true,
+   "means": "a required check failed",
+   "then": "retried; red tests go to a fixer first"
+  },
+  "CI-TIMEOUT": {
+   "group": "parked",
+   "retryable": true,
+   "means": "checks did not finish in 45 minutes",
+   "then": "retried at the same head"
+  },
+  "CI-HEAD-MOVED": {
+   "group": "parked",
+   "means": "the head kept moving while CI ran",
+   "then": "parked until the head moves again"
+  },
+  "HOLD-UI": {
+   "group": "parked",
+   "retryable": true,
+   "unused": true,
+   "means": "listed as retryable in the code, nothing sets it today",
+   "then": "none"
+  },
+  "LAND-STOPPED": {
+   "group": "parked",
+   "means": "merge was refused",
+   "then": "PR goes back to draft, resume retries when the PR changes",
+   "resume": {
+    "pr_changed": "land_try"
+   }
+  },
+  "STUCK": {
+   "group": "stopped",
+   "label": "chain/stuck",
+   "means": "rest_stop rests and redesign_tries redesigns, same area keeps failing",
+   "then": "one comment and one design issue; a real new push lifts it"
+  },
+  "NEEDS-PERSON": {
+   "group": "stopped",
+   "label": "chain/needs-person",
+   "means": "STUCK was lifted stuck_lifts_max times and came back each time",
+   "then": "waits until a person removes the label"
+  },
+  "POLICY-HOLD": {
+   "group": "stopped",
+   "means": "only fix breaks a project rule, or the PR declares a hold",
+   "then": "parked until the head moves"
+  },
+  "CLOSED": {
+   "group": "stopped",
+   "means": "PR closed without merge",
+   "then": "cleanup, labels removed"
+  },
+  "NOT-OURS": {
+   "group": "stopped",
+   "means": "author is not a configured chain author",
+   "then": "never touched"
+  },
+  "STOPPED": {
+   "group": "stopped",
+   "means": "STOP file exists",
+   "then": "every chain stops after its stage"
+  },
+  "CLAIMED": {
+   "group": "stopped",
+   "means": "another chain holds this PR",
+   "then": "skipped, nothing changes",
+   "no_die": true
+  },
+  "DRY": {
+   "group": "finished",
+   "no_die": true,
+   "means": "--dry-run stopped after the first review launch line",
+   "then": "nothing"
+  }
+ },
+ "counters": {
+  "rounds": {
+   "scope": "per run, starts at 1; a run that parks for CI before its review saves its round and last findings, and the next run goes on from there",
+   "limit": "max_rounds",
+   "when_hit": {
+    "status": "RESTING",
+    "label": "chain/resting",
+    "github": "label added; verdict comments already posted stay",
+    "comes_back": "after the rest back-off; the next run starts at round 1"
+   }
+  },
+  "same_findings": {
+   "scope": "per run",
+   "when_hit": {
+    "status": "RESTING",
+    "label": "chain/resting",
+    "github": "label added",
+    "comes_back": "after the rest back-off"
+   },
+   "rule": "the same files named in the findings two rounds in a row"
+  },
+  "audits": {
+   "scope": "per run",
+   "limit": "max_audits",
+   "when_hit": {
+    "status": "RESTING",
+    "label": "chain/resting",
+    "github": "label added",
+    "comes_back": "after the rest back-off; audits start at 0 again"
+   }
+  },
+  "ui_fails": {
+   "scope": "per run",
+   "limit": "max_ui",
+   "when_hit": {
+    "status": "RESTING",
+    "label": "chain/resting",
+    "github": "label added",
+    "comes_back": "after the rest back-off; the next run's fixer takes the last UI findings first"
+   }
+  },
+  "rests_at_head": {
+   "scope": "per head, a new head starts at 0",
+   "limit": "rest_hours_max",
+   "when_hit": {
+    "status": "RESTING",
+    "label": "chain/resting",
+    "github": "label stays",
+    "comes_back": "1, 2, 4, then 8 hours, and 8 hours from then on"
+   }
+  },
+  "rest_total": {
+   "scope": "per PR, all heads; reset by a landed redesign, a lifted STUCK or a released NEEDS-PERSON",
+   "limit": "rest_stop",
+   "at_2": "every review is told all past findings are one class and must FAIL unless the class is closed",
+   "when_hit": {
+    "status": "redesign agent runs",
+    "github": "nothing yet",
+    "comes_back": "a landed redesign resets rest_total to 0 and the loop carries on"
+   }
+  },
+  "redesigns": {
+   "scope": "per PR, reset by a lifted STUCK",
+   "limit": "redesign_tries",
+   "when_hit": {
+    "status": "STUCK",
+    "label": "chain/stuck",
+    "github": "label, one comment saying why and how to restart, one issue 'Design needed: #N keeps failing review in the same area' (label bug, filed once per PR)",
+    "comes_back": "a new push that is more than a merge of main lifts STUCK and resets rest_total, rests and redesigns"
+   }
+  },
+  "stuck_lifts": {
+   "scope": "per PR, lifetime",
+   "limit": "stuck_lifts_max",
+   "when_hit": {
+    "status": "NEEDS-PERSON",
+    "label": "chain/needs-person",
+    "github": "label swapped from chain/stuck",
+    "comes_back": "only when a person removes the chain/needs-person label; every counter starts over"
+   }
+  },
+  "retries": {
+   "scope": "per head, machine-caused states only (retryable)",
+   "limit": "retry_cap",
+   "when_hit": {
+    "status": "the same state, parked",
+    "label": "chain/needs-person",
+    "github": "label added",
+    "comes_back": "a new head, or a person removes the label"
+   }
+  },
+  "land_tries": {
+   "scope": "per head",
+   "limit": "land_tries",
+   "when_hit": {
+    "status": "LAND-STOPPED",
+    "github": "PR back to draft",
+    "comes_back": "a new head"
+   }
+  },
+  "land_fixes": {
+   "scope": "per head, approved PRs only",
+   "limit": "land_fix_cap",
+   "when_hit": {
+    "status": "RESTING",
+    "label": "chain/resting",
+    "github": "label added",
+    "comes_back": "after the rest back-off"
+   }
+  },
+  "drift": {
+   "scope": "per stage",
+   "limit": "drift_tries",
+   "when_hit": {
+    "status": "MAIN-MOVING",
+    "github": "nothing",
+    "comes_back": "next lap, at most retry_cap times per head"
+   }
+  },
+  "ci_wait": {
+   "scope": "per head",
+   "limit": "ci_wait_max_minutes",
+   "when_hit": {
+    "status": "a fixer gets 'required checks never finished'",
+    "github": "the fixer's push if it finds the cause",
+    "comes_back": "the fixer's new head waits for CI again; a fixer that cannot fix it rests"
+   }
+  },
+  "ci_reruns": {
+   "scope": "per head",
+   "rule": "one rerun of failed jobs for a flaky or main-also-red check",
+   "when_hit": {
+    "status": "CI-RED",
+    "github": "nothing",
+    "comes_back": "red tests go to a fixer next run"
+   }
+  }
+ },
+ "intake": {
+  "auto": {
+   "kind": "script",
+   "does": "pick the first eligible PR, else the first free issue, else scout",
+   "reads": [
+    "PR author is a configured chain author",
+    "exclude.txt",
+    "STATE.json: rest_until, retries, status",
+    "label chain/needs-person"
+   ],
+   "next": {
+    "pr": "claim",
+    "issue": "pick_issue",
+    "nothing": "scout",
+    "exception_in_any_step": "ERROR"
+   }
+  },
+  "pick_issue": {
+   "kind": "script",
+   "does": "choose an open issue nobody works on",
+   "reads": [
+    "needs one of: bug, status/ready-for-agent, status/accepted",
+    "skips: wontfix, duplicate, invalid, question, status/blocked, status/needs-info, status/needs-repro, status/ready-for-human",
+    "sorts by priority/p0 to p3"
+   ],
+   "next": {
+    "picked": "build_pr",
+    "none_free": "scout"
+   }
+  },
+  "scout": {
+   "kind": "agent",
+   "role": "scout",
+   "does": "file new bug issues, then the run ends",
+   "writes": [
+    "new issues labeled bug"
+   ],
+   "next": {
+    "issues_filed": "pick_issue"
+   }
+  },
+  "build_pr": {
+   "kind": "agent",
+   "role": "build",
+   "does": "red test first, then the fix, local checks on the Mac; the script pushes and opens a DRAFT PR. It does not wait for GitHub CI",
+   "writes": [
+    "DRAFT PR, no labels"
+   ],
+   "checks_by_script": [
+    "a test file exists",
+    "ruff clean on added lines",
+    "disk free above 5 GB",
+    "no NO-BUILD file"
+   ],
+   "next": {
+    "pr_opened": "claim",
+    "build_failed": "BUILD-FAILED"
+   }
+  },
+  "_note": "auto, issue building and scout still run from Python; the engine runs one PR's chain (phase 2 moves these in)"
+ }
+}

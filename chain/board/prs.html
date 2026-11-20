@@ -1,0 +1,267 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PR Chain · Pull Requests</title>
+<style>
+:root{--bg:oklch(0.145 0 0);--card:oklch(0.185 0 0);--raise:oklch(0.269 0 0);--fg:oklch(0.985 0 0);--mid:oklch(0.82 0 0);--muted:oklch(0.62 0 0);--faint:oklch(0.44 0 0);
+--hi:#78be21;--bad:oklch(0.704 0.191 22.216);--warn:oklch(0.769 0.188 70.08);--r:0.625rem;
+--sans:ui-sans-serif,system-ui,-apple-system,"SF Pro Text","Segoe UI",sans-serif;--mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,monospace}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%;text-size-adjust:100%}html,body{height:100%}
+body{margin:0;background:var(--bg);color:var(--fg);font:12px/1.5 var(--sans);-webkit-font-smoothing:antialiased;letter-spacing:.005em}
+a{color:inherit;text-decoration:none}a:hover{color:var(--fg)}
+main{max-width:1360px;margin:0 auto;padding:12px 20px 0;height:100%;display:flex;flex-direction:column}
+.top{display:flex;justify-content:space-between;align-items:baseline;gap:16px;flex-wrap:wrap}
+.brand{font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);font-weight:500;display:flex;gap:18px}
+.brand a{color:var(--faint)}.brand a.on{color:var(--fg)}
+@media(max-width:520px){.brand{gap:12px;letter-spacing:.08em}.brand a{white-space:nowrap}}
+.meta{color:var(--muted);font-size:11px;font-variant-numeric:tabular-nums}
+.grid{display:grid;grid-template-columns:minmax(0,var(--lw,430px)) 25px minmax(0,1fr);gap:0;flex:1;min-height:0;margin-top:12px}
+.col{display:flex;flex-direction:column;min-height:0;min-width:0}
+.bar{display:flex;gap:14px;align-items:baseline;margin-bottom:8px}
+.bar input{flex:1;min-width:0;background:var(--card);border:0;border-radius:6px;color:var(--fg);font:12px var(--sans);padding:5px 9px;outline:none}
+.bar input::placeholder{color:var(--faint)}.bar input:focus{background:var(--raise)}
+.sw{display:flex;gap:12px;font-size:11px}.sw a,.act a,.link{color:var(--muted);cursor:pointer}.sw a.on{color:var(--fg)}
+.scroll{overflow-y:auto;flex:1;min-height:0;scrollbar-width:thin;scrollbar-color:var(--raise) transparent;padding-bottom:18px}
+.row{display:grid;grid-template-columns:44px minmax(0,1fr) auto;gap:2px 8px;padding:6px 8px;border-radius:6px;cursor:pointer}
+.row:hover{background:var(--card)}.row.sel{background:var(--raise)}
+.row .n{font:11px var(--mono);color:var(--muted)}.row.sel .n{color:var(--hi)}
+.row .t{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--mid)}.row.sel .t,.row:hover .t{color:var(--fg)}
+.row .a{font:10.5px var(--mono);color:var(--faint);white-space:nowrap}
+.row .s{grid-column:2/4;font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ok{color:var(--hi)}.bad{color:var(--bad)}.warn{color:var(--warn)}.dim{color:var(--muted)}.f{color:var(--faint)}
+.mono{font-family:var(--mono);font-size:11px}
+h1{font-size:16px;font-weight:900;letter-spacing:-.01em;margin:0;line-height:1.35}h1 .num{font:500 12px var(--mono);color:var(--hi);margin-right:8px}
+.facts{color:var(--muted);font-size:11px;margin-top:3px;overflow-wrap:anywhere}
+.act{display:flex;gap:16px;font-size:11px;margin-top:6px;flex-wrap:wrap}.act a:hover,.sw a:hover,.link:hover{color:var(--fg)}
+h2{font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--faint);margin:18px 0 6px;font-weight:500;display:flex;justify-content:space-between;gap:10px}
+h2 span{letter-spacing:.02em;text-transform:none;color:var(--muted);display:flex;gap:12px}
+dl{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:3px 26px;margin:14px 0 0}
+dl.one{grid-template-columns:minmax(0,1fr);margin-top:3px}dl div{display:flex;gap:10px;min-width:0}dt{color:var(--faint);width:86px;flex:none}dd{margin:0;color:var(--mid);min-width:0;overflow-wrap:anywhere}
+.md{color:var(--mid);font-size:12px;line-height:1.55;overflow-wrap:anywhere}
+.md p{margin:0 0 7px;white-space:pre-wrap}.md>:last-child{margin-bottom:0}.md ul,.md ol{margin:2px 0 9px;padding-left:20px}.md li{margin:0 0 6px}.md li::marker{color:var(--faint)}
+.md .res{display:block;color:var(--muted)}.md .lb{font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--faint);margin:11px 0 4px}
+.md .vd{font-weight:600;letter-spacing:.05em;margin:0 0 3px}.md .kl{display:grid;grid-template-columns:86px minmax(0,1fr);column-gap:10px;margin:0 0 2px}.md .kl+p,.md .kl+ul{margin-top:7px}
+.md code{font:11px var(--mono);color:var(--fg)}.md pre{font:10.5px/1.5 var(--mono);color:var(--muted);background:var(--card);border-radius:6px;padding:8px 10px;margin:4px 0;white-space:pre-wrap;overflow-wrap:anywhere}
+.md a.shot{display:inline-block;vertical-align:top;width:220px;max-width:100%;margin:4px 10px 6px 0;text-decoration:none;white-space:normal}.md a.shot img{display:block;width:100%;max-height:260px;object-fit:contain;object-position:left top;background:var(--card);border-radius:6px}.md a.shot span{display:block;font:10px var(--mono);color:var(--muted);margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.md a{color:var(--fg);text-decoration:underline;text-decoration-color:var(--faint);text-underline-offset:2px}.md b{color:var(--fg);font-weight:500}
+.clip{max-height:5.2em;overflow:hidden;-webkit-mask-image:linear-gradient(#000 60%,transparent);mask-image:linear-gradient(#000 60%,transparent);cursor:pointer}
+.c{display:grid;grid-template-columns:64px 78px 104px minmax(0,1fr);gap:0 10px;padding:3px 8px;margin:0 -8px;border-radius:6px;cursor:pointer;font-size:11.5px}
+.c:hover{background:var(--card)}.c.open{background:var(--card);padding-bottom:9px}
+.c .w{color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.c .g{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.c .l{color:var(--mid);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.c.open .l{display:none}
+.c .b{grid-column:2/5;display:none;margin-top:4px;cursor:text}.c.open .b{display:block}
+table{width:100%;border-collapse:collapse;font-size:11.5px;font-variant-numeric:tabular-nums}
+.fr{display:flex;justify-content:space-between;gap:12px;padding:2px 6px;margin:0 -6px;border-radius:5px;cursor:pointer;font:11px var(--mono);color:var(--mid)}.fr:hover,.fr.open{background:var(--card);color:var(--fg)}.fr .p{overflow-wrap:anywhere;min-width:0}.fr .r{white-space:nowrap}
+.df{margin:3px 0 10px;font-size:11px}.dl{font:10.5px/1.5 var(--mono);background:var(--card);border-radius:6px;padding:6px 0;overflow-x:auto;max-height:70vh;overflow-y:auto;scrollbar-width:thin;scrollbar-color:var(--raise) transparent}
+.dl>div{display:flex;min-width:max-content;color:var(--muted)}.dl i{flex:0 0 40px;text-align:right;padding-right:8px;color:var(--faint);font-style:normal;user-select:none}.dl b{font-weight:400;white-space:pre;padding-right:12px}
+.dl .a{background:rgba(120,200,90,.10);color:var(--fg)}.dl .m{background:rgba(230,90,80,.11);color:var(--mid)}.dl .h{color:var(--faint);padding:3px 0}
+@media(max-width:520px){.dl i{flex-basis:28px;padding-right:5px}}
+td{padding:2px 12px 2px 0;vertical-align:top;color:var(--mid)}td.k{font:11px var(--mono);white-space:nowrap}td.p{font:11px var(--mono);overflow-wrap:anywhere}td.r{text-align:right;white-space:nowrap;font:11px var(--mono)}
+.empty{color:var(--muted);padding:30px 0}
+.rz{touch-action:none;user-select:none;-webkit-user-select:none;position:relative;flex:none}.rz::after{content:"";position:absolute;background:transparent;border-radius:1px;transition:background .12s}
+.rz.x{cursor:col-resize}.rz.x::after{left:12px;top:0;bottom:18px;width:1px}.rz.y{cursor:row-resize;height:13px}.rz.y::after{left:0;right:0;top:6px;height:1px}
+.rz:hover::after,.rz.on::after{background:var(--muted)}
+#dh{flex:none;overflow-y:auto;max-height:46vh;scrollbar-width:thin;scrollbar-color:var(--raise) transparent}#dh:empty,#dh:empty+.rz{display:none}#dh dl{margin-top:10px}
+#det>h2:first-child{margin-top:6px}#det{padding-right:8px}#det h2{cursor:pointer;flex-wrap:wrap}#det h2.shut{opacity:.5}#det h2.shut span{display:none}
+.link.on,.tools a.on{color:var(--fg)}.tools{display:flex;gap:12px;font-size:11px;margin:-2px 0 8px;flex-wrap:wrap}.tools a{color:var(--muted);cursor:pointer}.tools a:hover{color:var(--fg)}.tools .cnt{margin-left:auto;color:var(--faint)}
+#cq{background:var(--card);border:0;border-radius:5px;color:var(--fg);font:11px var(--sans);padding:1px 7px;outline:none;width:130px}#cq::placeholder{color:var(--faint)}
+#files.wrap .dl>div{min-width:0}#files.wrap .dl b{white-space:pre-wrap;overflow-wrap:anywhere;min-width:0}.row .a.new{color:var(--hi)}.df .rz.y{height:9px}.df .rz.y::after{top:4px;left:40%;right:40%;height:2px}
+#back{display:none}
+@media(max-width:900px){.grid{grid-template-columns:minmax(0,1fr)}#vsplit,#dh+.rz{display:none}#dh{max-height:40vh}body.d #listcol{display:none}body:not(.d) #detcol{display:none}#back{display:inline}
+ main{padding:10px 14px 0}dl{grid-template-columns:minmax(0,1fr)}}
+@media(max-width:520px){.c{grid-template-columns:34px 30px minmax(0,1fr)}.c .w,.c .g .dim{display:none}.c .b{grid-column:1/4}td{overflow-wrap:anywhere;padding-right:8px}table.led{table-layout:fixed}table.led td.k{white-space:normal}table.led td:nth-child(1){width:84px;white-space:nowrap}table.led td:nth-child(2){width:72px}table.led td:nth-child(3){display:none}}.runs{font-size:11px}.run{display:grid;grid-template-columns:84px minmax(0,1fr);column-gap:14px;padding:2px 0;align-items:baseline}.run .st{min-width:0;line-height:1.55}.run .sp:not(:last-child){white-space:nowrap}
+.at{margin:9px 0 2px;font-size:12px;line-height:1.5;color:var(--mid)}.at .ah{display:flex;gap:12px;align-items:baseline;flex-wrap:wrap;font-size:11px;margin-bottom:2px}.at .ah>:first-child{font-weight:700;letter-spacing:.02em}
+.at ol{margin:3px 0 4px;padding-left:20px}.at li{margin:1px 0}.at li::marker{color:var(--faint)}.at a{color:var(--fg);cursor:pointer;text-decoration:underline;text-decoration-color:var(--faint);text-underline-offset:2px}.at code{font:11px var(--mono);color:var(--fg)}.at .why{font-size:11px;white-space:pre-wrap;overflow-wrap:anywhere;margin-top:2px}
+</style></head><body><main>
+<div class="top"><div class="brand"><a href="/">Board</a><a class="on" href="/prs">Pull Requests</a><a href="/issues">Issues</a><a href="/spend">Spend</a><a href="/config">Config</a><a href="/wiki">Wiki</a></div><div class="meta"><span id="meta"></span> · <span title="j / k: next or previous pull request&#10;/: filter the list&#10;o: open on GitHub&#10;r: read GitHub again&#10;e: expand or collapse every file&#10;v: jump to the latest verdict&#10;Esc: back to the list" style="cursor:help">Keys</span></div></div>
+<div class="grid">
+ <div class="col" id="listcol">
+  <div class="bar"><input id="q" placeholder="Filter By Number, Title, Branch Or Author" autocomplete="off" spellcheck="false">
+   <div class="sw" id="sw"><a data-s="open">Open</a><a data-s="merged">Merged</a><a data-s="closed">Closed</a></div></div>
+  <div class="tools" id="tools"></div>
+  <div class="scroll" id="list"></div>
+ </div>
+ <div class="rz x" id="vsplit" data-rz="lw" title="Drag To Resize, Double-Click To Reset"></div>
+ <div class="col" id="detcol"><div id="dh"></div><div class="rz y" data-rz="hh" title="Drag To Resize, Double-Click To Reset"></div><div class="scroll" id="det"></div></div>
+</div>
+</main>
+<script src="/runs.js"></script>
+<script>
+const $=id=>document.getElementById(id),esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const P=Object.assign({which:'open',q:'',sort:'updated',flt:{},wrap:false,chg:false,shut:{}},JSON.parse(localStorage.getItem('prs.prefs')||'{}')),seen=JSON.parse(localStorage.getItem('prs.seen')||'{}');
+const save=()=>{localStorage.setItem('prs.prefs',JSON.stringify(P));localStorage.setItem('prs.seen',JSON.stringify(seen))};let cq='';
+let which=P.which,prs=[],sel=null,det=null,openC=new Set(),only=false,bodyOpen=false,openF=new Set(),diff=null,diffErr='';
+function ago(t){if(!t)return'';const s=(Date.now()-new Date(t))/1e3;if(s<90)return'now';if(s<5400)return Math.round(s/60)+'m';if(s<129600)return Math.round(s/3600)+'h';return Math.round(s/86400)+'d'}
+const since=t=>{const a=ago(t);return !a?'':a==='now'?'just now':a+' ago'};
+const tk=n=>n>=1e6?(n/1e6).toFixed(2)+'M':n>=1e3?Math.round(n/1e3)+'k':String(n||0);
+const us=n=>n?' · ~$'+(n>=100?Math.round(n):n>=0.01?n.toFixed(2):'0.01'):'';
+const low=s=>String(s||'').toLowerCase().replace(/_/g,' ');
+function md(s){const keep=[];s=esc(s).replace(/```[^\n]*\n([\s\S]*?)```/g,(m,c)=>{keep.push('<pre>'+c.replace(/\n$/,'')+'</pre>');return'\u0000'+(keep.length-1)+'\u0000'});
+ const pic=(u,alt)=>{u=u.replace(/&amp;/g,'&');if(!/^https:\/\/[^\s"'<>]+$/.test(u))return null;keep.push('<a class="shot" href="'+esc(u)+'" target="_blank" rel="noopener" title="'+alt+'"><img loading="lazy" referrerpolicy="no-referrer" src="'+esc(u)+'" alt="'+alt+'"><span>'+alt+'</span></a>');return'\u0000'+(keep.length-1)+'\u0000'};
+ s=s.replace(/&lt;img\b([\s\S]*?)&gt;/g,(m,at)=>{const g=n=>((at.match(new RegExp('\\b'+n+'=(?:&quot;|&#39;|"|\')(.*?)(?:&quot;|&#39;|"|\')'))||[])[1]||'');return pic(g('src'),g('alt'))||m})
+  .replace(/!\[([^\]\n]*)\]\((https:\/\/[^\s)]+)\)/g,(m,alt,u)=>pic(u,alt)||m).replace(/(\u0000\d+\u0000)\s+(?=\u0000\d+\u0000)/g,'$1');
+ s=s.replace(/`([^`\n]+)`/g,'<code>$1</code>').replace(/\*\*([^*\n]+)\*\*/g,'<b>$1</b>').replace(/^#{1,6}\s+(.*)$/gm,'<b>$1</b>')
+  .replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g,'<a href="$2" target="_blank" rel="noopener">$1</a>')
+  .replace(/(^|[\s(])(https?:\/\/[^\s<)]+)/g,'$1<a href="$2" target="_blank" rel="noopener">$2</a>').replace(/\n{3,}/g,'\n\n');
+ return blocks(s).replace(/\u0000(\d+)\u0000\n?/g,(m,i)=>keep[i])}
+function blocks(s){const out=[];let para=[],list=null;
+ const fp=()=>{if(para.length){out.push('<p>'+para.join('\n')+'</p>');para=[]}},fl=()=>{if(list){out.push('<'+list.t+'>'+list.i.join('')+'</'+list.t+'>');list=null}};
+ s.split('\n').forEach(l=>{let m;
+  if(m=l.match(/^\s*(?:[-*]|(\d+)\.)\s+(.*)$/)){fp();const t=m[1]?'ol':'ul';if(!list||list.t!==t){fl();list={t,i:[]}}
+   let b=m[2];const st=b.match(/^(ok|pass|fail|warn|n\/a)\s+-\s+(.*)$/i);if(st)b='<span class="'+(/ok|pass/i.test(st[1])?'ok':/fail/i.test(st[1])?'bad':/warn/i.test(st[1])?'warn':'dim')+'">'+st[1]+'</span> '+st[2];
+   const k=b.indexOf(' — ');if(k>0)b=b.slice(0,k)+'<span class="res">'+b.slice(k+3)+'</span>';
+   list.i.push('<li'+(m[1]?' value="'+m[1]+'"':'')+'>'+b+'</li>');return}
+  if(list&&/^\s{2,}\S/.test(l)){list.i[list.i.length-1]=list.i[list.i.length-1].replace(/<\/li>$/,' '+l.trim()+'</li>');return}
+  fl();if(!l.trim()){fp();return}
+  if(m=l.match(/^(PASS|FAIL|READY|NOT READY|BEHIND|BLOCKED|FIXED|DISPUTE)$/)){fp();out.push('<div class="vd '+vcls(m[1])+'">'+m[1]+'</div>');return}
+  if(m=l.match(/^(head|base) ([0-9a-f]{40})$/)){fp();out.push('<div class="kl"><span class="f">'+m[1]+'</span><code title="'+m[2]+'">'+m[2].slice(0,12)+'</code></div>');return}
+  if(m=l.match(/^<b>([^<]+?):?<\/b>:?$/)||l.match(/^([A-Z][A-Za-z0-9 \/-]{1,38}):$/)){fp();out.push('<div class="lb">'+m[1]+'</div>');return}
+  if(m=l.match(/^([A-Z][A-Za-z -]{1,22}): (.+)$/)){fp();out.push('<div class="kl"><span class="f">'+m[1]+'</span><span>'+m[2]+'</span></div>');return}
+  if(/^(\u0000\d+\u0000)+$/.test(l)){fp();out.push(l);return}
+  para.push(l)});fp();fl();return out.join('')}
+const vcls=v=>/PASS|APPROVED|^READY|SUCCESS|MERGED|CLEAN/.test(v)?'ok':/FAIL|CHANGES|NOT READY|ERROR|DIRTY|CONFLICT/.test(v)?'bad':/HUMAN|BEHIND|BLOCKED|TIMEOUT|UNSTABLE|REVIEW_REQUIRED|DRAFT/.test(v)?'warn':'dim';
+function ck(p){return p.fail?`<span class="bad">${p.fail} failing</span>`:p.wait?`<span class="warn">${p.wait} running</span>`:p.ok?`<span class="ok">checks pass</span>`:'no checks'}
+function listHtml(){const q=$('q').value.trim().toLowerCase(),rows=prs.filter(p=>(!q||('#'+p.n+' '+p.title+' '+p.branch+' '+p.author+' '+p.chain).toLowerCase().includes(q))&&(!P.flt.human||/human/i.test(p.chain||''))&&(!P.flt.fail||p.fail)&&(!P.flt.ui||p.ui));
+ if(P.sort==='number')rows.sort((a,b)=>b.n-a.n);else if(P.sort==='size')rows.sort((a,b)=>b.add+b.rem-a.add-a.rem);
+ $('tools').innerHTML=`<a data-sort title="Click To Change The Order">Sort: ${{updated:'Updated',number:'Number',size:'Size'}[P.sort]}</a>${[['human','Needs Human'],['fail','Failing'],['ui','UI']].map(([k,l])=>`<a data-f="${k}"${P.flt[k]?' class="on"':''}>${l}</a>`).join('')}<span class="cnt">${rows.length===prs.length?'':rows.length+' of '+prs.length}</span>`;
+ $('list').innerHTML=rows.length?rows.map(p=>`<div class="row${p.n===sel?' sel':''}" data-n="${p.n}"><span class="n">#${p.n}</span><span class="t">${esc(p.title)}</span><span class="a${seen[p.n]&&p.at>seen[p.n]&&p.n!==sel?' new" title="Changed Since You Last Opened It':''}">${ago(p.at)}</span>
+  <span class="s">${ck(p)} · ${p.draft?'draft · ':''}${p.merge&&p.state==='OPEN'?`<span class="${vcls(p.merge)}">${low(p.merge)}</span> · `:''}+${p.add} −${p.rem}${p.ui?' · UI':''}${p.tok?' · '+tk(p.tok)+' tokens'+us(p.usd):''}${p.chain?` · chain <span class="${vcls(p.chain)}">${low(p.chain)}</span>`:''}</span></div>`).join('')
+  :`<div class="empty">${prs.length?'No pull request matches the filter.':'Loading pull requests from GitHub…'}</div>`;
+ document.querySelectorAll('#sw a').forEach(a=>a.classList.toggle('on',a.dataset.s===which))}
+async function loadList(fresh){try{const r=await (await fetch('/api/prs?state='+which+(fresh?'&fresh=1':''))).json();
+  if(r.error){$('meta').innerHTML='<span class="warn">'+esc(r.error)+'</span>';return}
+  if(r.state!==which)return;prs=r.prs;markSeen();$('meta').textContent=`${prs.length} ${which} · GitHub read ${r.age<5?'just now':r.age+' s ago'}`;listHtml()}
+ catch(e){$('meta').innerHTML='<span class="bad">Board server not answering</span>'}}
+function attn(d){const ch=d.chain;if(!ch||d.state!=='OPEN'||!/^(AWAIT-HUMAN|NEEDS-PERSON|STUCK|HOLD-UI|LAND-STOPPED|CI-TIMEOUT|ERROR|MAIN-MOVING|UI-FAILED)$/.test(ch.status||''))return'';
+ const n=d.n,why=String(ch.why||''),c=d.checks,h8=String(ch.head||'').slice(0,8),cp=x=>`<code>${esc(x)}</code> <a data-copy="${esc(x)}">Copy</a>`,gh=(t,u)=>`<a href="${esc(u)}" target="_blank" rel="noopener">${t}</a>`;
+ const again=`Run the chain again: ${cp('pr-chain run '+n+' --land')}`,land=`Land it: ${cp('pr-chain land '+n+' --land')}`,verdict='<a data-attn="v">Open The Latest Verdict</a>';
+ const when=`stopped ${since(ch.updated)} at ${h8}, round ${ch.round??0}`;
+ if(ch.head&&ch.head!==d.head&&ch.status!=='NEEDS-PERSON')return`<div class="at"><div class="ah"><span class="dim">Nothing To Do Yet</span><span class="f">${when}</span></div><div>A new push arrived after this stop (the head is now ${d.head.slice(0,8)}). The loop runs this pull request again on its own within about 10 minutes.</div></div>`;
+ let what='',steps=[];
+ if(ch.status==='AWAIT-HUMAN'){what='The UI review passed. The chain posted screenshots of the changed screens and waits for your look before it merges.';
+  steps=[`Look at the screenshots: <a data-attn="g">Show Them Here</a> or ${gh('Open Them On GitHub',d.url+(ch.gate_comment?'#issuecomment-'+ch.gate_comment:''))}.`,
+   `They look right: ${gh('on GitHub',d.url)}, add the label ${cp('human-approved')}. The loop then waits for CI and merges on its next lap.`,
+   `They look wrong: leave a comment on the pull request saying what to change. The fixer takes the comment on the next lap and the reviews start over.`]}
+ else if(ch.status==='STUCK'){what='The chain stopped: this pull request came back 6 times with new findings in the same area and the redesign agent could not close it. It carries the chain/stuck label and a comment saying why.';
+  steps=['Read the design issue the chain filed and decide the approach.',`Push a change that is more than a merge of main: the next lap starts the chain again. After 2 such restarts it waits for you as NEEDS-PERSON.`]}
+ else if(ch.status==='NEEDS-PERSON'){what='The chain gave up: a new push lifted STUCK twice and it came back each time. It carries the chain/needs-person label and does not run again on its own.';
+  steps=['Decide what this pull request needs; the filed design issue has the history.',`Remove the label ${cp('chain/needs-person')} ${gh('on GitHub',d.url)}. The next lap starts it again with every counter at zero.`]}
+ else if(ch.status==='HOLD-UI'){what='This changes UI and no vision review has run at this head.';steps=[`Run the chain so the vision review and the screenshot step happen: ${cp('pr-chain run '+n+' --land')}`,`Or, when you already looked at this head yourself: ${cp('pr-chain land '+n+' --vision-ok --land')}`]}
+ else if(ch.status==='LAND-STOPPED'){what='Review and audit passed. The landing step refused to merge.';
+  if(/d_issue|no 'Fixes/.test(why))steps.push(`The description links no issue. ${gh('Edit the description on GitHub',d.url)} and add a line such as <code>Fixes #123</code>.`);
+  if(/spec_or_fix_brief/.test(why))steps.push('The description has no Fix Brief section (Root Cause and Regression Test). Add it in the same edit.');
+  if(/BEHIND|DIRTY|conflict/i.test(why))steps.push(`The branch is behind or conflicts with main. Merge main into <code>${esc(d.branch)}</code> and push.`);
+  if(!steps.length)steps.push('Read the stop reason below and fix what it names.');steps.push(land)}
+ else if(ch.status==='CI-TIMEOUT'){what='Review and audit passed. The required checks did not finish inside the wait window.';
+  steps=[c.fail?`${c.fail} checks are failing now: fix them (list under Checks Needing Attention), then push.`:c.wait?`${c.wait} checks are still running. Wait for them, then press Refresh.`:'All checks are green now.',land]}
+ else if(ch.status==='ERROR'){what='The chain tool itself broke. This is not a verdict on the pull request.';steps=[`Read the state file: ${cp('~/backups/pr-chain/prs/'+n+'/STATE.json')}`,again]}
+ else if(ch.status==='MAIN-MOVING'){what='main moved three times in a row while a stage ran, so the chain gave up for now.';steps=[again]}
+ else{what='The chain could not finish this pull request on its own.';
+  if(/conflict with main/.test(why))steps=[`Merge main into <code>${esc(d.branch)}</code>, resolve the conflicts and push. The loop runs the new head on its own.`];
+  else if(/fork PR/.test(why))steps=['This comes from a fork, so the fixer cannot push to it. '+verdict+', then ask the author for the changes or push them to the fork branch yourself.'];
+  else if(/screenshots/.test(why))steps=['The UI screenshots could not be made, so nobody reviewed the screens. Start the web UI test stack and check it renders.',again];
+  else if(/same findings|no audited PASS|audit failed/.test(why))steps=[verdict+': the fixer could not clear these findings.','Fix them by hand on <code>'+esc(d.branch)+'</code> and push (the loop runs the new head on its own), or close the pull request.'];
+  else if(/fixer/.test(why))steps=[verdict+' and the stop reason below: the fixer gave up.','Fix it by hand on <code>'+esc(d.branch)+'</code> and push (the loop runs the new head on its own).',`Or try once more: ${cp('pr-chain run '+n+' --land')}`];
+  else steps=[verdict+'.',again]}
+ const also=[];if(ch.status!=='LAND-STOPPED'&&!d.issues.length)also.push('the description links no issue, and landing refuses that');if(d.mergeable==='CONFLICTING'&&!/conflict/.test(why))also.push('the branch conflicts with main');if(c.fail&&ch.status!=='CI-TIMEOUT')also.push(c.fail+' checks are failing');
+ return`<div class="at"><div class="ah"><span class="warn">Needs Your Attention</span><span class="f">${when}</span></div><div>${what}</div><ol>${steps.map(s=>'<li>'+s+'</li>').join('')}</ol>${also.length?`<div class="dim">Also in the way: ${also.join('; ')}.</div>`:''}${why?`<div class="f why">Stop reason: ${esc(why.trim())}</div>`:''}</div>`}
+function kv(k,v){return v?`<div><dt>${k}</dt><dd>${v}</dd></div>`:''}
+function detHtml(){const d=det;if(!d||d.error)$('dh').innerHTML='';if(!d){$('det').innerHTML=`<div class="empty">${sel?'Loading #'+sel+' from GitHub…':'Select a pull request to see its properties and conversation.'}</div>`;return}
+ if(d.error){$('det').innerHTML=`<div class="empty"><a class="link" id="back">Back To List</a> <span class="warn">${esc(d.error)}</span></div>`;return}
+ const c=d.checks,ch=d.chain,st=d.merged?'MERGED':d.state==='CLOSED'?'CLOSED':d.draft?'DRAFT':'OPEN',th=only?d.thread.filter(x=>x.verdict):d.thread;
+ keepDl();$('dh').innerHTML=`<h1><span class="num">#${d.n}</span>${esc(d.title)}</h1>
+ <div class="facts">${esc(d.author)} · <span class="mono">${esc(d.branch)}</span> into <span class="mono">${esc(d.base)}</span> · head <span class="mono">${d.head.slice(0,8)}</span> · opened ${since(d.created)} · updated ${since(d.updated)}</div>${attn(d)}
+ <div class="act"><a id="back">Back To List</a><a href="${esc(d.url)}" target="_blank" rel="noopener">Open On GitHub</a><a href="${esc(d.url)}/files" target="_blank" rel="noopener">Open Diff</a><a data-copy="${esc(d.branch)}">Copy Branch</a><a data-copy="${d.head}">Copy Head SHA</a><a data-copy="pr-chain run ${d.n} --land">Copy Chain Command</a><a id="fresh">Refresh</a></div>
+ <dl>${kv('State',`<span class="${vcls(st)}">${low(st)}</span>${d.merged?' '+ago(d.merged)+' ago':''}`)}
+ ${kv('Review',d.review?`<span class="${vcls(d.review)}">${low(d.review)}</span>`:'none yet')}
+ ${kv('Merge State',d.merge?`<span class="${vcls(d.merge)}">${low(d.merge)}</span>${d.mergeable==='CONFLICTING'?' <span class="bad">conflicts</span>':''}`:'')}
+ ${kv('Checks',`${c.ok} pass${c.fail?` · <span class="bad">${c.fail} failing</span>`:''}${c.wait?` · <span class="warn">${c.wait} running</span>`:''}${c.skip?` · ${c.skip} skipped`:''}`)}
+ ${kv('Tokens',d.tok?tk(d.tok)+' used by chain agents'+us(d.usd)+(d.usd?' at API rates':''):'none recorded')}
+ ${kv('Size',`+${d.add} −${d.rem} in ${d.nfiles} files · ${d.ncommits} commits`)}
+ ${kv('Linked Issues',d.issues.length?d.issues.map(i=>`<a class="link" href="/issues#${i.n}" title="Open In The Issues Tab">#${i.n}</a>`).join(' '):'<span class="warn">none, landing needs one</span>')}
+ ${kv('Labels',d.labels.map(esc).join(', '))}
+ ${kv('Kind',d.ui===true?'UI, stops for a human review':d.ui===false?'no UI, merges after Audit and CI':'')}
+ ${kv('Chain',ch?`<span class="${vcls(ch.status||'')}">${low(ch.status)}</span>${ch.last_verdict?` · last verdict <span class="${vcls(ch.last_verdict)}">${low(ch.last_verdict)}</span>`:''} · round ${ch.round??0}${ch.head&&ch.head!==d.head?' · <span class="warn">head moved since</span>':''}`:'never run')}
+ </dl>${ch&&ch.why&&!attn(d)?`<dl class="one">${kv('Chain Note',esc(ch.why))}</dl>`:''}`;
+ $('det').innerHTML=`${c.items.length?`<h2>Checks Needing Attention</h2><table>${c.items.map(i=>`<tr><td class="k ${i.k==='fail'?'bad':'warn'}">${esc(i.res)}</td><td>${i.url?`<a href="${esc(i.url)}" target="_blank" rel="noopener">${esc(i.name)}</a>`:esc(i.name)}</td><td class="dim">${esc(i.flow)}</td></tr>`).join('')}</table>`:''}
+ <h2>Description</h2>${d.body?`<div class="md${bodyOpen?'':' clip'}" id="body">${md(d.body)}</div>`:'<div class="dim">No description.</div>'}
+ <h2>Conversation <span><input id="cq" placeholder="Search Comments" value="${esc(cq)}" autocomplete="off" spellcheck="false"><a class="link" id="lastv">Latest Verdict</a><a class="link" id="only">${only?'Show All '+d.thread.length:'Verdicts Only'}</a><a class="link" id="all">${openC.size?'Collapse All':'Expand All'}</a></span></h2>
+ ${th.length?th.map((x,i)=>{const id=d.thread.indexOf(x);return `<div class="c${openC.has(id)?' open':''}" data-c="${id}"><span class="mono f">${ago(x.at)}</span><span class="w">${esc(x.who)}</span>
+  <span class="g">${x.verdict?`<span class="${vcls(x.verdict)}">${low(x.verdict)}</span> `:''}<span class="dim">${esc(x.tag||(x.kind==='inline'?'inline':x.kind==='review'?'review':''))}</span></span>
+  <span class="l">${esc(x.first)}</span><div class="b">${x.extra?`<div class="mono f">${esc(x.extra)}</div>`:''}<div class="md">${md(x.body)}</div>${x.url?`<a class="link" href="${esc(x.url)}" target="_blank" rel="noopener">Open This Comment On GitHub</a>`:''}</div></div>`}).join(''):'<div class="dim">No comments.</div>'}
+ <h2>Files <span><a class="link${P.chg?' on':''}" id="chg">Changes Only</a><a class="link${P.wrap?' on':''}" id="wrap">Wrap Lines</a><a class="link" id="fall">${openF.size?'Collapse All':'Expand All'}</a>${d.nfiles>d.files.length?'largest '+d.files.length+' of '+d.nfiles:d.nfiles}</span></h2>
+ <div id="files"${P.wrap?' class="wrap"':''}>${d.files.map((f,i)=>`<div class="fr${openF.has(f.path)?' open':''}" data-f="${i}"><span class="p">${esc(f.path)}</span><span class="r"><span class="ok">+${f.add}</span> <span class="bad">−${f.rem}</span></span></div>${openF.has(f.path)?diffHtml(f.path):''}`).join('')}</div>
+ <h2>Latest Commits <span>${d.ncommits}</span></h2>
+ <table>${d.commits.map(m=>`<tr><td class="k f">${m.oid}</td><td>${esc(m.msg)}</td><td class="r f">${ago(m.at)}</td></tr>`).join('')}</table>
+ ${ledHtml(d.ledger)}${Runs.html()}`;restoreDl();secs();cqApply()}
+function ledHtml(L){if(!L.length)return '';const runs=[];let cur=[];L.forEach(r=>{cur.push(r);if(r.stage==='end'){runs.push(cur);cur=[]}});if(cur.length)runs.push(cur);
+ const models=[...new Set(L.map(r=>r.model).filter(Boolean))],one=models.length===1;
+ const mins=s=>s<90?Math.round(s)+'s':Math.round(s/60)+'m',hm=ts=>String(ts).split(' ').pop();
+ return `<h2>Chain History <span>${runs.length} ${runs.length===1?'run':'runs'} · ${L.length} steps${one?' · '+esc(models[0]):''}</span></h2><div class="runs">${runs.map(R=>{let last=hm(R[0].ts);
+  const steps=R.map((r,i)=>{const t=hm(r.ts),tm=i&&t!==last?`<span class="k f">${esc(t)}</span> `:'';last=t;
+   return `<span class="sp">${tm}${esc(r.stage)}${r.role?' '+esc(r.role):''}${r.secs?` <span class="dim">${mins(r.secs)}</span>`:''}${!one&&r.model?` <span class="dim">${esc(r.model)}</span>`:''}${r.rc?` <span class="bad">exit ${r.rc}</span>`:''}${r.status?` <span class="${vcls(r.status)}">${low(r.status)}</span>`:''}${r.why?` <span class="dim">${esc(r.why)}</span>`:''}</span>`});
+  if(R[R.length-1].stage!=='end')steps.push('<span class="dim">still running</span>');
+  return `<div class="run"><span class="k f">${esc(R[0].ts)}</span><span class="st">${steps.join(' <span class="dim">›</span> ')}</span></div>`}).join('')}</div>`}
+function secs(){let shut=false;[...$('det').children].forEach(el=>{if(el.tagName==='H2'){const k=el.firstChild.textContent.trim();shut=!!P.shut[k];el.dataset.sec=k;el.classList.toggle('shut',shut);el.title='Click To Hide Or Show This Section'}else el.hidden=shut})}
+function cqApply(){const q=cq.trim().toLowerCase();document.querySelectorAll('#det .c').forEach(el=>{const x=det.thread[+el.dataset.c];el.style.display=!q||(x.who+' '+x.first+' '+x.body+' '+(x.verdict||'')+' '+(x.tag||'')).toLowerCase().includes(q)?'':'none'})}
+function markSeen(){const p=prs.find(p=>p.n===sel);if(p&&seen[p.n]!==p.at){seen[p.n]=p.at;save()}}
+function allFiles(){if(openF.size)openF.clear();else{det.files.forEach(f=>openF.add(f.path));if(!diff||diffErr){diffErr='';loadDiff()}}redraw()}
+function lastVerdict(){let i=-1;det.thread.forEach((x,j)=>{if(x.verdict)i=j});if(i<0)return;only=false;cq='';delete P.shut.Conversation;openC.add(i);detHtml();document.querySelector('#det .c[data-c="'+i+'"]')?.scrollIntoView({block:'start'})}
+function redraw(){const y=$('det').scrollTop;detHtml();$('det').scrollTop=y}
+function diffHtml(path){if(diffErr)return`<div class="df dim">Could not read the diff: ${esc(diffErr)}</div>`;if(!diff)return'<div class="df dim">Reading diff…</div>';const f=diff.files[path];
+ if(!f)return'<div class="df dim">No diff for this file.</div>';if(!f.lines.length)return`<div class="df dim">${esc(f.note)}</div>`;
+ let o=0,n=0;const rows=f.lines.map(l=>{const c=l[0];if(c==='@'){const m=l.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)/);if(m){o=+m[1];n=+m[2]}return`<div class="h"><i></i><i></i><b>${esc(l)}</b></div>`}
+  if(c==='\\')return`<div class="h"><i></i><i></i><b>${esc(l)}</b></div>`;
+  if(c==='+')return`<div class="a"><i></i><i>${n++}</i><b>${esc(l)||' '}</b></div>`;if(c==='-')return`<div class="m"><i>${o++}</i><i></i><b>${esc(l)}</b></div>`;
+  o++;n++;return P.chg?'':`<div><i>${o-1}</i><i>${n-1}</i><b>${esc(l)||' '}</b></div>`}).join('');
+ return`<div class="df"><div class="dl" data-p="${esc(path)}"${dlH[path]?` style="max-height:${dlH[path]}px"`:''}>${rows}</div><div class="rz y" data-rz="dl" title="Drag To Resize, Double-Click To Reset"></div>${f.cut?`<div class="dim">${f.cut} more lines not shown. Use Open Diff for the rest.</div>`:''}</div>`}
+async function loadDiff(fresh){const n=sel;if(!n)return;try{const r=await (await fetch('/api/pr/'+n+'/diff'+(fresh?'?fresh=1':''))).json();if(n!==sel)return;if(r.error){diffErr=r.error}else{diff=r;diffErr=''}}catch(e){diffErr='request failed'}if(n===sel&&openF.size)detHtml()}
+async function loadDet(fresh){const n=sel;if(!n)return;try{const r=await (await fetch('/api/pr/'+n+(fresh?'?fresh=1':''))).json();if(n!==sel)return;det=r;detHtml();if(!r.error)Runs.load('pr',n,redraw)}catch(e){}}
+function pick(n,push){if(n===sel&&det)return;sel=n;det=null;openC=new Set();only=false;bodyOpen=false;openF=new Set();diff=null;diffErr='';cq='';markSeen();document.body.classList.toggle('d',!!n);if(push)history.pushState(null,'',n?'#'+n:location.pathname);listHtml();detHtml();$('det').scrollTop=0;loadDet()}
+$('list').onclick=e=>{const r=e.target.closest('.row');if(r)pick(+r.dataset.n,true)};
+$('sw').onclick=e=>{const s=e.target.dataset.s;if(s&&s!==which){which=P.which=s;save();prs=[];listHtml();loadList()}};
+$('q').value=P.q;$('q').oninput=()=>{P.q=$('q').value;save();listHtml()};
+$('tools').onclick=e=>{const t=e.target;if('sort' in t.dataset)P.sort={updated:'number',number:'size',size:'updated'}[P.sort];else if(t.dataset.f)P.flt[t.dataset.f]=!P.flt[t.dataset.f];else return;save();listHtml()};
+$('det').addEventListener('input',e=>{if(e.target.id==='cq'){cq=e.target.value;cqApply()}});
+$('detcol').onclick=e=>{const t=e.target;if(t.closest('a[href]'))return;
+ if(Runs.click(t,redraw))return;
+ if(t.id==='back'){pick(null,true);return}
+ if(t.id==='fresh'){t.textContent='Reading GitHub…';loadDet(true);loadList(true);if(openF.size)loadDiff(true);return}
+ if(t.dataset.attn==='v'){lastVerdict();return}
+ if(t.dataset.attn==='g'){let i=-1;det.thread.forEach((x,j)=>{if(x.tag==='Human Gate')i=j});if(i<0)return;only=false;cq='';delete P.shut.Conversation;openC.add(i);detHtml();const el=document.querySelector('#det .c[data-c="'+i+'"]');if(el)el.scrollIntoView({block:'start'});return}
+ if(t.dataset.copy){navigator.clipboard.writeText(t.dataset.copy);const o=t.textContent;t.textContent='Copied';setTimeout(()=>t.textContent=o,900);return}
+ const fr=t.closest('.fr');if(fr){if(String(getSelection()))return;const p=det.files[+fr.dataset.f].path;if(openF.has(p))openF.delete(p);else{openF.add(p);if(!diff||diffErr){diffErr='';loadDiff()}}const y=$('det').scrollTop;detHtml();$('det').scrollTop=y;return}
+ if(t.id==='cq')return;
+ if(t.tagName==='H2'&&t.dataset.sec){P.shut[t.dataset.sec]=!P.shut[t.dataset.sec];save();secs();return}
+ if(t.id==='chg'){P.chg=!P.chg;save();redraw();return}
+ if(t.id==='wrap'){P.wrap=!P.wrap;save();redraw();return}
+ if(t.id==='fall'){allFiles();return}
+ if(t.id==='lastv'){lastVerdict();return}
+ if(t.id==='only'){only=!only;detHtml();return}
+ if(t.id==='all'){if(openC.size)openC.clear();else det.thread.forEach((x,i)=>openC.add(i));detHtml();return}
+ if(t.closest('#body')){if(!bodyOpen){bodyOpen=true;detHtml()}return}
+ const c=t.closest('.c');if(c&&!(t.closest('.b')&&String(getSelection()))){const i=+c.dataset.c;if(t.closest('.b'))return;openC.has(i)?openC.delete(i):openC.add(i);const y=$('det').scrollTop;detHtml();$('det').scrollTop=y}};
+addEventListener('keydown',e=>{if(e.target.tagName==='INPUT'){if(e.key==='Escape')e.target.blur();return}if(e.metaKey||e.ctrlKey||e.altKey)return;
+ if(det&&!det.error&&'orev'.includes(e.key)){if(e.key==='o')window.open(det.url,'_blank','noopener');else if(e.key==='r'){loadDet(true);loadList(true);if(openF.size)loadDiff(true)}else if(e.key==='e')allFiles();else lastVerdict();return}
+ if(e.key==='/'){e.preventDefault();$('q').focus()}else if(e.key==='Escape')pick(null,true);
+ else if(e.key==='j'||e.key==='k'){const rows=[...document.querySelectorAll('.row')].map(r=>+r.dataset.n);if(!rows.length)return;let i=rows.indexOf(sel);i=i<0?0:Math.max(0,Math.min(rows.length-1,i+(e.key==='j'?1:-1)));pick(rows[i],true);document.querySelector('.row.sel')?.scrollIntoView({block:'nearest'})}});
+let dlH={},dlPos={},rz=null;const grid=document.querySelector('.grid');
+function keepDl(){dlPos={};document.querySelectorAll('.dl').forEach(e=>dlPos[e.dataset.p]=[e.scrollTop,e.scrollLeft])}
+function restoreDl(){document.querySelectorAll('.dl').forEach(e=>{const p=dlPos[e.dataset.p];if(p){e.scrollTop=p[0];e.scrollLeft=p[1]}})}
+function setLw(w){w=Math.max(220,Math.min(w,grid.clientWidth-345));grid.style.setProperty('--lw',w+'px');return w}
+function setHh(v){v=Math.max(26,Math.min(v,$('detcol').clientHeight-110));$('dh').style.height=v+'px';$('dh').style.maxHeight='none';return v}
+addEventListener('pointerdown',e=>{const h=e.target.closest('.rz');if(!h)return;e.preventDefault();const k=h.dataset.rz,el=k==='lw'?$('listcol'):h.previousElementSibling,r=el.getBoundingClientRect();
+ rz={h,k,el,s:k==='lw'?e.clientX:e.clientY,v:k==='lw'?r.width:r.height};h.classList.add('on');h.setPointerCapture(e.pointerId)});
+addEventListener('pointermove',e=>{if(!rz)return;const v=rz.v+((rz.k==='lw'?e.clientX:e.clientY)-rz.s);
+ if(rz.k==='lw')rz.out=setLw(v);else if(rz.k==='hh')rz.out=setHh(v);else{const x=Math.max(60,v);rz.el.style.maxHeight=x+'px';dlH[rz.el.dataset.p]=x}});
+const rzEnd=()=>{if(!rz)return;rz.h.classList.remove('on');if(rz.out&&rz.k!=='dl')localStorage.setItem('prs.'+rz.k,Math.round(rz.out));rz=null};
+addEventListener('pointerup',rzEnd);addEventListener('pointercancel',rzEnd);
+addEventListener('dblclick',e=>{const h=e.target.closest('.rz');if(!h)return;const k=h.dataset.rz;if(k==='lw'){grid.style.removeProperty('--lw');localStorage.removeItem('prs.lw')}
+ else if(k==='hh'){$('dh').style.height='';$('dh').style.maxHeight='';localStorage.removeItem('prs.hh')}else{const el=h.previousElementSibling;el.style.maxHeight='';delete dlH[el.dataset.p]}});
+function sizes(){const w=+localStorage.getItem('prs.lw'),v=+localStorage.getItem('prs.hh');if(w)setLw(w);const d=$('dh');if(innerWidth<=900||$('detcol').clientHeight<240){d.style.height='';d.style.maxHeight=''}else if(v)setHh(v)}
+sizes();addEventListener('resize',sizes);
+function fromHash(){const n=parseInt(location.hash.slice(1));pick(n||null,false)}
+addEventListener('popstate',fromHash);
+loadList();fromHash();detHtml();
+setInterval(()=>{if(!document.hidden){loadList();if(sel&&!String(getSelection())&&document.activeElement.id!=='cq')loadDet()}},60000);
+document.addEventListener('visibilitychange',()=>{if(!document.hidden){loadList();if(sel&&!String(getSelection()))loadDet()}});
+</script></body></html>

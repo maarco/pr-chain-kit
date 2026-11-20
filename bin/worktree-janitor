@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+"""worktree-janitor: remove the git worktrees (and the code index each one built) of work that is finished.
+
+A merged or closed PR must not leave its working copy on this machine; leftovers are what fills the disk.
+The pr-chain cleans its own worktrees (`pr-chain doctor`); this covers every other worktree of the repo (lanes, reviews,
+codex fixes). A worktree goes only when ALL of these hold:
+  - it is not the main checkout, not locked, and not one of the chain's (<worktree_root>/*, the chain owns those);
+  - no process stands in it (cwd) and nothing in it changed for MIN_IDLE_H hours;
+  - `git status` is clean, including ignored files;
+  - its HEAD is already on origin/main, or it is the last commit of a MERGED or CLOSED PR and no PR for the branch is open.
+Closed-PR commits must also be reachable from a local branch. Branches are never deleted.
+
+  worktree-janitor             list what would go using the local main ref (dry run)
+  worktree-janitor --apply     remove them (plain `git worktree remove`, never forced)
+
+Run by hand, and by `pr-chain doctor` at most once an hour (apply mode, log ~/backups/pr-chain/logs/janitor.log).
+"""
+import argparse
+import fcntl
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HOME = Path.home()
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "chain"))
+try:
+    from config import CFG as _CONF  # defaults come from pr-chain.toml; CLI flags still win
+    SLUG = _CONF.slug
+except Exception:
+    _CONF = None
+    SLUG = os.environ.get("KIT_REPO", "owner/name")
+MIN_IDLE_H = float(os.environ.get("WORKTREE_JANITOR_IDLE_H", "6"))
+
+
+def run(*cmd, timeout=120):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(cmd, 124, "", "timeout")
+
+
+def git(repo, *args, timeout=120):
+    return run("git", "--no-optional-locks", "-C", str(repo), *args, timeout=timeout)
+
+
+def worktrees(repo):
+    """One dict per worktree from `git worktree list --porcelain`: worktree, HEAD, branch, detached, locked, prunable."""
+    rows, cur = [], {}
+    result = git(repo, "worktree", "list", "--porcelain")
+    if result.returncode:
+        raise RuntimeError("cannot list worktrees")
+    for line in result.stdout.splitlines() + [""]:
+        if not line:
+            if cur:
+                rows.append(cur)
+                cur = {}
+            continue
+        key, _, val = line.partition(" ")
+        cur[key] = val
+    return rows
+
+
+def busy_dirs():
+    """cwd of every process of this user: a worktree some process stands in is in use."""
+    result = run("lsof", "-a", "-d", "cwd", "-Fn", "-u", str(os.getuid()), timeout=60)
+    if result.returncode:
+        raise RuntimeError("cannot reliably inspect process working directories")
+    return {line[1:] for line in result.stdout.splitlines() if line.startswith("n")}
+
+
+def pr_list():
+    """Every PR (any state) with its head commit, from GitHub."""
+    p = run("gh", "pr", "list", "-R", SLUG, "--state", "all", "--limit", "3000", "--json", "number,state,headRefName,headRefOid", timeout=180)
+    if p.returncode:
+        raise SystemExit(f"worktree-janitor: GitHub did not answer, nothing removed ({p.stderr.strip()[:150]})")
+    return json.loads(p.stdout)
+
+
+def idle_hours(path):
+    """Hours since any worktree entry or its Git metadata changed; errors keep it."""
+    stamps = [path.stat().st_mtime]
+    def onerror(error):
+        raise error
+    for root, dirs, files in os.walk(path, onerror=onerror, followlinks=False):
+        for name in dirs + files:
+            stamps.append((Path(root) / name).lstat().st_mtime)
+    result = git(path, "rev-parse", "--absolute-git-dir")
+    if result.returncode or not result.stdout.strip():
+        raise RuntimeError("cannot inspect worktree metadata")
+    gd = result.stdout.strip()
+    for name in ("HEAD", "index"):
+        f = Path(gd) / name
+        if gd and f.exists():
+            stamps.append(f.stat().st_mtime)
+    return (time.time() - max(stamps)) / 3600
+
+
+def judge(wt, repo, main_ref, prs, busy, skip_prefixes, now_idle=idle_hours):
+    """('remove' | 'keep', why) for one worktree."""
+    path = Path(wt["worktree"])
+    if path.resolve() == Path(repo).resolve():
+        return "keep", "main checkout"
+    if any(str(path).startswith(p) or str(path).startswith(os.path.realpath(p) + os.sep) for p in skip_prefixes):
+        return "keep", "the pr-chain's own (it cleans these)"
+    if path.name.endswith("-train"):  # agent-kit's fold.py runs in `<agent>-train` and does not recreate it
+        return "keep", "a fold worktree (agent-kit needs it to exist)"
+    if "locked" in wt:
+        return "keep", "locked"
+    if not path.exists():
+        return "keep", "folder gone (git worktree prune)"
+    if any(os.path.realpath(b) == str(path) or os.path.realpath(b).startswith(str(path) + os.sep) for b in busy):
+        return "keep", "a process is inside"
+    status = git(path, "status", "--porcelain", "--ignored=matching", "--untracked-files=all")
+    if status.returncode:
+        return "keep", "cannot inspect git status"
+    if status.stdout.strip():
+        return "keep", "modified, untracked or ignored files"
+    try:
+        idle = now_idle(path)
+    except (OSError, RuntimeError):
+        return "keep", "cannot inspect activity"
+    if idle < MIN_IDLE_H:
+        return "keep", f"touched {idle:.1f} h ago"
+    head = wt.get("HEAD", "")
+    branch = wt.get("branch", "").removeprefix("refs/heads/")
+    if branch and any(p["headRefName"] == branch and p["state"] == "OPEN" for p in prs):
+        return "keep", "its PR is open"
+    # the reason names what was checked (HEAD, idle hours, the PR), so the log is the evidence and nothing has to be re-derived later
+    if git(repo, "merge-base", "--is-ancestor", head, main_ref).returncode == 0:
+        return "remove", f"HEAD {head[:8]} is on {main_ref}; idle {idle:.0f} h"
+    done = [p for p in prs if p["headRefOid"] == head and p["state"] in ("MERGED", "CLOSED")]
+    if done and not any(p["headRefOid"] == head and p["state"] == "OPEN" for p in prs):
+        refs = git(repo, "for-each-ref", "--format=%(refname)", "--contains", head, "refs/heads/")
+        if refs.returncode or not refs.stdout.strip():
+            return "keep", "PR commit is not preserved by a local branch"
+        return "remove", f"HEAD {head[:8]} is the last commit of {done[0]['state'].lower()} PR #{done[0]['number']}; idle {idle:.0f} h"
+    return "keep", "HEAD does not meet removal criteria"
+
+
+def du_mb(path):
+    p = run("du", "-sk", str(path), timeout=60)
+    try:
+        return int(p.stdout.split()[0]) / 1024
+    except (ValueError, IndexError):
+        return 0.0
+
+
+def drop_index(path, index_dir):
+    stem = str(Path(path).resolve()).lstrip("/").replace("/", "-")
+    n = 0
+    for suf in (".db", ".db-wal", ".db-shm"):
+        f = index_dir / (stem + suf)
+        if f.exists():
+            n += f.stat().st_size
+            f.unlink()
+    return n / 1048576
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--apply", action="store_true", help="remove them (default: only list)")
+    ap.add_argument("--repo", default=str(_CONF.checkout if _CONF else HOME / "dev/repo"))
+    ap.add_argument("--main-ref", default="origin/main")
+    ap.add_argument("--index-dir", default=str(HOME / ".cache" / "codebase-memory-mcp"))
+    ap.add_argument("--prs-json", help="a file with the PR list instead of asking GitHub (tests)")
+    ap.add_argument("--skip-prefix", action="append", default=None, help="worktree path prefixes that belong to someone else")
+    ap.add_argument("--lock", default=str((_CONF.work if _CONF else HOME / "backups/pr-chain") / "janitor.lock"), help="one run at a time")
+    a = ap.parse_args(argv)
+    repo, index_dir = Path(a.repo), Path(a.index_dir)
+    Path(a.lock).parent.mkdir(parents=True, exist_ok=True)
+    lock = open(a.lock, "w")  # held until this process ends
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:  # 11-16: the hourly run and a hand run overlapped and both logged the same two worktrees as removed
+        print("worktree-janitor: another run is active; nothing done")
+        return 0
+    skip = a.skip_prefix if a.skip_prefix is not None else [str(_CONF.worktree_root if _CONF else HOME / "wt/pr-chain") + os.sep]
+    if a.apply and git(repo, "fetch", "-q", "origin", "main", timeout=120).returncode:
+        raise SystemExit("worktree-janitor: fetch failed, nothing removed")
+    if not a.apply:
+        print(f"dry run: using local {a.main_ref}; apply refreshes origin/main")
+    prs = json.loads(Path(a.prs_json).read_text()) if a.prs_json else pr_list()
+    busy = busy_dirs()
+    freed, removed = 0.0, 0
+    for wt in worktrees(repo):
+        what, why = judge(wt, repo, a.main_ref, prs, busy, skip)
+        name = Path(wt["worktree"]).name
+        if what != "remove":
+            if why not in ("main checkout", "the pr-chain's own (it cleans these)"):
+                print(f"keep    {name:44} {why}")
+            continue
+        size = du_mb(wt["worktree"])
+        if not a.apply:
+            print(f"WOULD   {name:44} {size:7.0f} MB  {why}")
+            freed += size
+            removed += 1
+            continue
+        # Refresh the mutable checks immediately before removing the checkout.
+        current = next((row for row in worktrees(repo) if row["worktree"] == wt["worktree"]), None)
+        if not current or current.get("HEAD") != wt.get("HEAD") or current.get("branch") != wt.get("branch"):
+            print(f"keep    {name:44} worktree changed during scan")
+            continue
+        what, why = judge(current, repo, a.main_ref, prs, busy_dirs(), skip)
+        if what != "remove":
+            print(f"keep    {name:44} {why}")
+            continue
+        p = git(repo, "worktree", "remove", wt["worktree"])
+        if p.returncode:
+            print(f"keep    {name:44} git refused: {p.stderr.strip()[:90]}")
+            continue
+        freed += size + drop_index(wt["worktree"], index_dir)
+        removed += 1
+        print(f"removed {name:44} {size:7.0f} MB  {why}")
+    print(f"{'removed' if a.apply else 'would remove'} {removed} worktree(s), about {freed / 1024:.1f} GB (worktree folders" + (", plus their code indexes)" if a.apply else "; indexes not counted)"))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

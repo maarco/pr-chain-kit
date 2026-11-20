@@ -1,0 +1,1833 @@
+#!/usr/bin/env python3
+"""pr-chain-board: live page for the pr-chain loop. http://127.0.0.1:8790
+
+Shows the PR in flight, which step it is on, the agent's latest lines, the queue of PRs that come next and the last
+results. Reads only: the work folder (claims, prs/<n>/STATE.json, stage folders, ledger.jsonl, logs/loop.log) and
+`pr-chain pick` (cached 3 minutes). POST /api/loop {"action":"start"} starts pr-chain-loop when it is down (the Start Loop button). The other writing surface is /config (2026-11-13): it edits
+chain/models.json (backup beside it), the loop thread count (board-config.json) and the
+NO-BUILD issue-building block, and saves/applies named model profiles (profiles.json); every other route is read-only.
+The /config model rows render the real per-stage command through agent_cmd() loaded from the pr-chain script itself.
+/prs is the pull request browser (board/prs.html): list, properties and condensed conversation, read from gh (read-only calls).
+Run: pr-chain-board [port]
+"""
+import hashlib
+import json
+import shlex
+import urllib.request
+import os
+import re
+import subprocess
+import sys
+import shutil
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "chain"))
+from config import CFG as CONF  # noqa: E402  pr-chain.toml: paths.work etc.
+
+WORK = CONF.work
+CHAIN = str(ROOT / "bin" / "pr-chain")
+LOGS = [WORK / "logs" / "loop.log"]
+STEPS = ["Update Branch", "Review", "Fix", "Audit", "UI Review", "Human Gate", "CI", "Merge"]
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+pick_cache = {"at": 0, "rows": [], "busy": False}
+VENDOR = ROOT / "vendor" / "three"
+vendor_cache = {}
+
+# --- /config page state: models.json, thread count, issue-building block, profiles ---
+PC = ROOT / "chain"
+MODELS_FILE = PC / "models.json"
+CFG_FILE = Path(os.environ.get("PR_CHAIN_BOARD_CONFIG") or (CONF.board_config or WORK / "board-config.json"))
+NO_BUILD = WORK / "NO-BUILD"
+CONFIG_PAGE = PC / "board" / "config.html"
+PROFILES_FILE = PC / "profiles.json"
+COMMANDS_FILE = PC / "commands.json"  # named full commands; a stage value cmd:<name> runs one
+# keep in sync with MODEL_ROLES in bin/pr-chain
+BUILTIN_MODELS = {"review": "haiku", "fix": "haiku", "gate": "opus", "ui": "opus", "build": "haiku", "scout": "haiku"}
+MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")
+
+
+# The loop process itself (python running bin/pr-chain-loop), not any shell whose command text mentions it
+# (11-14 21:00: a watcher shell holding that text made the watchdog skip a restart).
+LOOP_PROC = r"^[^ ]*python[^ ]* -B [^ ]*bin/pr-chain-loop"
+
+def _chain_mod():
+    """Load bin/pr-chain once and cache it, so /config shows the REAL command builder."""
+    mod = _chain_mod.cache
+    if mod is None:
+        try:
+            import importlib.util
+            from importlib.machinery import SourceFileLoader
+            loader = SourceFileLoader("pr_chain_mod", CHAIN)
+            spec = importlib.util.spec_from_loader(loader.name, loader)
+            mod = importlib.util.module_from_spec(spec)
+            loader.exec_module(mod)
+        except Exception as e:
+            mod = False
+            print(f"board: could not load pr-chain for command rendering: {e}", file=sys.stderr)
+    _chain_mod.cache = mod
+    return mod or None
+
+
+_chain_mod.cache = None
+
+
+def read_commands():
+    try:
+        data = json.loads(COMMANDS_FILE.read_text())
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def command_uses(name):
+    """Where cmd:<name> is referenced: stage names in models.json and profile names."""
+    ref = f"cmd:{name}"
+    try:
+        cur = json.loads(MODELS_FILE.read_text())
+    except Exception:
+        cur = {}
+    stages = sorted(r for r, v in cur.items() if v == ref)
+    profiles = sorted(n for n, p in read_profiles().items() if isinstance(p, dict) and ref in p.values())
+    return stages, profiles
+
+
+def validate_command(name, cmd):
+    """None when valid, else the error string."""
+    if not isinstance(name, str) or not NAME_RE.match(name):
+        return f"bad command name: {name!r} (letters, digits, . _ -, max 32)"
+    if not isinstance(cmd, str) or not cmd.strip() or len(cmd) > 4000 or "\n" in cmd or "\r" in cmd:
+        return "the command must be one line, at most 4000 characters"
+    if "<brief.md>" not in cmd:
+        return "the command needs a <brief.md> slot; the chain puts the brief path there"
+    if "astra" in cmd.lower():
+        return "gpt-6-astra is banned"
+    try:
+        shlex.split(cmd)
+    except ValueError as e:
+        return f"the command does not parse: {e}"
+    return None
+
+
+def read_profiles():
+    try:
+        data = json.loads(PROFILES_FILE.read_text())
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _procs():
+    try:
+        out = subprocess.run(["/bin/ps", "-axo", "pid,ppid,command"], capture_output=True, text=True).stdout
+    except Exception:
+        return []
+    rows = []
+    for ln in out.splitlines()[1:]:
+        parts = ln.strip().split(None, 2)
+        if len(parts) == 3:
+            rows.append((int(parts[0]), int(parts[1]), parts[2]))
+    return rows
+
+
+def running_chains():
+    """Live chain processes (with their full run command) and their agent children (codex/claude descendants)."""
+    rows = _procs()
+    chains = {pid: cmd for pid, _ppid, cmd in rows if re.search(r"bin/pr-chain (run|land) ", cmd)}
+    parent = {pid: _ppid for pid, _ppid, _cmd in rows}
+
+    def under_chain(pid):
+        seen = set()
+        while pid in parent and pid not in seen:
+            if pid in chains:
+                return True
+            seen.add(pid)
+            pid = parent[pid]
+        return False
+
+    agents = 0
+    for pid, _ppid, cmd in rows:
+        if re.search(r"(codex|claude)", cmd) and under_chain(parent.get(pid)):
+            agents += 1
+    loop_cmd = next((cmd for _pid, _ppid, cmd in rows if re.search(r"bin/pr-chain-loop( |$)", cmd)), "")
+    return [dict(pid=pid, cmd=cmd) for pid, cmd in sorted(chains.items())], agents, loop_cmd
+
+
+def read_prs_at_once():
+    """flow.json limits.prs_at_once: how many PRs pick marks free (the loop's threads only add build slots above it)."""
+    try:
+        v = json.loads((ROOT / "chain" / "flow.json").read_text())["limits"]["prs_at_once"]["value"]
+        return v if v != -1 else None
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def read_threads():
+    try:
+        return max(1, min(4, int(json.loads(CFG_FILE.read_text())["threads"])))
+    except Exception:
+        return 1
+
+
+PROMPT_DIR = PC / "prompts"
+PROMPT_USE = {"review.md": "review and audit agents", "review-fix.md": "added to the review brief: the reviewer fixes what it fails",
+              "fix.md": "plain fixer (red CI, conflicts, gate findings, your comments)", "ui-review.md": "UI screenshot reviewer",
+              "addendum.md": "merge-only addendum after main moves", "build.md": "issue builder", "scout.md": "issue scout"}
+
+
+def prompt_files():
+    return sorted(f for f in PROMPT_DIR.glob("*.md") if f.is_file())
+
+
+def config_state():
+    models = {}
+    cfg = {}
+    if MODELS_FILE.exists():
+        try:
+            cfg = json.loads(MODELS_FILE.read_text())
+        except Exception:
+            cfg = {}
+    chain = _chain_mod()
+    commands, labels = {}, {}
+    for role, builtin in BUILTIN_MODELS.items():
+        env = os.environ.get(f"PR_CHAIN_{role.upper()}_MODEL")
+        if env:
+            models[role] = [env, f"env PR_CHAIN_{role.upper()}_MODEL"]
+        elif cfg.get(role):
+            models[role] = [cfg[role], str(MODELS_FILE)]
+        else:
+            models[role] = [builtin, "built-in"]
+        if chain is not None:
+            try:
+                val = models[role][0]
+                named = read_commands().get(val[4:]) if val.startswith("cmd:") else None
+                commands[role] = named if isinstance(named, str) else shlex.join(chain.agent_cmd(val))
+                labels[role] = chain.cmd_label(commands[role]) if hasattr(chain, "cmd_label") else val
+            except (Exception, SystemExit) as e:
+                commands[role] = f"(cannot render: {e})"
+        else:
+            commands[role] = "(pr-chain script did not load; see board log)"
+    file_map = {k: str(v) for k, v in sorted(cfg.items()) if k in BUILTIN_MODELS}
+    profiles = [{"name": n, "models": p, "active": p == file_map}
+                for n, p in sorted(read_profiles().items())]
+    chains, agents, loop_cmd = running_chains()
+    return {"prompts": [dict(name=f.name, text=f.read_text(), use=PROMPT_USE.get(f.name, "")) for f in prompt_files()],
+            "models": models, "builtins": BUILTIN_MODELS, "models_file": str(MODELS_FILE),
+            "commands": commands, "labels": labels, "profiles": profiles,
+            "named": {n: {"cmd": c, "uses": dict(zip(("stages", "profiles"), command_uses(n)))}
+                      for n, c in sorted(read_commands().items())},
+            "threads": read_threads(), "prs_at_once": read_prs_at_once(), "build_issues": not NO_BUILD.exists(),
+            "running": {"chains": len(chains), "agents": agents, "loop_cmd": loop_cmd, "chain_cmds": chains}}
+
+
+def write_atomic(path, text):
+    tmp = path.with_suffix(path.suffix + f".tmp{os.getpid()}")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
+def validate_models(m):
+    """None when valid, else the error string."""
+    if not isinstance(m, dict) or set(m) - set(BUILTIN_MODELS):
+        return "models must hold only: " + ", ".join(sorted(BUILTIN_MODELS))
+    for role, val in m.items():
+        if not isinstance(val, str) or not MODEL_RE.match(val):
+            return f"bad model name for {role}: {val!r}"
+    if any("astra" in str(v).lower() for v in m.values()):
+        return "gpt-6-astra is banned"
+    names = read_commands()
+    for role, val in m.items():
+        if val.startswith("cmd:") and val[4:] not in names:
+            return f"{role}: no command named {val[4:]!r}"
+    return None
+
+
+def backup_models():
+    if MODELS_FILE.exists():
+        bak = MODELS_FILE.with_name(f"models.json.bak-{time.strftime('%Y%m%d-%H%M%S')}")
+        shutil.copy2(MODELS_FILE, bak)
+
+
+def write_models(m):
+    """Write a full role->model map (empty values drop the role)."""
+    backup_models()
+    cur = {}
+    if MODELS_FILE.exists():
+        try:
+            cur = json.loads(MODELS_FILE.read_text())
+        except Exception:
+            cur = {}
+    cur.update({k: v for k, v in m.items() if v})
+    for k, v in m.items():
+        if not v:
+            cur.pop(k, None)
+    write_atomic(MODELS_FILE, json.dumps(cur, indent=2, sort_keys=True) + "\n")
+
+
+def apply_config(body):
+    """Validate and apply one POST from the config page. Returns (ok, saved-message).
+
+    Profile operations run first and return before anything else writes, so a rejected
+    request never touches models.json."""
+    saved = []
+    if "save_prompt" in body:  # a stage brief; the old text is kept in prompts/.history, and no {{SLOT}} may disappear
+        c = body["save_prompt"] if isinstance(body["save_prompt"], dict) else {}
+        name, text = c.get("name"), c.get("text")
+        f = PROMPT_DIR / str(name)
+        if not isinstance(name, str) or f not in prompt_files():
+            return False, "unknown prompt file"
+        if not isinstance(text, str) or not text.strip():
+            return False, "a prompt cannot be empty"
+        old = f.read_text()
+        gone = sorted(set(re.findall(r"\{\{[A-Z_]+\}\}", old)) - set(re.findall(r"\{\{[A-Z_]+\}\}", text)))
+        if gone:
+            return False, "the chain fills these slots and they are missing now: " + ", ".join(gone)
+        hist = PROMPT_DIR / ".history"
+        hist.mkdir(exist_ok=True)
+        (hist / f"{name}.{time.strftime('%Y%m%d-%H%M%S')}").write_text(old)
+        write_atomic(f, text if text.endswith("\n") else text + "\n")
+        return True, f"prompt saved: {name} (old copy in prompts/.history)"
+    if "save_command" in body:
+        c = body["save_command"] if isinstance(body["save_command"], dict) else {}
+        name, cmd = c.get("name"), (c.get("cmd") or "").strip() if isinstance(c.get("cmd"), str) else c.get("cmd")
+        err = validate_command(name, cmd)
+        if err:
+            return False, err
+        cmds = read_commands()
+        existed = name in cmds
+        cmds[name] = cmd
+        write_atomic(COMMANDS_FILE, json.dumps(cmds, indent=2, sort_keys=True) + "\n")
+        saved.append(f"command {'updated' if existed else 'added'}: {name}")
+        return True, "; ".join(saved)
+    if "delete_command" in body:
+        name = body["delete_command"]
+        cmds = read_commands()
+        if not isinstance(name, str) or name not in cmds:
+            return False, f"no such command: {name!r}"
+        stages, profs = command_uses(name)
+        if stages or profs:
+            return False, f"{name} is still used by " + ", ".join(
+                ([f"stages {', '.join(stages)}"] if stages else []) + ([f"profiles {', '.join(profs)}"] if profs else []))
+        del cmds[name]
+        write_atomic(COMMANDS_FILE, json.dumps(cmds, indent=2, sort_keys=True) + "\n")
+        return True, f"command deleted: {name}"
+    if "save_profile" in body:
+        name = body["save_profile"]
+        if not isinstance(name, str) or not NAME_RE.match(name):
+            return False, f"bad profile name: {name!r} (letters, digits, . _ -, max 32)"
+        err = validate_models(body.get("models"))
+        if err:
+            return False, f"profile needs models: {err}"
+        profiles = read_profiles()
+        existed = name in profiles
+        profiles[name] = {k: v for k, v in sorted(body["models"].items()) if v}
+        write_atomic(PROFILES_FILE, json.dumps(profiles, indent=2, sort_keys=True) + "\n")
+        saved.append(f"profile {'overwrote' if existed else 'saved'}: {name}")
+    if "apply_profile" in body:
+        name = body["apply_profile"]
+        profiles = read_profiles()
+        if not isinstance(name, str) or name not in profiles:
+            return False, f"no such profile: {name!r}"
+        write_models(profiles[name])
+        saved.append(f"applied profile {name} -> models.json")
+    if "delete_profile" in body:
+        name = body["delete_profile"]
+        profiles = read_profiles()
+        if not isinstance(name, str) or name not in profiles:
+            return False, f"no such profile: {name!r}"
+        del profiles[name]
+        write_atomic(PROFILES_FILE, json.dumps(profiles, indent=2, sort_keys=True) + "\n")
+        saved.append(f"profile deleted: {name}")
+    if "models" in body and "save_profile" not in body:
+        err = validate_models(body["models"])
+        if err:
+            return False, err
+        write_models(body["models"])
+        m = body["models"]
+        saved.append(f"models -> {', '.join(f'{k}={m[k]}' for k in sorted(m) if m[k])}" + (f", cleared {', '.join(k for k in m if not m[k])}" if any(not v for v in m.values()) else ""))
+    if "threads" in body:
+        t = body["threads"]
+        if not isinstance(t, int) or isinstance(t, bool) or not 1 <= t <= 4:
+            return False, "threads must be an integer 1-4"
+        cur = {}
+        if CFG_FILE.exists():
+            try:
+                cur = json.loads(CFG_FILE.read_text())
+            except Exception:
+                cur = {}
+        cur["threads"] = t
+        write_atomic(CFG_FILE, json.dumps(cur, indent=2) + "\n")
+        saved.append(f"threads -> {t}")
+    if "build_issues" in body:
+        want = body["build_issues"]
+        if not isinstance(want, bool):
+            return False, "build_issues must be true or false"
+        if want:
+            NO_BUILD.unlink(missing_ok=True)
+            saved.append("issue building allowed")
+        else:
+            NO_BUILD.write_text("issue building blocked from the board /config page\n")
+            saved.append("issue building blocked")
+    return True, "; ".join(saved)
+
+
+def start_loop():
+    """Board Start Loop button (2026-11-16): start pr-chain-loop the way its README row does, detached and appending to
+    logs/loop.log. Clears a STOP file first (pressing Start means run). No-op when the loop already runs."""
+    if subprocess.run(["/usr/bin/pgrep", "-f", LOOP_PROC], capture_output=True, text=True).stdout.strip():
+        return True, "loop already running"
+    (WORK / "STOP").unlink(missing_ok=True)
+    env = {k: v for k, v in os.environ.items() if k not in ("VIRTUAL_ENV", "PYTHONHOME", "PYTHONPATH")}  # never a repo .venv
+    (WORK / "logs").mkdir(parents=True, exist_ok=True)
+    with open(WORK / "logs" / "loop.log", "a") as fh:  # own session: a board restart never takes the loop down with it
+        subprocess.Popen([sys.executable, "-B", str(ROOT / "bin" / "pr-chain-loop")], stdout=fh,
+                         stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, cwd=str(ROOT), env=env, start_new_session=True)
+    return True, "loop started"
+
+
+def alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except Exception:
+        return False
+
+
+def tail(path, size=8000):
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, 2)
+            n = fh.tell()
+            fh.seek(max(0, n - size))
+            return fh.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def log_lines(path=None):
+    """Narrative lines ("[" first) from `path`, else from the newest of LOGS."""
+    live = [path] if path else [p for p in LOGS if p.exists()]
+    if not live:
+        return []
+    p = max(live, key=lambda x: x.stat().st_mtime)
+    return [ln for ln in tail(p, 20000).splitlines() if ln.startswith("[")]
+
+
+def step_of(text):
+    t = text.lower()
+    for pat, step in ((r"\bmerged\b|approver|land", "Merge"), (r"\bci\b|checks", "CI"), (r"human|screenshots posted", "Human Gate"),
+                      (r"\bui\b|vision", "UI Review"), (r"addendum|gate|audit", "Audit"), (r"fix|push", "Fix"),
+                      (r"review", "Review"), (r"fold|behind|update-branch|drift", "Update Branch")):
+        if re.search(pat, t):
+            return step
+    return None
+
+
+MARK = {"codex": "say", "exec": "run", "thinking": "think", "user": "skip"}
+ENVVAR = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=\S+\s+")
+
+
+def clean_cmd(s):
+    s = re.sub(r"^/bin/(zsh|bash|sh) -l?c\s+", "", s).lstrip("'\"")
+    s = re.sub(r"^set -o pipefail;\s*", "", s)
+    while ENVVAR.match(s):
+        s = ENVVAR.sub("", s, count=1)
+    s = re.sub(re.escape(str(WORK)) + r"/prs/\d+/[^/]+/wt/?", "", s)
+    s = re.sub(r"\S*" + re.escape(str(CONF.worktree_root)) + r"/[^/\s]+/?", "", s).replace(str(Path.home()), "~")
+    return s[:240]
+
+
+def events(raw):
+    """Codex transcript lines -> [{k: say|think|run|out|tool, t: text}]."""
+    ev, mode, fresh, outn = [], None, False, 0
+    for ln in raw:
+        s = ln.strip()
+        if not s:
+            continue
+        if s in MARK:
+            mode, fresh = MARK[s], True
+            continue
+        if s.startswith("mcp: "):
+            if s.endswith(")"):
+                name = s[5:].split(" ")[0].split("/")[-1]
+                if ev and ev[-1]["k"] == "tool":
+                    ev[-1]["n"].append(name)
+                else:
+                    ev.append({"k": "tool", "n": [name]})
+            mode = None
+            continue
+        if s.startswith("tokens used"):
+            mode = None
+            continue
+        if mode in ("say", "think"):
+            if not fresh and ev and ev[-1]["k"] == mode:
+                ev[-1]["t"] = (ev[-1]["t"] + "\n" + s)[:1600]
+            else:
+                ev.append({"k": mode, "t": s[:1600]})
+            fresh = False
+        elif mode == "run":
+            if fresh:
+                ev.append({"k": "run", "t": clean_cmd(s)})
+                fresh, outn = False, 0
+            elif re.fullmatch(r"succeeded in [\d.]+m?s:", s):
+                continue
+            elif outn < 3:
+                ev.append({"k": "out", "t": s.replace(str(Path.home()), "~")[:200]})
+                outn += 1
+    for e in ev:
+        if e["k"] == "tool":
+            names = e.pop("n")
+            e["t"] = ", ".join(f"{n} x{names.count(n)}" if names.count(n) > 1 else n for n in dict.fromkeys(names))
+    return ev
+
+
+def stream_events(raw):
+    """claude -p --output-format stream-json lines -> the same [{k, t}] shape as events(); hook/system lines are skipped."""
+    ev, outn = [], 3
+    for ln in raw:
+        if not ln.startswith('{"type":"assistant"') and not ln.startswith('{"type":"user"'):
+            continue
+        try:
+            msg = json.loads(ln).get("message") or {}
+        except ValueError:
+            continue
+        for c in msg.get("content") or []:
+            if not isinstance(c, dict):
+                continue
+            k = c.get("type")
+            if k == "text" and c.get("text", "").strip():
+                ev.append({"k": "say", "t": c["text"].strip()[:1600]})
+            elif k == "thinking" and c.get("thinking", "").strip():
+                ev.append({"k": "think", "t": c["thinking"].strip()[:1600]})
+            elif k == "tool_use":
+                inp = c.get("input") or {}
+                if c.get("name") == "Bash" and inp.get("command"):
+                    ev.append({"k": "run", "t": clean_cmd(inp["command"])}); outn = 0
+                else:
+                    arg = inp.get("file_path") or inp.get("pattern") or inp.get("path") or ""
+                    ev.append({"k": "tool", "t": f"{c.get('name')} {str(arg).replace(str(Path.home()), '~')}".strip()[:200]}); outn = 3
+            elif k == "tool_result" and outn < 3:
+                body = c.get("content")
+                if isinstance(body, list):
+                    body = "\n".join(x.get("text", "") for x in body if isinstance(x, dict))
+                for line in str(body or "").splitlines():
+                    if line.strip() and outn < 3:
+                        ev.append({"k": "out", "t": line.strip().replace(str(Path.home()), "~")[:200]}); outn += 1
+    return ev
+
+
+def log_epoch(line):
+    """[HH:MM:SS] at the start of a log line -> epoch seconds (today, or yesterday if that would be in the future)."""
+    m = re.match(r"\[(\d\d):(\d\d):(\d\d)\]", line)
+    if not m:
+        return 0.0
+    t = time.localtime()
+    e = time.mktime((t.tm_year, t.tm_mon, t.tm_mday, int(m[1]), int(m[2]), int(m[3]), 0, 0, -1))
+    return e - 86400 if e > time.time() + 60 else e
+
+
+def refresh_pick():
+    if pick_cache["busy"] or time.time() - pick_cache["at"] < 180:
+        return
+    pick_cache["busy"] = True
+
+    def work():
+        try:
+            out = subprocess.run([sys.executable, "-B", CHAIN, "pick", "--all"], capture_output=True, text=True, timeout=120).stdout
+            rows = []
+            for ln in out.splitlines():
+                m = re.match(r"^\s*(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(.*)$", ln)
+                if m:
+                    rows.append(dict(pr=int(m.group(1)), size=int(m.group(2)), state=m.group(3), ui=m.group(4) == "UI",
+                                     author=m.group(5), owner=m.group(6).strip()))
+            pick_cache["rows"] = rows
+        except Exception:
+            pass
+        pick_cache["at"] = time.time()
+        pick_cache["busy"] = False
+    threading.Thread(target=work, daemon=True).start()
+
+
+def ledger_rows(n=400):
+    rows = []
+    for ln in tail(WORK / "ledger.jsonl", 200000).splitlines()[-n:]:
+        try:
+            rows.append(json.loads(ln))
+        except ValueError:
+            pass
+    return rows
+
+
+TOK_CODEX = re.compile(r"tokens used\s*\n?\s*([\d,]+)")
+tok_cache = {}
+spend_cache = {"key": None, "runs": []}
+
+
+RATES_FILE = ROOT / "chain" / "rates.json"
+CODEX_SID = re.compile(r"session id:\s*([0-9a-f-]{36})")
+rates_cache = {"at": 0.0, "key": None, "data": {}}
+rollouts = {"at": 0.0, "map": {}}
+
+
+LITELLM_URL = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
+LITELLM_FILE = WORK / "litellm-rates.json"
+table = {"at": 0.0, "data": {}, "new": None, "busy": False, "tried": 0.0, "loaded": False}
+rate_used = {}
+
+
+def table_parse(doc):
+    """LiteLLM's price document as dollars per million tokens per model. An entry with no input or output rate is dropped.
+    A bare model name is added only when no entry has that exact name and every provider-prefixed entry agrees on the rate."""
+    num = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool)
+    out = {}
+    for name, e in (doc.items() if isinstance(doc, dict) else []):
+        if not isinstance(e, dict) or not num(e.get("input_cost_per_token")) or not num(e.get("output_cost_per_token")):
+            continue
+        i, r, w = e["input_cost_per_token"], e.get("cache_read_input_token_cost"), e.get("cache_creation_input_token_cost")
+        out[name.strip().lower()] = dict(input=round(i * 1e6, 6), cached_input=round((r if num(r) else i) * 1e6, 6),
+                                         cache_write=round((w if num(w) else i) * 1e6, 6),
+                                         output=round(e["output_cost_per_token"] * 1e6, 6))
+    alias = {}
+    for k, v in out.items():
+        b = k.rsplit("/", 1)[-1]
+        if b != k and b not in out:
+            alias[b] = v if b not in alias else (alias[b] if alias[b] == v else None)
+    out.update({k: v for k, v in alias.items() if v})
+    return out
+
+
+def table_fetch():
+    """Background thread: download the price table, keep a slim copy on disk. A failed download keeps the old table."""
+    try:
+        req = urllib.request.Request(LITELLM_URL, headers={"User-Agent": "rate-table-reader"})
+        data = table_parse(json.loads(urllib.request.urlopen(req, timeout=60).read()))
+        if len(data) > 100:
+            tmp = LITELLM_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"fetched": time.time(), "source": LITELLM_URL, "rates": data}))
+            os.replace(tmp, LITELLM_FILE)
+            table["new"] = (time.time(), data)
+    except Exception:
+        pass
+    table["busy"] = False
+
+
+def rates():
+    """Hand-entered dollars per million tokens per model, from rates.json; these win over the downloaded table.
+    Also keeps the downloaded LiteLLM table fresh (once a day, in the background). Checked at most once a minute."""
+    if time.time() - rates_cache["at"] > 60:
+        rates_cache["at"] = time.time()
+        changed = False
+        try:
+            st = RATES_FILE.stat()
+            if rates_cache["key"] != (st.st_mtime_ns, st.st_size):
+                raw = json.loads(RATES_FILE.read_text())
+                rates_cache.update(key=(st.st_mtime_ns, st.st_size), data={k: v for k, v in raw.items() if isinstance(v, dict)})
+                changed = True
+        except (OSError, ValueError):
+            pass
+        if not table["loaded"]:
+            table["loaded"] = True
+            try:
+                j = json.loads(LITELLM_FILE.read_text())
+                table.update(at=float(j["fetched"]), data=j["rates"])
+                changed = True
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
+        if table["new"]:
+            (table["at"], table["data"]), table["new"] = table["new"], None
+            changed = True
+        if time.time() - table["at"] > 86400 and not table["busy"] and time.time() - table["tried"] > 3600:
+            table.update(busy=True, tried=time.time())
+            threading.Thread(target=table_fetch, daemon=True).start()
+        if changed:
+            tok_cache.clear()
+            rate_used.clear()
+            spend_cache["key"] = None
+    return rates_cache["data"]
+
+
+def override_for(model):
+    """A rate entered by hand in rates.json, matched by name prefix."""
+    m = re.sub(r"\[.*$", "", str(model).strip().lower())
+    hit = [k for k in rates() if m.startswith(k.lower())]
+    if not hit:
+        return None
+    rate_used[m] = dict(rates()[max(hit, key=len)], src="rates.json")
+    return rates()[max(hit, key=len)]
+
+
+def table_for(model):
+    """A rate from the downloaded LiteLLM table, by exact model name. Bare family names are never priced."""
+    m = re.sub(r"\[.*$", "", str(model).strip().lower())
+    r = None if m in ("opus", "sonnet", "haiku", "fable", "synthetic", "<synthetic>") else table["data"].get(m)
+    if r:
+        rate_used[m] = dict(r, src="litellm")
+    return r
+
+
+def rate_for(model):
+    return override_for(model) or table_for(model)
+
+
+def priced(rate, fresh, cached, write, out):
+    return (fresh * rate.get("input", 0) + cached * rate.get("cached_input", 0) + write * rate.get("cache_write", 0)
+            + out * rate.get("output", 0)) / 1e6
+
+
+def codex_rollout(sid):
+    """The Codex session file for one session id. The folder is walked once, and again (at most once a minute) for an unknown id."""
+    if sid not in rollouts["map"] and time.time() - rollouts["at"] > 60:
+        rollouts["at"] = time.time()
+        for root, _, files in os.walk(Path.home() / ".codex/sessions"):
+            for fn in files:
+                m = re.search(r"([0-9a-f]{8}-[0-9a-f-]{27})\.jsonl$", fn)
+                if m:
+                    rollouts["map"][m.group(1)] = os.path.join(root, fn)
+    return rollouts["map"].get(sid)
+
+
+def codex_usage(text):
+    """Codex's own running total for the session: input, cached input, cache writes, output. None when the session file is gone."""
+    m = CODEX_SID.search(text)
+    f = codex_rollout(m.group(1)) if m else None
+    if not f:
+        return None
+    last = None
+    try:
+        with open(f, errors="replace") as fh:
+            for ln in fh:
+                if '"total_token_usage"' in ln:
+                    last = ln
+        hit = re.search(r'"total_token_usage"\s*:\s*(\{[^{}]*\})', last or "")
+        return json.loads(hit.group(1)) if hit else None
+    except (OSError, ValueError):
+        return None
+
+
+def run_usage(row):
+    """(tokens, dollars) for one finished agent run; either is None when its log holds no figure.
+    Tokens. Codex: the 'tokens used' line (fresh input + output). Claude: input + cache writes + output (cache reads left out).
+    Dollars are an API-equivalent estimate, never a charge. Codex: its session totals times the model rate, cached input at the
+    cached rate. Claude harness: the dollar figure it reports per model, except a model listed in rates.json, priced from its token
+    classes. A rate is the rates.json entry when there is one, otherwise the downloaded LiteLLM table."""
+    codex = str(row.get("model", "")).startswith("codex")
+    name = "err.txt" if codex else "out.jsonl"
+    try:
+        at = time.mktime(time.strptime(row.get("ts", ""), "%Y-%m-%dT%H:%M:%S"))
+        d = Path(row.get("dir", ""))
+        near = [(abs(f.stat().st_mtime - at), f) for c in d.parent.iterdir() if c.name == d.name or c.name.startswith(d.name + ".")
+                for f in [c / name] if f.exists()]
+    except (OSError, ValueError):
+        return None, None, ""
+    near = [x for x in near if x[0] < 600]
+    if not near:
+        return None, None, ""
+    f = min(near, key=lambda x: x[0])[1]
+    st = f.stat()
+    rates()
+    key = (str(f), st.st_mtime_ns, st.st_size)
+    if key not in tok_cache:
+        val = usd = None
+        real = ""
+        text = f.read_text(errors="replace")
+        if codex:
+            m = TOK_CODEX.findall(text)
+            val = int(m[-1].replace(",", "")) if m else None
+            u, rate = codex_usage(text), rate_for(str(row.get("model", "")).replace("codex:", ""))
+            if u and rate:
+                cached = int(u.get("cached_input_tokens") or 0)
+                usd = priced(rate, max(int(u.get("input_tokens") or 0) - cached, 0), cached,
+                             int(u.get("cache_write_input_tokens") or 0), int(u.get("output_tokens") or 0))
+        else:
+            for ln in reversed(text.splitlines()):
+                if '"type":"result"' in ln.replace(" ", ""):
+                    try:
+                        j = json.loads(ln)
+                        u = j.get("usage") or {}
+                        val = sum(int(u.get(k) or 0) for k in ("input_tokens", "cache_creation_input_tokens", "output_tokens"))
+                        mu = j.get("modelUsage") or {}
+                        if mu:
+                            usd = 0.0
+                            top = max(mu, key=lambda k: int(mu[k].get("outputTokens") or 0))
+                            real = re.sub(r"\[.*?\]$", "", top).replace("claude-", "")
+                            for mname, x in mu.items():
+                                rate = override_for(mname) or (None if x.get("costUSD") is not None else table_for(mname))
+                                usd += priced(rate, int(x.get("inputTokens") or 0), int(x.get("cacheReadInputTokens") or 0),
+                                              int(x.get("cacheCreationInputTokens") or 0), int(x.get("outputTokens") or 0)) \
+                                    if rate else float(x.get("costUSD") or 0)
+                        elif j.get("total_cost_usd") is not None:
+                            usd = float(j["total_cost_usd"])
+                    except (ValueError, TypeError, AttributeError):
+                        pass
+                    break
+        tok_cache[key] = (val, usd, real)
+    return tok_cache[key]
+
+
+def spend_runs():
+    """Every ledger row that is an agent run or a chain end, each agent run with its token count. Rebuilt when the ledger grows."""
+    f = WORK / "ledger.jsonl"
+    try:
+        st = f.stat()
+    except OSError:
+        return []
+    key = (st.st_mtime_ns, st.st_size)
+    rates()
+    if spend_cache["key"] != key:
+        runs = []
+        for ln in f.read_text(errors="replace").splitlines():
+            try:
+                r = json.loads(ln)
+            except ValueError:
+                continue
+            if r.get("stage") == "agent":
+                runs.append(dict(pr=r.get("pr"), ts=r.get("ts", ""), end=False, role=r.get("role", ""), model=r.get("model", ""),
+                                 **dict(zip(("tok", "usd", "real"), run_usage(r)))))
+            elif r.get("stage") == "end":
+                runs.append(dict(pr=r.get("pr"), ts=r.get("ts", ""), end=True))
+        spend_cache.update(key=key, runs=runs)
+    return spend_cache["runs"]
+
+
+def spend(cur=None, started=""):
+    """Token totals: today, per PR (all time), per finished chain run (keyed pr + end time), and the PR in flight."""
+    today = time.strftime("%Y-%m-%d")
+    out = dict(today=0, today_usd=0.0, today_runs=0, today_missing=0, by_pr={}, by_end={}, by_end_usd={}, cur=0, cur_usd=0.0, cur_runs=[])
+    open_run, open_usd = {}, {}
+    for r in spend_runs():
+        pr = r["pr"]
+        if r["end"]:
+            out["by_end"][f"{pr}@{r['ts']}"] = open_run.pop(pr, 0)
+            out["by_end_usd"][f"{pr}@{r['ts']}"] = round(open_usd.pop(pr, 0.0), 4)
+            continue
+        tok, usd = r["tok"], r["usd"] or 0.0
+        if r["ts"].startswith(today):
+            out["today_runs"] += 1
+            out["today_missing"] += tok is None
+            out["today"] += tok or 0
+            out["today_usd"] += usd
+        out["by_pr"][pr] = out["by_pr"].get(pr, 0) + (tok or 0)
+        open_run[pr] = open_run.get(pr, 0) + (tok or 0)
+        open_usd[pr] = open_usd.get(pr, 0.0) + usd
+        if cur is not None and pr == cur and r["ts"] >= started:
+            out["cur"] += tok or 0
+            out["cur_usd"] += usd
+            out["cur_runs"].append(dict(role=r["role"], model=r["model"], tok=tok, usd=r["usd"], ts=r["ts"][11:16]))
+    return out
+
+
+LEDGER_STEP = {"fold": "Update Branch", "update-branch": "Update Branch", "drift": "Update Branch", "verdict": "Review", "fix": "Fix",
+               "push": "Fix", "audit": "Audit", "addendum": "Audit", "ui-review": "UI Review", "ui-verdict": "UI Review", "ui-fix": "UI Review",
+               "land": "Merge"}
+
+
+def lane_info(n, led):
+    """A running chain other than the featured one: where it is and what it finished, for one row of the graphic."""
+    try:
+        st = json.loads((WORK / "prs" / str(n) / "STATE.json").read_text())
+    except (OSError, ValueError):
+        st = {}
+    rl = WORK / "logs" / f"run-{n}.log"
+    mine = [ln for ln in log_lines(rl if rl.exists() else None) if f"#{n} " in ln]
+    step = step_of(mine[-1].split("] ", 1)[-1]) if mine else None
+    started = st.get("started", "")
+    done = [dict(step=LEDGER_STEP[r["stage"]], verdict=r.get("verdict") or r.get("status") or "", ts=r.get("ts", "")[11:16])
+            for r in led if r.get("pr") == n and r.get("ts", "") >= started and r.get("stage") in LEDGER_STEP]
+    row = next((q for q in pick_cache["rows"] if q["pr"] == n), {})
+    return dict(pr=n, step=step, round=st.get("round"), ui=row.get("ui", False), done=done)
+
+
+def state(pick_pr=None):
+    refresh_pick()
+    cur, since, live = None, 0.0, []
+    claims = WORK / "claims"
+    if claims.exists():
+        for c in claims.iterdir():
+            pidf = c / "pid"
+            if c.name.isdigit() and pidf.exists() and alive(pidf.read_text().strip()):
+                live.append((pidf.stat().st_mtime, int(c.name)))
+    if live:
+        since, cur = max(live)
+        chosen = [x for x in live if x[1] == pick_pr]  # the board's PR toggle: show that chain's agent instead of the newest
+        if chosen:
+            since, cur = chosen[0]
+    out_live = sorted(n for _, n in live)
+    loop_on = bool(subprocess.run(["/usr/bin/pgrep", "-f", LOOP_PROC], capture_output=True, text=True).stdout.strip())
+    chain_on = bool(subprocess.run(["/usr/bin/pgrep", "-f", r"bin/pr-chain (auto|run|land|resume)"], capture_output=True, text=True).stdout.strip())
+    # the loop sends each chain's output to logs/run-<pr>.log: show it once this chain has written there, else loop.log as before
+    run_log = WORK / "logs" / f"run-{cur}.log"
+    lines = log_lines(run_log if cur is not None and run_log.exists() and run_log.stat().st_mtime >= since else None)
+    led = ledger_rows()
+    out = dict(now=time.strftime("%H:%M:%S"), loop_on=loop_on, chain_on=chain_on, stop=(WORK / "STOP").exists(), steps=STEPS,
+               log=[ln[:220] for ln in lines[-60:]], current=None, queue=pick_cache["rows"], pick_age=int(time.time() - pick_cache["at"]))
+    sp = spend()
+    out["tok"] = dict(today=sp["today"], usd=round(sp["today_usd"], 2), runs=sp["today_runs"], missing=sp["today_missing"])
+    try:  # pr-chain doctor's last findings (it runs every loop lap)
+        out["problems"] = json.loads((WORK / "doctor.json").read_text()).get("rows", [])
+    except (OSError, ValueError):
+        out["problems"] = []
+    out["ended"] = [dict(pr=r.get("pr"), status=r.get("status"), why=(r.get("why") or "")[:140], ts=r.get("ts", "")[5:16].replace("T", " "),
+                         tok=sp["by_end"].get(f"{r.get('pr')}@{r.get('ts', '')}", 0),
+                         usd=sp["by_end_usd"].get(f"{r.get('pr')}@{r.get('ts', '')}", 0))
+                    for r in led if r.get("stage") == "end"][-40:][::-1]
+    today = time.strftime("%Y-%m-%d")
+    out["drift_today"] = sum(1 for r in led if r.get("stage") in ("drift", "addendum") and r.get("ts", "").startswith(today))
+    out["live"] = out_live
+    out["building"] = None  # the loop's issue builds (pr-chain auto, up to 3): which issues, while a build process lives
+    out["build_lanes"] = []
+    if subprocess.run(["/usr/bin/pgrep", "-f", r"bin/pr-chain (auto|issue)"], capture_output=True).returncode == 0:
+        nums = []
+        for bl in sorted((WORK / "logs").glob("run-build*.log")):
+            if time.time() - bl.stat().st_mtime < 3 * 3600:
+                hits = re.findall(r"#i(\d+) ", tail(bl, 4000))
+                if hits and int(hits[-1]) not in nums:
+                    nums.append(int(hits[-1]))
+        out["building"] = nums[0] if nums else 0
+        out["building_all"] = nums
+        out["build_lanes"] = [dict(pr=n, label=f"issue #{n}", step="Fix", ui=False, done=[]) for n in nums]
+    out["lanes"] = [lane_info(n, led) for _, n in sorted(live, reverse=True) if n != cur]  # the other running chains
+    out["lanes"] += out.get("build_lanes", [])
+    # doctor rows go stale while chains run (it runs inside resume): drop the ones the live state already answers
+    out["problems"] = [r for r in out.get("problems", []) if not (r.get("pr") in out_live and r.get("kind") == "dead-chain")
+                       and not (r.get("kind") == "loop-down" and out.get("loop_on"))]
+    if cur is None:
+        return out
+    d = WORK / "prs" / str(cur)
+    st = {}
+    try:
+        st = json.loads((d / "STATE.json").read_text())
+    except Exception:
+        pass
+    mine = [ln for ln in lines if f"#{cur} " in ln]
+    step = step_of(mine[-1].split("] ", 1)[-1]) if mine else None
+    stage_dirs = sorted([p for p in d.iterdir() if p.is_dir() and ".old" not in p.name], key=lambda p: p.stat().st_mtime)
+    agent = dict(dir="", events=[], idle=None, role="")
+    if stage_dirs:
+        sd = stage_dirs[-1]
+        # the agent's transcript is the bigger of the two: Codex streams to err.txt, claude -p streams stream-json to
+        # out.jsonl (its err.txt holds only startup warnings)
+        cands = [f for f in (sd / "err.txt", sd / "out.jsonl") if f.exists() and f.stat().st_size]
+        src = max(cands, key=lambda f: f.stat().st_size) if cands else sd / "out.jsonl"
+        if src.name == "out.jsonl" and src.open("rb").read(1) == b"{":
+            ev = stream_events(tail(src, 1500000).splitlines()[1:])  # hook lines dominate the file; read deep
+        else:
+            ev = events([ANSI.sub("", ln) for ln in tail(src, 60000).splitlines()][1:])
+        agent = dict(dir=sd.name, events=ev[-45:], role=sd.name.split("-")[-1],
+                     idle=int(time.time() - src.stat().st_mtime) if src.exists() else None)
+        # the newest of the last log line and the agent's own file says where the chain is
+        if step is None or (src.exists() and src.stat().st_mtime > log_epoch(mine[-1]) + 5):
+            step = "UI Review" if re.match(r"r\d+u\d+-", sd.name) else \
+                {"review": "Review", "fix": "Fix", "gate": "Audit", "ui": "UI Review"}.get(agent["role"])
+    started = st.get("started", "")
+    done = []
+    for r in led:
+        if r.get("pr") == cur and r.get("ts", "") >= started:
+            s = LEDGER_STEP.get(r.get("stage"))
+            if s:
+                done.append(dict(step=s, verdict=r.get("verdict") or r.get("status") or "", ts=r.get("ts", "")[11:16]))
+    title = ""
+    for sd in stage_dirs:
+        pm = sd / "pr.md"
+        if pm.exists():
+            title = pm.read_text().splitlines()[0].lstrip("# ").strip()[:120]
+            break
+    row = next((q for q in pick_cache["rows"] if q["pr"] == cur), {})
+    out["current"] = dict(pr=cur, title=title, step=step, round=st.get("round"), head=(st.get("head") or "")[:8], started=started[11:16],
+                          ui=row.get("ui", False), agent=agent, done=done)
+    sp = spend(cur, started)
+    out["current"].update(tok=sp["cur"], usd=round(sp["cur_usd"], 2), tok_runs=sp["cur_runs"])
+    return out
+
+
+PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PR Chain</title>
+<script type="importmap">{"imports":{"three":"/three/three.module.js"}}</script>
+<style>
+html{-webkit-text-size-adjust:100%;text-size-adjust:100%}
+:root{--bg:oklch(0.145 0 0);--card:oklch(0.185 0 0);--raise:oklch(0.269 0 0);--fg:oklch(0.985 0 0);--mid:oklch(0.82 0 0);--muted:oklch(0.62 0 0);--faint:oklch(0.44 0 0);
+--hi:#78be21;--bad:oklch(0.704 0.191 22.216);--warn:oklch(0.769 0.188 70.08);--r:0.625rem;
+--sans:ui-sans-serif,system-ui,-apple-system,"SF Pro Text","Segoe UI",sans-serif;--mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,monospace}
+*{box-sizing:border-box}html,body{height:100%}
+body{margin:0;background:var(--bg);color:var(--fg);font:12px/1.5 var(--sans);-webkit-font-smoothing:antialiased;letter-spacing:.005em}
+main{max-width:1360px;margin:0 auto;padding:12px 20px 18px;min-height:100%;display:flex;flex-direction:column}
+.top{display:flex;justify-content:space-between;align-items:baseline;gap:16px;flex-wrap:wrap}
+.brand{font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);font-weight:500;display:flex;gap:18px}
+a{color:inherit;text-decoration:none}.brand a{color:var(--faint)}.brand a.on,.brand a:hover{color:var(--fg)}
+@media(max-width:520px){.brand{gap:12px;letter-spacing:.08em}.brand a{white-space:nowrap}}td.k a:hover,.pr .num a:hover{text-decoration:underline}
+.meta{color:var(--muted);font-size:11px;display:flex;gap:16px;flex-wrap:wrap;font-variant-numeric:tabular-nums}
+.meta b{font-weight:500;color:var(--mid)}.meta .on{color:var(--hi)}.meta .off{color:var(--bad)}.meta .warn{color:var(--warn)}
+.pr{margin-top:10px;display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
+.pr .num{font:500 12px var(--mono);color:var(--hi)}.pr .title{font-size:15px;font-weight:500;letter-spacing:-.01em}
+.pr .facts{color:var(--muted);font-size:11px}.pr.idle .title{color:var(--muted);font-weight:400}
+#stage{position:relative;height:min(var(--sh,clamp(190px,27vh,270px)),60vh);margin:2px -20px 0;overflow:hidden}@media(min-width:1361px){#stage{width:100vw;margin:2px 0 0 calc(50% - 50vw)}body{overflow-x:clip}}
+#stage canvas{position:absolute;inset:0;width:100%;height:100%;display:block}
+.lab{position:absolute;left:0;top:0;text-align:center;white-space:nowrap;pointer-events:none;will-change:transform;transition:color .5s,opacity .5s;color:var(--faint)}
+.lab .n{font-size:11px;font-weight:500;letter-spacing:.02em}.lab .s{font:10px var(--mono);color:var(--faint);margin-top:1px;min-height:13px}
+.lab.done{color:var(--mid)}.lab.done .s{color:var(--muted)}.lab.active{color:var(--fg)}.lab.active .s{color:var(--hi)}
+.lab.fail{color:var(--bad)}.lab.fail .s{color:var(--bad)}.lab.skip{opacity:.3}
+#stage.flat{height:auto;margin:14px 0 6px;display:flex;gap:22px;flex-wrap:wrap}#stage.flat .lab{position:static;transform:none!important}
+#pin{position:sticky;top:0;z-index:5;background:var(--bg);margin:-12px -20px 0;padding:12px 20px 0}
+@media(max-height:560px){#pin{position:static}}
+.grid{display:grid;grid-template-columns:var(--gc,minmax(0,1.6fr) 26px minmax(0,1fr));gap:0;flex:1;min-height:0;margin-top:4px}
+.lab .sh{display:none}
+@media(max-width:900px){.grid{grid-template-columns:minmax(0,1fr);row-gap:18px}.rz.x{display:none}.lab .s{display:none}.lab .n{font-size:10px}}
+@media(max-width:700px){.lab .lg{display:none}.lab .sh{display:inline}.lab .n{font-size:9px;letter-spacing:0}main{padding:10px 14px 16px}#stage{margin:2px -14px 0}#pin{margin:-10px -14px 0;padding:10px 14px 0}}
+h2{font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--faint);margin:0 0 7px;font-weight:500;display:flex;justify-content:space-between;gap:10px}
+h2 span{letter-spacing:.02em;text-transform:none;font-family:var(--mono);color:var(--muted)}h2 span.live{color:var(--hi)}
+.feedwrap{display:flex;flex-direction:column;min-height:0}
+#feed{background:var(--card);border-radius:var(--r);padding:12px 14px;overflow-y:auto;flex:1;min-height:340px;max-height:calc(100vh - 150px);scrollbar-width:thin;scrollbar-color:var(--raise) transparent}
+.e{margin:0 0 7px;word-break:break-word}
+.e.say{font-size:12.5px;line-height:1.55;color:var(--mid);white-space:pre-wrap;padding-left:10px;border-left:1px solid var(--raise)}
+.e.say.last{color:var(--fg);border-left-color:var(--hi)}
+.e.think{font-size:11.5px;color:var(--muted);font-style:italic;white-space:pre-wrap;padding-left:10px}
+.e.run{font:10.5px/1.5 var(--mono);color:var(--muted)}.e.run::before{content:"$ ";color:var(--faint)}
+.e.out{font:10.5px/1.45 var(--mono);color:var(--faint);margin-top:-5px;padding-left:12px}
+.e.tool{font:10.5px var(--mono);color:var(--faint)}.e.tool::before{content:"tools  ";letter-spacing:.06em}
+@media(max-width:700px){#feed{padding:10px 11px}.e.say{font-size:10.5px;line-height:1.5}.e.think{font-size:10px}.e.run,.e.out,.e.tool{font-size:8px;line-height:1.4}}
+.side{display:flex;flex-direction:column;gap:20px;min-width:0}
+table{width:100%;border-collapse:collapse;font-size:11.5px;font-variant-numeric:tabular-nums}
+td{padding:2.5px 10px 2.5px 0;vertical-align:top;color:var(--mid)}td:last-child{padding-right:0}
+td.k{font-family:var(--mono);font-size:11px;white-space:nowrap}td.d,.dim{color:var(--muted)}td.f{color:var(--faint)}
+tr.next td{color:var(--fg)}tr.next td.k{color:var(--hi)}
+.ok{color:var(--hi)!important}.bad{color:var(--bad)!important}.warn{color:var(--warn)!important}
+.why{color:var(--muted);overflow-wrap:anywhere;overflow:hidden;text-overflow:ellipsis;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+pre{margin:0;font:10.5px/1.6 var(--mono);color:var(--muted);white-space:pre-wrap;word-break:break-word}
+.more{color:var(--faint);font-size:11px;margin-top:3px}
+.rz{touch-action:none;user-select:none;-webkit-user-select:none;position:relative;flex:none}
+.rz::after{content:"";position:absolute;background:transparent;border-radius:1px;transition:background .12s}
+.rz.x{cursor:col-resize}.rz.x::after{left:12px;top:0;bottom:0;width:2px}
+.rz.y{cursor:row-resize;height:9px}.rz.y::after{top:4px;left:40%;right:40%;height:2px}
+.rz:hover::after,.rz.on::after{background:var(--muted)}
+#stage.flat+.rz{display:none}
+#queue,#ended,#log{overflow-y:auto;scrollbar-width:thin;scrollbar-color:var(--raise) transparent}
+#queue{max-height:206px}#ended{max-height:190px}#log{max-height:122px}
+.side{gap:9px}
+#feed.nt .e.run,#feed.nt .e.out,#feed.nt .e.tool{display:none}
+h2 b{font-weight:500;display:flex;gap:14px;align-items:baseline}
+.band{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:0 26px;margin-top:8px}
+@media(max-width:900px){.band{grid-template-columns:minmax(0,1fr);row-gap:10px}}
+.band>div{min-width:0}.band h2 b{white-space:nowrap}.band h2 a:hover{color:var(--fg)}
+.lst{overflow-y:auto;max-height:138px;scrollbar-width:thin;scrollbar-color:var(--raise) transparent}
+.lr{display:grid;grid-template-columns:46px minmax(0,1fr) auto 28px;gap:10px;padding:2.5px 0;font-size:11.5px;align-items:baseline;font-variant-numeric:tabular-nums}
+.lr .k{font:11px var(--mono);color:var(--muted)}.lr .t{color:var(--mid);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.lr .s{color:var(--muted);font-size:11px;white-space:nowrap;max-width:230px;overflow:hidden;text-overflow:ellipsis}.lr .a{color:var(--faint);font-size:11px;text-align:right}
+.lr:hover .t{color:var(--fg)}.lr:hover .k{color:var(--hi)}.lr.now .k{color:var(--hi)}.lr.now .t{color:var(--fg)}
+@media(max-width:520px){.lr .s{max-width:120px}}
+#tg{all:unset;cursor:pointer;color:var(--muted);letter-spacing:.02em;text-transform:none;font-size:11px}#tg:hover{color:var(--fg)}
+.startloop{margin-left:6px;background:none;border:1px solid #3a3a3a;border-radius:3px;padding:0 6px;font:inherit;color:#9be03a;cursor:pointer}.startloop:hover{border-color:#9be03a}.startloop:disabled{color:#6b6b6b;cursor:default}
+.agsw{margin-left:14px}.agsw button{background:none;border:0;padding:0 8px 0 0;font:inherit;color:#6b6b6b;cursor:pointer}.agsw button:hover{color:#bdbdbd}.agsw button.on{color:#9be03a}
+</style></head><body><main>
+<div id="pin"><div class="top"><div class="brand"><a class="on" href="/">Board</a><a href="/prs">Pull Requests</a><a href="/issues">Issues</a><a href="/spend">Spend</a><a href="/config">Config</a><a href="/wiki">Wiki</a></div><div class="meta" id="meta"></div></div>
+<div class="pr" id="cur"></div>
+<div id="stage"></div><div class="rz y" data-rz="sh" title="Drag to resize. Double-click to reset."></div></div>
+<div class="band">
+ <div><h2><b><a href="/prs">Pull Requests</a></b><span id="prc"></span></h2><div class="lst" id="prl"><div class="dim">Reading GitHub…</div></div><div class="rz y" data-rz="ph" title="Drag to resize. Double-click to reset."></div></div>
+ <div><h2><b><a href="/issues">Issues</a></b><span id="isc"></span></h2><div class="lst" id="isl"><div class="dim">Reading GitHub…</div></div><div class="rz y" data-rz="ih" title="Drag to resize. Double-click to reset."></div></div>
+</div>
+<div class="grid">
+ <div class="feedwrap"><h2><b>Agent Output<button id="tg" title="Hide or show the commands the agent ran and their output. Its own words always stay."></button></b><span id="agsw" class="agsw"></span><span id="who"></span></h2><div id="feed"></div><div class="rz y" data-rz="fh" title="Drag to resize. Double-click to reset."></div></div>
+ <div class="rz x" data-rz="sw" title="Drag to resize. Double-click to reset."></div>
+ <div class="side">
+  <div><h2>Up Next</h2><div id="queue"></div><div class="rz y" data-rz="qh" title="Drag to resize. Double-click to reset."></div></div>
+  <div><h2>Problems</h2><div id="problems"></div></div>
+  <div><h2>Last Results</h2><div id="ended"></div><div class="rz y" data-rz="eh" title="Drag to resize. Double-click to reset."></div></div>
+  <div><h2>Chain Log</h2><pre id="log"></pre><div class="rz y" data-rz="lh" title="Drag to resize. Double-click to reset."></div></div>
+ </div>
+</div>
+</main>
+<script type="module">
+const STEPS=['Update Branch','Review','Fix','Audit','UI Review','Human Gate','CI','Merge'],SHORT=['Update','Review','Fix','Audit','UI','Gate','CI','Merge'],N=STEPS.length;
+const $=id=>document.getElementById(id),esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const stage=$('stage');
+const labs=STEPS.map((n,i)=>{const d=document.createElement('div');d.className='lab';d.innerHTML=`<div class="n"><span class="lg">${n}</span><span class="sh">${SHORT[i]}</span></div><div class="s"></div>`;stage.appendChild(d);return d});
+const view={states:Array(N).fill('pending'),active:-1,loop:false,idle:true};
+
+function laneStates(c){const st=Array(N).fill('pending'),last={};(c.done||[]).forEach(d=>last[d.step]=d);const ai=STEPS.indexOf(c.step);
+ STEPS.forEach((n,i)=>{const d=last[n];if((n==='UI Review'||n==='Human Gate')&&!c.ui)st[i]='skip';else if(i===ai)st[i]='active';
+  else if(d)st[i]=/FAIL|RED|None/.test(String(d.verdict||''))?'fail':'done'});return st}
+function nodeStates(s){const c=s.current,st=Array(N).fill('pending'),sub=Array(N).fill('');let ai=-1;
+ if(c){const last={};c.done.forEach(d=>last[d.step]=d);ai=STEPS.indexOf(c.step);
+  STEPS.forEach((n,i)=>{const d=last[n];
+   if((n==='UI Review'||n==='Human Gate')&&!c.ui){st[i]='skip'}
+   else if(i===ai){st[i]='active';sub[i]=n==='Review'||n==='Fix'?'round '+(c.round||1):n==='UI Review'&&c.agent&&c.agent.role==='fix'?'fixing':'running'}
+   else if(d){const v=String(d.verdict||'');st[i]=/FAIL|RED|None/.test(v)?'fail':'done';sub[i]=((v&&v!=='ok'?v.split(/[\s;:,(]/)[0]+' ':'')+d.ts).toLowerCase()}})}
+ view.lanes=s.lanes||[];
+ view.states=st;view.active=ai;view.idle=!c;view.loop=!!c&&(c.step==='Fix'||(c.step==='Review'&&(c.round||1)>1));
+ labs.forEach((l,i)=>{l.className='lab '+st[i];l.lastChild.textContent=sub[i]})}
+
+let feedKey='',curPr=0,prRows=null,isRows=null;
+const low=s=>String(s||'').toLowerCase().replace(/_/g,' ');
+const ago=t=>{const s=(Date.now()-new Date(t))/1e3;return s<3600?Math.max(1,Math.round(s/60))+'m':s<86400?Math.round(s/3600)+'h':Math.round(s/86400)+'d'};
+const vcls=v=>/PASS|APPROVED|^READY|SUCCESS|MERGED|CLEAN/.test(v)?'ok':/FAIL|CHANGES|NOT READY|ERROR|DIRTY|CONFLICT/.test(v)?'bad':/HUMAN|POLICY|BEHIND|BLOCKED|TIMEOUT|UNSTABLE|REVIEW_REQUIRED|DRAFT/.test(v)?'warn':'dim';
+const tk=n=>n>=1e6?(n/1e6).toFixed(2)+'M':n>=1e3?Math.round(n/1e3)+'k':String(n||0);
+const us=n=>n?' · ~$'+(n>=100?Math.round(n):n>=0.01?n.toFixed(2):'0.01'):'';
+const w=(t,c)=>`<span class="${c||''}">${esc(t)}</span>`;
+function prBits(p){const b=[];
+ if(p.n===curPr||p.chain==='running')b.push(w('in the chain now','ok'));else if(p.chain)b.push(w(low(p.chain),vcls(String(p.chain).toUpperCase())));
+ if(p.fail)b.push(w(p.fail+' failing','bad'));else if(p.wait)b.push(w('checks running'));
+ if(p.merge==='DIRTY')b.push(w('conflict','bad'));else if(p.merge==='BEHIND')b.push(w('behind main','warn'));
+ if(p.draft)b.push(w('draft'));else if(!b.length)b.push(p.review==='APPROVED'?w('approved','ok'):p.ok?w('checks green'):w('no checks'));
+ return b.join(' · ')}
+function paintPrs(){if(!prRows)return;const r=prRows,f=r.filter(p=>p.fail).length,h=r.filter(p=>/AWAIT-HUMAN|POLICY-HOLD|NEEDS-PERSON|STUCK/.test(String(p.chain).toUpperCase())).length,d=r.filter(p=>p.draft).length;
+ $('prc').innerHTML=[r.length+' open',f?w(f+' failing checks','bad'):'',h?w(h+' need you','warn'):'',d?d+' drafts':''].filter(Boolean).join(' · ');
+ $('prl').innerHTML=r.length?r.map(p=>`<a class="lr${p.n===curPr?' now':''}" href="/prs#${p.n}" title="${esc(p.title)}"><span class="k">#${p.n}</span><span class="t">${esc(p.title)}</span><span class="s">${prBits(p)}${p.tok?' · '+tk(p.tok)+us(p.usd):''}</span><span class="a">${ago(p.at)}</span></a>`).join(''):'<div class="dim">No open pull requests.</div>'}
+function isBits(i){if(i.chain==='building')return w('in the chain now','ok');if(i.prs&&i.prs.length)return i.prs.map(q=>w('PR #'+q.n)+(q.chain?' '+w(low(q.chain),vcls(String(q.chain).toUpperCase())):'')).join(' · ');
+ const l=i.labels.filter(x=>!/triage/.test(x)).slice(0,2).join(', ');return w(l||'no labels')}
+function paintIs(){if(!isRows)return;const r=isRows,b=r.filter(i=>i.labels.includes('bug')).length,n=r.filter(i=>!(i.prs&&i.prs.length)).length,top=[...r.filter(i=>i.chain==='building'),...r.filter(i=>i.chain!=='building')].slice(0,40);
+ $('isc').innerHTML=[r.length+' open',b?b+' bugs':'',n?n+' without a pull request':''].filter(Boolean).join(' · ');
+ $('isl').innerHTML=r.length?top.map(i=>`<a class="lr" href="/issues#${i.n}" title="${esc(i.title)}"><span class="k">#${i.n}</span><span class="t">${esc(i.title)}</span><span class="s">${isBits(i)}${i.tok?' · '+tk(i.tok)+us(i.usd):''}</span><span class="a">${ago(i.at)}</span></a>`).join('')+(r.length>top.length?`<a class="more" href="/issues">All ${r.length} Open Issues</a>`:''):'<div class="dim">No open issues.</div>'}
+async function lists(){const get=async u=>{try{const d=await (await fetch(u)).json();return d.error?null:d}catch(e){return null}};
+ const [a,b]=await Promise.all([get('/api/prs?state=open'),get('/api/issues?state=open')]);
+ if(a){prRows=a.prs;paintPrs()}else if(!prRows)$('prl').innerHTML='<div class="dim">GitHub did not answer. Trying again in a minute.</div>';
+ if(b){isRows=b.issues;paintIs()}else if(!isRows)$('isl').innerHTML='<div class="dim">GitHub did not answer. Trying again in a minute.</div>'}
+function feed(a){const el=$('feed'),ev=(a&&a.events)||[];
+ $('who').textContent=a&&a.dir?a.dir+(a.idle!=null?(a.idle<90?' · writing now':' · quiet '+Math.max(1,Math.round(a.idle/60))+' min'):''):'';
+ $('who').className=a&&a.idle!=null&&a.idle<90?'live':'';
+ const S=window.lastS||{},lv=S.live||[],cp=S.current?S.current.pr:0;if(agPick&&!lv.includes(agPick))agPick=0;
+ $('agsw').innerHTML=lv.length>1?lv.map(n=>`<button class="${n===cp?'on':''}" data-pr="${n}" title="Show this chain's agent">#${n}</button>`).join(''):'';
+ const key=(a?a.dir:'')+ev.length+(ev.length?ev[ev.length-1].t.length:0);if(key===feedKey)return;feedKey=key;
+ const stick=el.scrollHeight-el.scrollTop-el.clientHeight<60;let lastSay=-1;ev.forEach((e,i)=>{if(e.k==='say')lastSay=i});
+ el.innerHTML=ev.length?ev.map((e,i)=>`<div class="e ${e.k}${i===lastSay?' last':''}">${esc(e.t)}</div>`).join(''):'<div class="dim">No agent output yet.</div>';
+ if(stick)el.scrollTop=el.scrollHeight}
+
+const BUILD='__BUILD__';
+let agPick=0;
+document.addEventListener('click',e=>{const b=e.target.closest('#agsw button');if(!b)return;agPick=+b.dataset.pr;feedKey='';tick()});
+window.startLoop=async function(b){  // module script: inline onclick needs it on window
+b.disabled=true;b.textContent='Starting';try{const r=await fetch('/api/loop',{method:'POST',headers:{'Content-Type':'application/json'},body:'{"action":"start"}'});if(!r.ok)b.textContent='Failed: '+((await r.json()).error||r.status)}catch(e){b.textContent='Failed'}setTimeout(tick,1500)}
+async function tick(){let s;try{s=window.lastS=await (await fetch('/api/state'+(agPick?'?pr='+agPick:''))).json()}catch(e){$('meta').innerHTML='<b class="off">Board server not answering</b>';return}
+ if(s.error){$('meta').innerHTML='<b class="warn">'+esc(s.error)+'</b>';return}
+ if(s.build&&s.build!==BUILD){try{if(sessionStorage.getItem('rl')!==s.build){sessionStorage.setItem('rl',s.build);location.reload();return}}catch(e){}}
+ const c=s.current;if((c?c.pr:0)!==curPr){curPr=c?c.pr:0;paintPrs()}
+ $('meta').innerHTML=`<span>Loop <b class="${s.loop_on?'on':'off'}">${s.loop_on?'running':'not running'}</b>${s.loop_on?'':' <button class="startloop" onclick="startLoop(this)" title="Starts pr-chain-loop in the background, logging to logs/loop.log. Clears a stop request first.">Start Loop</button>'}</span><span>Chain <b class="${s.chain_on?'on':''}">${s.chain_on?'working':'idle'}</b></span>${s.building!=null?`<span>Building <b class="on">${(s.building_all||[]).length?s.building_all.map(n=>'#'+n).join(' '):'an issue'}</b>`:''}</span>${s.stop?'<span><b class="warn">stop requested</b></span>':''}<span>Main-drift refolds today <b>${s.drift_today}</b></span><span title="${s.tok.runs} agent runs today${s.tok.missing?', '+s.tok.missing+' with no count in their log':''}"><a href="/spend">Tokens today</a> <b>${tk(s.tok.today)}</b>${us(s.tok.usd)}</span><span>${s.now}</span>`;
+ $('cur').className='pr'+(c?'':' idle');
+ $('cur').innerHTML=c?`<span class="num"><a href="/prs#${c.pr}">#${c.pr}</a></span><span class="title">${esc(c.title.replace(/^#?\d+:\s*/,''))}</span><span class="facts">head ${esc(c.head)} · started ${esc(c.started)} · ${c.ui?'UI PR, stops for your review':'no UI, merges after Audit and CI'} · <span title="${esc((c.tok_runs||[]).map(r=>r.ts+' '+r.role+' '+r.model+' '+(r.tok==null?'no count':tk(r.tok)+us(r.usd))).join('\n'))}">${tk(c.tok)} tokens so far${us(c.usd)}</span></span>`:`<span class="title">No PR in flight${s.loop_on?'. The loop is between PRs or waiting for a free one.':''}</span>`;
+ nodeStates(s);feed(c&&c.agent);
+ const q=s.queue.filter(x=>!c||x.pr!==c.pr);let nx=false;
+ $('queue').innerHTML=s.queue.length?'<table>'+q.map(x=>{const free=x.owner==='FREE',n=free&&!nx;if(n)nx=true;
+  return `<tr class="${n?'next':''}"><td class="k"><a href="/prs#${x.pr}">#${x.pr}</a></td><td class="d">${x.ui?'UI':''}</td><td class="d">${x.size} lines</td><td class="d">${esc(x.state.toLowerCase())}</td><td class="${free?'':'f'}">${n?'next, updates its branch first':free?'free':esc(x.owner)}</td></tr>`}).join('')+'</table>':'<div class="dim">Loading the PR list…</div>';
+ $('problems').innerHTML=(s.problems||[]).length?'<table>'+s.problems.map(q=>`<tr><td class="k">${q.pr?`<a href="/prs#${q.pr}">#${q.pr}</a>`:''}</td><td class="k ${q.kind==='needs-you'||q.kind==='loop-down'?'warn':q.kind==='resting'?'dim':'bad'}">${esc(String(q.kind).replace(/-/g,' '))}</td><td><div class="why">${esc(q.what)}</div></td><td class="f k">${esc(q.action)}</td></tr>`).join('')+'</table>':'<div class="why">No Problems Found</div>';
+ $('ended').innerHTML='<table>'+s.ended.map(e=>`<tr><td class="k"><a href="/prs#${e.pr}">#${e.pr}</a></td><td class="k ${e.status==='MERGED'?'ok':/HUMAN|POLICY/.test(e.status)?'warn':/RESTING|CLOSED/.test(e.status)?'dim':'bad'}">${esc(String(e.status).toLowerCase())}</td><td class="f k">${esc(e.ts)}</td><td class="f k" title="Tokens this chain run used, with its API-rate estimate">${e.tok?tk(e.tok)+us(e.usd):''}</td><td><div class="why">${esc(e.why)}</div></td></tr>`).join('')+'</table>';
+ const lg=$('log'),bot=lg.scrollHeight-lg.scrollTop-lg.clientHeight<30;lg.textContent=s.log.map(l=>l.replace(/cwd=\S+/,'').slice(0,150)).join('\n');if(bot)lg.scrollTop=lg.scrollHeight}
+const root=document.documentElement,side=document.querySelector('.side'),grid=document.querySelector('.grid');
+const box=id=>({get:()=>$(id).offsetHeight,min:40,max:()=>1400,set:v=>{$(id).style.height=v==null?'':v+'px';$(id).style.maxHeight=v==null?'':'none'}});
+const RZ={sh:{get:()=>stage.offsetHeight,min:110,max:()=>innerHeight*.6,set:v=>v==null?root.style.removeProperty('--sh'):root.style.setProperty('--sh',v+'px')},
+ sw:{x:1,get:()=>side.offsetWidth,min:240,max:()=>grid.offsetWidth-340,set:v=>v==null?root.style.removeProperty('--gc'):root.style.setProperty('--gc',`minmax(0,1fr) 26px ${v}px`)},
+ qh:box('queue'),ph:box('prl'),ih:box('isl'),eh:box('ended'),lh:box('log'),
+ fh:{get:()=>$('feed').offsetHeight,min:120,max:()=>2400,set:v=>{const f=$('feed').style;f.height=v==null?'':v+'px';f.flex=v==null?'':'none';f.minHeight=v==null?'':'0';f.maxHeight=v==null?'':'none'}}};
+const tg=$('tg');let noTools=false;try{noTools=localStorage.getItem('board.tools')==='0'}catch(e){}
+const paintTg=()=>{$('feed').classList.toggle('nt',noTools);tg.textContent=noTools?'Show Tools':'Hide Tools'};paintTg();
+tg.addEventListener('click',()=>{noTools=!noTools;try{localStorage.setItem('board.tools',noTools?'0':'1')}catch(e){}paintTg();const f=$('feed');f.scrollTop=f.scrollHeight});
+let sizes={};try{sizes=JSON.parse(localStorage.getItem('board.rz')||'{}')}catch(e){}
+const keep=()=>{try{localStorage.setItem('board.rz',JSON.stringify(sizes))}catch(e){}};
+for(const k in sizes)if(RZ[k])RZ[k].set(sizes[k]);
+document.querySelectorAll('.rz').forEach(h=>{const k=h.dataset.rz,r=RZ[k];let a=null;
+ h.addEventListener('pointerdown',e=>{a={p:r.x?e.clientX:e.clientY,v:r.get()};h.setPointerCapture(e.pointerId);h.classList.add('on');e.preventDefault()});
+ h.addEventListener('pointermove',e=>{if(!a)return;const d=(r.x?e.clientX:e.clientY)-a.p,v=Math.round(Math.max(r.min,Math.min(r.max(),a.v+(r.x?-d:d))));sizes[k]=v;r.set(v)});
+ const end=()=>{if(a){a=null;h.classList.remove('on');keep()}};h.addEventListener('pointerup',end);h.addEventListener('pointercancel',end);
+ h.addEventListener('dblclick',()=>{delete sizes[k];r.set(null);keep()})});
+tick();setInterval(tick,3000);lists();setInterval(lists,60000);
+
+let THREE;try{THREE=await import('three')}catch(e){stage.classList.add('flat')}
+if(THREE){
+ const renderer=new THREE.WebGLRenderer({antialias:true,alpha:true});renderer.setPixelRatio(Math.min(devicePixelRatio,2));stage.prepend(renderer.domElement);
+ const scene=new THREE.Scene(),cam=new THREE.PerspectiveCamera(30,2,.1,100);
+ scene.add(new THREE.AmbientLight(0xffffff,.5));
+ const key=new THREE.DirectionalLight(0xffffff,1.7);key.position.set(-4,5,7);scene.add(key);
+ const rim=new THREE.DirectionalLight(0x9fd0ff,.5);rim.position.set(5,-2,-4);scene.add(rim);
+ const glowLight=new THREE.PointLight(0x78be21,0,7,1.5);scene.add(glowLight);
+ const GAP=2.1,P=STEPS.map((_,i)=>new THREE.Vector3((i-(N-1)/2)*GAP,Math.sin(i*.9)*.34,Math.cos(i*.7)*.5));
+ const curve=new THREE.CatmullRomCurve3(P),SEG=240,pts=[];for(let i=0;i<=SEG;i++)pts.push(curve.getPoint(i/SEG));
+ const baseGeo=new THREE.BufferGeometry().setFromPoints(pts);scene.add(new THREE.Line(baseGeo,new THREE.LineBasicMaterial({color:0x333333})));
+ const progGeo=new THREE.BufferGeometry().setFromPoints(pts);progGeo.setDrawRange(0,0);
+ scene.add(new THREE.Line(progGeo,new THREE.LineBasicMaterial({color:0x78be21,transparent:true,opacity:.75})));
+ const cuts=[()=>new THREE.OctahedronGeometry(.4),()=>new THREE.IcosahedronGeometry(.4,0),()=>new THREE.DodecahedronGeometry(.38,0),()=>new THREE.OctahedronGeometry(.42,1)];
+ const LOOK={pending:{c:0x2b2b2b,e:0x000000,ei:0,o:.95,s:.78,eo:.3,ec:0x707070,spin:.12},done:{c:0x4c7a16,e:0x78be21,ei:.22,o:1,s:.86,eo:.55,ec:0xa6e04a,spin:.18},
+  active:{c:0x78be21,e:0x78be21,ei:.8,o:1,s:1.28,eo:.9,ec:0xe6ffc2,spin:.95},fail:{c:0x7c2226,e:0xff6467,ei:.45,o:1,s:.9,eo:.6,ec:0xff8f91,spin:.15},skip:{c:0x222222,e:0x000000,ei:0,o:.1,s:.5,eo:.08,ec:0x555555,spin:.05}};
+ const gems=P.map((p,i)=>{const g=cuts[i%cuts.length]();
+  const m=new THREE.Mesh(g,new THREE.MeshStandardMaterial({color:0x2b2b2b,flatShading:true,metalness:.25,roughness:.28,transparent:true}));
+  const ed=new THREE.LineSegments(new THREE.EdgesGeometry(g),new THREE.LineBasicMaterial({color:0x707070,transparent:true,opacity:.3}));m.add(ed);
+  m.position.copy(p);m.rotation.set(i*.7,i*1.3,0);m.scale.setScalar(.78);scene.add(m);return {m,ed}});
+ const cv=document.createElement('canvas');cv.width=cv.height=128;const cx=cv.getContext('2d'),gr=cx.createRadialGradient(64,64,0,64,64,64);
+ gr.addColorStop(0,'rgba(150,230,60,.55)');gr.addColorStop(.35,'rgba(120,190,33,.16)');gr.addColorStop(1,'rgba(120,190,33,0)');cx.fillStyle=gr;cx.fillRect(0,0,128,128);
+ const glow=new THREE.Sprite(new THREE.SpriteMaterial({map:new THREE.CanvasTexture(cv),blending:THREE.AdditiveBlending,depthWrite:false,transparent:true,opacity:0}));glow.scale.setScalar(3.4);scene.add(glow);
+ const rings=[0,1].map(k=>{const r=new THREE.Mesh(new THREE.TorusGeometry(.74+k*.14,.006,6,120),new THREE.MeshBasicMaterial({color:0x78be21,transparent:true,opacity:0}));scene.add(r);return r});
+ const M=80,flowPos=new Float32Array(M*3),flowU=Float32Array.from({length:M},()=>Math.random()),flowJ=Float32Array.from({length:M*3},()=>(Math.random()-.5)*.11);
+ const flowGeo=new THREE.BufferGeometry();flowGeo.setAttribute('position',new THREE.BufferAttribute(flowPos,3));
+ const flowMat=new THREE.PointsMaterial({size:.055,color:0x9be03a,transparent:true,opacity:.9,blending:THREE.AdditiveBlending,depthWrite:false});scene.add(new THREE.Points(flowGeo,flowMat));
+ const up=new THREE.Vector3(0,.62,0),arc=new THREE.QuadraticBezierCurve3(P[2].clone().add(up),P[1].clone().lerp(P[2],.5).add(new THREE.Vector3(0,1.55,0)),P[1].clone().add(up));
+ const arcMat=new THREE.LineBasicMaterial({color:0x333333,transparent:true,opacity:.8});const arcGeo=new THREE.BufferGeometry().setFromPoints(arc.getPoints(40));scene.add(new THREE.Line(arcGeo,arcMat));
+ const L=14,loopPos=new Float32Array(L*3),loopGeo=new THREE.BufferGeometry();loopGeo.setAttribute('position',new THREE.BufferAttribute(loopPos,3));
+ const loopMat=new THREE.PointsMaterial({size:.05,color:0x9be03a,transparent:true,opacity:0,blending:THREE.AdditiveBlending,depthWrite:false});scene.add(new THREE.Points(loopGeo,loopMat));
+ const D=320,dust=new Float32Array(D*3);for(let i=0;i<D;i++){dust[i*3]=(Math.random()-.5)*64;dust[i*3+1]=(Math.random()-.5)*9;dust[i*3+2]=-1-Math.random()*8}
+ const dustGeo=new THREE.BufferGeometry();dustGeo.setAttribute('position',new THREE.BufferAttribute(dust,3));
+ const dustPts=new THREE.Points(dustGeo,new THREE.PointsMaterial({size:.03,color:0x6b6b6b,transparent:true,opacity:.7,depthWrite:false}));scene.add(dustPts);
+ const slow=matchMedia('(prefers-reduced-motion: reduce)').matches?.25:1,tc=new THREE.Color(),v=new THREE.Vector3(),clock=new THREE.Clock();
+ let W=1,H=1,dist=9,mx=0,my=0,prog=0,gapNow=GAP;
+ function spread(gap){if(Math.abs(gap-gapNow)<.01)return;gapNow=gap;P.forEach((p,i)=>{p.x=(i-(N-1)/2)*gap;gems[i].m.position.x=p.x});
+  for(let i=0;i<=SEG;i++)curve.getPoint(i/SEG,pts[i]);baseGeo.setFromPoints(pts);const dr=progGeo.drawRange.count;progGeo.setFromPoints(pts);progGeo.setDrawRange(0,dr);
+  arc.v0.copy(P[2]).add(up);arc.v1.copy(P[1]).lerp(P[2],.5).add(v.set(0,1.55,0));arc.v2.copy(P[1]).add(up);arcGeo.setFromPoints(arc.getPoints(40))}
+ function fit(){W=stage.clientWidth;H=stage.clientHeight;if(!W||!H)return;renderer.setSize(W,H,false);cam.aspect=W/H;
+  const t15=Math.tan(15*Math.PI/180),half=(N-1)/2,pad=W<700?1.05:1.15,tv=Math.min(t15,.6/cam.aspect),th=tv*cam.aspect;
+  cam.fov=Math.atan(tv)*360/Math.PI;cam.updateProjectionMatrix();dist=Math.max(8.6*t15/tv,(half*GAP+pad)/th);
+  const halfW=dist*th;spread(Math.max(GAP,(halfW-Math.max(pad,halfW*2*(W<700?46:104)/W))/half))}
+ const laneGrp=new THREE.Group();scene.add(laneGrp);let laneKey='',laneAct=[],laneN=0;
+ const LCOL={done:0x78be21,fail:0xe5484d,active:0xc8ff6a,pending:0x3a3a3a,skip:0x1a1a1a};
+ const laneGlowTex=(()=>{const c=document.createElement('canvas');c.width=c.height=64;const g=c.getContext('2d'),r=g.createRadialGradient(32,32,0,32,32,32);
+  r.addColorStop(0,'rgba(255,255,255,.9)');r.addColorStop(.35,'rgba(255,255,255,.25)');r.addColorStop(1,'rgba(255,255,255,0)');g.fillStyle=r;g.fillRect(0,0,64,64);
+  return new THREE.CanvasTexture(c)})();
+ function laneLabel(txt,on){const cv=document.createElement('canvas');cv.width=160;cv.height=56;const g=cv.getContext('2d');
+  g.fillStyle=on?'#9be03a':'#8a8a8a';g.font='600 40px ui-monospace,Menlo,monospace';g.textBaseline='middle';g.textAlign='right';g.fillText(txt,156,28);
+  const s=new THREE.Sprite(new THREE.SpriteMaterial({map:new THREE.CanvasTexture(cv),transparent:true,depthWrite:false}));s.scale.set(1.25,.44,1);return s}
+ let laneFire=[];
+ function buildLanes(lanes){laneGrp.clear();laneAct=[];laneFire=[];laneN=lanes.length;let prev=P;
+  lanes.forEach((ln,k)=>{const st=laneStates(ln),q=P.map(p=>p.clone().add(v.set(0,-1.9-k*.8,-(k+1)*.3))),seg=[],syn=[];
+   const reach=Math.max(st.lastIndexOf('active'),st.lastIndexOf('done')),lit=[];
+   for(let i=0;i<N;i++){if(i<N-1)(i<reach?lit:seg).push(q[i].x,q[i].y,q[i].z,q[i+1].x,q[i+1].y,q[i+1].z);
+    for(const j of [i-1,i,i+1])if(j>=0&&j<N)syn.push(q[i].x,q[i].y,q[i].z,prev[j].x,prev[j].y,prev[j].z);
+    if(st[i]==='skip')continue;
+    const m=new THREE.Mesh(new THREE.IcosahedronGeometry(st[i]==='active'?.19:.14,0),new THREE.MeshStandardMaterial({color:LCOL[st[i]],
+     emissive:st[i]==='active'?0x4a7a10:0x000000,flatShading:true,metalness:.25,roughness:.3}));m.position.copy(q[i]);laneGrp.add(m);
+    if(st[i]==='active'){laneAct.push(m);const gl=new THREE.Sprite(new THREE.SpriteMaterial({map:laneGlowTex,color:0x9be03a,
+     blending:THREE.AdditiveBlending,depthWrite:false,transparent:true,opacity:.55}));gl.scale.set(1.1,1.1,1);gl.position.copy(q[i]);laneGrp.add(gl);laneAct.push(gl)}}
+   const line=(arr,c,o)=>{const g=new THREE.BufferGeometry();g.setAttribute('position',new THREE.Float32BufferAttribute(arr,3));
+    laneGrp.add(new THREE.LineSegments(g,new THREE.LineBasicMaterial({color:c,transparent:true,opacity:o})))};
+   line(seg,0x2e2e2e,.9);line(lit,0x78be21,.55);line(syn,0x9be03a,.045);
+   if(reach>0){const path=new THREE.CatmullRomCurve3(q.slice(0,reach+1).map(x=>x.clone())),n=6,pos=new Float32Array(n*3),g=new THREE.BufferGeometry();
+    g.setAttribute('position',new THREE.BufferAttribute(pos,3));laneGrp.add(new THREE.Points(g,new THREE.PointsMaterial({size:.24,color:0xd6ff8a,
+     transparent:true,opacity:.9,blending:THREE.AdditiveBlending,depthWrite:false})));laneFire.push({path,pos,g,n,speed:.18/Math.max(1,reach),off:k*.37})}
+   const lb=laneLabel(ln.label||'#'+ln.pr,st.includes('active'));lb.position.copy(q[0]).add(v.set(-1.05,0,0));laneGrp.add(lb);prev=q})}
+ function syncLanes(force){const k=JSON.stringify(view.lanes||[])+gapNow;if(!force&&k===laneKey)return;laneKey=k;buildLanes(view.lanes||[])}
+ fit();new ResizeObserver(fit).observe(stage);
+ addEventListener('pointermove',e=>{mx=e.clientX/innerWidth-.5;my=e.clientY/innerHeight-.5});
+ const lerp=(a,b,k)=>a+(b-a)*k;
+ function frame(){const dt=Math.min(clock.getDelta(),.05)*slow,t=clock.elapsedTime*slow,ai=view.active,k=1-Math.pow(.002,dt);
+  syncLanes();laneAct.forEach(m=>m.scale.setScalar((m.isSprite?1.1:1)*(1+.22*Math.sin(t*2.6))));
+  laneFire.forEach(f=>{for(let i=0;i<f.n;i++){f.path.getPoint((t*f.speed*3+f.off+i/f.n)%1,v);f.pos[i*3]=v.x;f.pos[i*3+1]=v.y;f.pos[i*3+2]=v.z}
+   f.g.attributes.position.needsUpdate=true});const ls=laneN*.5+(laneN?.15:0);
+  cam.position.set(lerp(cam.position.x,mx*.35,.04),lerp(cam.position.y,.35-my*.6-ls,.04),dist*(1+laneN*(W<700?.1:.2)+(laneN?.15:0)));cam.lookAt(cam.position.x,.12-ls,0);
+  gems.forEach(({m,ed},i)=>{const L=LOOK[view.states[i]],pulse=view.states[i]==='active'?.5+.5*Math.sin(t*2.6):0;
+   m.material.color.lerp(tc.set(L.c),k);m.material.emissive.lerp(tc.set(L.e),k);m.material.emissiveIntensity=lerp(m.material.emissiveIntensity,L.ei*(.65+.5*pulse),k);
+   m.material.opacity=lerp(m.material.opacity,L.o,k);ed.material.opacity=lerp(ed.material.opacity,L.eo,k);ed.material.color.lerp(tc.set(L.ec),k);
+   m.scale.setScalar(lerp(m.scale.x,L.s*(1+.04*pulse),k));m.rotation.y+=dt*L.spin;m.rotation.x+=dt*L.spin*.4;m.position.y=P[i].y+Math.sin(t*.8+i)*.035});
+  const on=ai>=0?1:0,target=ai>=0?P[ai]:P[0];glow.position.lerp(target,k);glowLight.position.copy(glow.position).add(v.set(0,.2,1.2));
+  glow.material.opacity=lerp(glow.material.opacity,on*(.8+.2*Math.sin(t*2.6)),k);glowLight.intensity=lerp(glowLight.intensity,on*5,k);
+  rings.forEach((r,j)=>{r.position.copy(glow.position);r.rotation.set(1.25+Math.sin(t*.5+j)*.35,t*(j?-.5:.7),j*1.1);r.material.opacity=lerp(r.material.opacity,on*(j?.28:.5),k)});
+  prog=lerp(prog,ai>=0?ai/(N-1):0,k*.6);progGeo.setDrawRange(0,Math.round(prog*SEG)+1);
+  const span=view.idle?1:Math.max(prog,.02);flowMat.color.lerp(tc.set(view.idle?0x5a5a5a:0x9be03a),k);flowMat.opacity=lerp(flowMat.opacity,view.idle?.5:.9,k);
+  for(let i=0;i<M;i++){flowU[i]=(flowU[i]+dt*(view.idle?.03:.16)*(.6+(i%7)/7))%1;curve.getPoint(flowU[i]*span,v);flowPos[i*3]=v.x+flowJ[i*3];flowPos[i*3+1]=v.y+flowJ[i*3+1];flowPos[i*3+2]=v.z+flowJ[i*3+2]}
+  flowGeo.attributes.position.needsUpdate=true;
+  loopMat.opacity=lerp(loopMat.opacity,view.loop?.95:0,k);arcMat.color.lerp(tc.set(view.loop?0x4c7a16:0x2c2c2c),k);
+  for(let i=0;i<L;i++){arc.getPoint((t*.22+i/L)%1,v);loopPos[i*3]=v.x;loopPos[i*3+1]=v.y;loopPos[i*3+2]=v.z}loopGeo.attributes.position.needsUpdate=true;
+  dustPts.rotation.y=Math.sin(t*.05)*.06;dustPts.position.x=mx*-.6;
+  renderer.render(scene,cam);
+  labs.forEach((l,i)=>{v.copy(P[i]);v.y-=.74;v.project(cam);l.style.transform=`translate(${((v.x*.5+.5)*W).toFixed(1)}px,${((-v.y*.5+.5)*H).toFixed(1)}px) translateX(-50%)`});
+  requestAnimationFrame(frame)}
+ frame()}
+</script></body></html>
+"""
+# an open tab (a phone on the VPN) keeps the CSS it loaded; /api/state carries this token and the tab reloads itself once when it changes
+BUILD = hashlib.sha1(PAGE.encode()).hexdigest()[:10]
+
+CHECKOUT = CONF.checkout
+PRS_PAGE = PC / "board" / "prs.html"
+ISSUES_PAGE = PRS_PAGE.with_name("issues.html")
+ILIST_FIELDS = "number,title,author,labels,state,stateReason,assignees,updatedAt,createdAt,closedAt,closedByPullRequestsReferences"
+IVIEW_FIELDS = ILIST_FIELDS + ",body,comments,milestone,url"
+GH = next((g for g in ("/opt/homebrew/bin/gh", "/usr/local/bin/gh") if os.path.exists(g)), "gh")
+gh_cache = {}
+LIST_FIELDS = "number,title,author,headRefName,isDraft,state,mergeStateStatus,reviewDecision,labels,updatedAt,additions,deletions,changedFiles,statusCheckRollup,mergedAt,closedAt"
+VIEW_FIELDS = ("number,title,body,author,state,isDraft,headRefName,baseRefName,headRefOid,mergeable,mergeStateStatus,reviewDecision,labels,additions,"
+               "deletions,changedFiles,files,commits,comments,reviews,statusCheckRollup,closingIssuesReferences,url,createdAt,updatedAt,mergedAt,closedAt")
+HTMLC = re.compile(r"<!--.*?-->", re.S)
+MARKER = re.compile(r"<!--\s*pr-chain:([a-z-]+)")
+TAGS = {"ui-verdict": "UI Review", "verdict": "Review", "gate-verdict": "Audit", "audit": "Audit", "addendum": "Addendum", "review": "Review"}
+
+
+gh_busy = set()
+GH_CACHE_FILE = WORK / "board-gh-cache.json"  # survives a board restart: the first page load reads this, not GitHub
+try:
+    gh_cache.update({k: tuple(v) for k, v in json.loads(GH_CACHE_FILE.read_text()).items()})
+except (OSError, ValueError):
+    pass
+
+
+def gh_save():
+    try:
+        tmp = GH_CACHE_FILE.with_suffix(f".tmp{threading.get_ident()}")
+        tmp.write_text(json.dumps({k: list(v) for k, v in list(gh_cache.items()) if not k.startswith("diff:")}))
+        tmp.replace(GH_CACHE_FILE)
+    except (OSError, TypeError, ValueError):
+        pass
+
+
+def gh_fetch(key, args):
+    p = subprocess.run([GH, *args], cwd=str(CHECKOUT), capture_output=True, text=True, timeout=60)
+    if p.returncode:
+        raise RuntimeError((p.stderr or "gh failed").strip()[:300])
+    data = json.loads(p.stdout or "null")
+    gh_cache[key] = (time.time(), data)
+    gh_save()
+    return data
+
+
+def gh_refresh(key, args):
+    try:
+        gh_fetch(key, args)
+    except Exception:
+        pass
+    finally:
+        gh_busy.discard(key)
+
+
+STALE_MAX = 600  # a saved GitHub answer older than this is never shown first: the request waits for GitHub (the old answer is the fallback on a gh failure)
+
+
+def gh_json(key, ttl, args, fresh=False):
+    """Read-only gh call, cached. A stale answer is served at once while a background thread refetches it,
+    so only the first read of a key (or fresh=True) waits on GitHub. On a gh failure the last good answer is reused."""
+    hit = gh_cache.get(key)
+    if hit and not fresh and time.time() - hit[0] < STALE_MAX:
+        if time.time() - hit[0] >= ttl and key not in gh_busy:
+            gh_busy.add(key)
+            threading.Thread(target=gh_refresh, args=(key, args), daemon=True).start()
+        return hit[1]
+    try:
+        return gh_fetch(key, args)
+    except Exception:
+        if hit:
+            return hit[1]
+        raise
+
+
+def pr_diff(n, fresh=False):
+    """Unified diff of one PR, split per file (read-only `gh pr diff`, cached 60 s)."""
+    key = f"diff:{n}"
+    hit = gh_cache.get(key)
+    if hit and not fresh and time.time() - hit[0] < 60:
+        return hit[1]
+    p = subprocess.run([GH, "pr", "diff", str(n)], cwd=str(CHECKOUT), capture_output=True, text=True, errors="replace", timeout=90)
+    if p.returncode:
+        if hit:
+            return hit[1]
+        raise RuntimeError((p.stderr or "gh failed").strip()[:300])
+    files = {}
+    for chunk in re.split(r"(?m)^(?=diff --git )", p.stdout):
+        m = re.match(r"diff --git a/(.*?) b/(.*)\n", chunk)
+        if not m:
+            continue
+        lines = chunk.split("\n")
+        start = next((i for i, ln in enumerate(lines) if ln.startswith("@@")), None)
+        if start is None:
+            note_ = next((ln for ln in lines[1:] if ln.startswith(("Binary", "rename", "similarity", "deleted", "new file"))), "No text changes.")
+            files[m.group(2)] = dict(lines=[], note=note_, cut=0)
+            continue
+        body = lines[start:]
+        if body and body[-1] == "":
+            body.pop()
+        files[m.group(2)] = dict(lines=body[:2500], note="", cut=max(0, len(body) - 2500))
+    data = dict(pr=n, files=files)
+    gh_cache[key] = (time.time(), data)
+    return data
+
+
+def checks(rollup, full=False):
+    out = dict(ok=0, fail=0, wait=0, skip=0, items=[])
+    for c in rollup or []:
+        name = c.get("name") or c.get("context") or "?"
+        res = (c.get("conclusion") or c.get("state") or "").upper()
+        done = c.get("status", "COMPLETED") == "COMPLETED"
+        if not done or res in ("PENDING", "EXPECTED", ""):
+            k = "wait"
+        elif res in ("SUCCESS", "NEUTRAL"):
+            k = "ok"
+        elif res in ("SKIPPED",):
+            k = "skip"
+        else:
+            k = "fail"
+        out[k] += 1
+        if full and k in ("fail", "wait"):
+            out["items"].append(dict(name=name, flow=c.get("workflowName") or "", k=k, res=res.lower() or "running", url=c.get("detailsUrl") or c.get("targetUrl") or ""))
+    return out
+
+
+def chain_state(n):
+    try:
+        return json.loads((WORK / "prs" / str(n) / "STATE.json").read_text())
+    except Exception:
+        return None
+
+
+def pr_list(which, fresh=False):
+    which = which if which in ("open", "merged", "closed") else "open"
+    rows = gh_json("list:" + which, 60, ["pr", "list", "--state", which, "--limit", "40", "--json", LIST_FIELDS], fresh)
+    pick = {q["pr"]: q for q in pick_cache["rows"]}
+    ptok = tok_maps()[0]
+    out = []
+    for r in rows:
+        n = r["number"]
+        st = chain_state(n) or {}
+        c = checks(r.get("statusCheckRollup"))
+        out.append(dict(n=n, title=r["title"], author=(r.get("author") or {}).get("login", ""), branch=r["headRefName"], draft=r["isDraft"],
+                        state=r["state"], merge=r.get("mergeStateStatus") or "", review=r.get("reviewDecision") or "",
+                        labels=[x["name"] for x in r.get("labels") or []], at=r.get("mergedAt") or r.get("closedAt") or r["updatedAt"],
+                        add=r["additions"], rem=r["deletions"], files=r["changedFiles"], ok=c["ok"], fail=c["fail"], wait=c["wait"],
+                        chain=st.get("status", ""), ui=pick.get(n, {}).get("ui"), owner=pick.get(n, {}).get("owner", ""), tok=ptok.get(n, 0),
+                        usd=usd_maps()[0].get(n, 0)))
+    out.sort(key=lambda x: x["at"], reverse=True)
+    return dict(state=which, prs=out, age=int(time.time() - gh_cache["list:" + which][0]))
+
+
+def note(who, at, kind, body, url="", extra=""):
+    raw = body or ""
+    m = MARKER.search(raw)
+    text = HTMLC.sub("", raw).strip()
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    first = next((ln for ln in lines if not re.fullmatch(r"(PASS|FAIL)", ln)), lines[0] if lines else "")
+    v = re.search(r"\b(NOT READY|PASS|FAIL|READY|APPROVED|CHANGES_REQUESTED)\b", extra + " " + text[:400])
+    return dict(who=who, at=at, kind=kind, tag=TAGS.get(m.group(1), m.group(1).replace("-", " ").title()) if m else "", verdict=v.group(1) if v else "",
+                first=re.sub(r"^#+\s*", "", first)[:220], body=text[:9000], long=len(lines) > 1 or len(first) > 220, url=url, extra=extra)
+
+
+def pr_detail(n, fresh=False):
+    hit, sp = gh_cache.get(f"pr:{n}"), WORK / "prs" / str(n) / "STATE.json"
+    # A cached GitHub copy older than the chain's last write holds an older head; the page would call that head a new push.
+    fresh = fresh or bool(hit and sp.exists() and sp.stat().st_mtime > hit[0])
+    d = gh_json(f"pr:{n}", 45, ["pr", "view", str(n), "--json", VIEW_FIELDS], fresh)
+    try:
+        inline = gh_json(f"inline:{n}", 45, ["api", f"repos/{{owner}}/{{repo}}/pulls/{n}/comments", "--paginate"], fresh)
+    except Exception:
+        inline = []
+    thread = [note((c.get("author") or {}).get("login", ""), c["createdAt"], "comment", c.get("body"), c.get("url", "")) for c in d.get("comments") or []]
+    for r in d.get("reviews") or []:
+        if r.get("body") or r.get("state") != "COMMENTED":
+            thread.append(note((r.get("author") or {}).get("login", ""), r.get("submittedAt") or "", "review", r.get("body"), "",
+                               f'{r.get("state", "")} at {((r.get("commit") or {}).get("oid") or "")[:8]}'))
+    for c in inline or []:
+        thread.append(note((c.get("user") or {}).get("login", ""), c.get("created_at", ""), "inline", c.get("body"), c.get("html_url", ""),
+                           f'{c.get("path", "")}:{c.get("line") or c.get("original_line") or ""}'))
+    thread.sort(key=lambda x: x["at"])
+    files = sorted(d.get("files") or [], key=lambda f: -(f.get("additions", 0) + f.get("deletions", 0)))
+    commits = d.get("commits") or []
+    led = [r for r in ledger_rows(3000) if str(r.get("pr")) == str(n)][-14:]
+    return dict(n=d["number"], title=d["title"], url=d["url"], state=d["state"], draft=d["isDraft"], author=(d.get("author") or {}).get("login", ""),
+                branch=d["headRefName"], base=d["baseRefName"], head=d["headRefOid"], created=d["createdAt"], updated=d["updatedAt"],
+                merged=d.get("mergedAt"), closed=d.get("closedAt"), mergeable=d.get("mergeable") or "", merge=d.get("mergeStateStatus") or "",
+                review=d.get("reviewDecision") or "", labels=[x["name"] for x in d.get("labels") or []],
+                issues=[dict(n=i["number"], url=i["url"]) for i in d.get("closingIssuesReferences") or []],
+                tok=tok_maps()[0].get(n, 0), usd=usd_maps()[0].get(n, 0),
+                add=d["additions"], rem=d["deletions"], nfiles=d["changedFiles"],
+                files=[dict(path=f["path"], add=f.get("additions", 0), rem=f.get("deletions", 0)) for f in files[:60]],
+                ncommits=len(commits), commits=[dict(oid=c["oid"][:8], msg=c.get("messageHeadline", ""), at=c.get("committedDate", "")) for c in commits[-6:]][::-1],
+                checks=checks(d.get("statusCheckRollup"), True), body=HTMLC.sub("", d.get("body") or "").strip()[:9000], thread=thread,
+                chain=chain_state(n), ui=next((q.get("ui") for q in pick_cache["rows"] if q["pr"] == n), None),
+                ledger=[dict(ts=str(r.get("ts", ""))[5:16].replace("T", " "), stage=r.get("stage", ""), role=r.get("role", ""), model=r.get("model", ""),
+                             rc=r.get("rc"), secs=r.get("secs"), status=r.get("status", ""), why=str(r.get("why") or "")[:160]) for r in led],
+                age=int(time.time() - gh_cache[f"pr:{n}"][0]))
+
+
+def issue_chain(n):
+    """What pr-chain recorded when it built this issue into a pull request (None: never tried)."""
+    try:
+        st = json.loads((WORK / "issues" / str(n) / "STATE.json").read_text())
+        return dict(status=str(st.get("status") or ""), why=str(st.get("why") or "")[:300], pr=st.get("pr"))
+    except Exception:
+        return None
+
+
+def issue_row(r):
+    return dict(n=r["number"], title=r["title"], author=(r.get("author") or {}).get("login", ""), state=r["state"], reason=r.get("stateReason") or "",
+                labels=[x["name"] for x in r.get("labels") or []], who=[a["login"] for a in r.get("assignees") or []],
+                at=r["updatedAt"], created=r["createdAt"], closed=r.get("closedAt"),
+                prs=[dict(n=q["number"], chain=(chain_state(q["number"]) or {}).get("status", "")) for q in r.get("closedByPullRequestsReferences") or []],
+                chain=(issue_chain(r["number"]) or {}).get("status", ""))
+
+
+def issue_list(which, fresh=False):
+    """Read-only `gh issue list`, cached 90 s. Open: up to 300. Closed: the 80 most recent."""
+    which = which if which in ("open", "closed") else "open"
+    rows = gh_json("ilist:" + which, 90, ["issue", "list", "--state", which, "--limit", "300" if which == "open" else "80", "--json", ILIST_FIELDS], fresh)
+    itok = tok_maps()[1]
+    iusd = usd_maps()[1]
+    out = [dict(issue_row(r), tok=itok.get(r["number"], 0), usd=iusd.get(r["number"], 0)) for r in rows]
+    out.sort(key=lambda x: x["at"], reverse=True)
+    return dict(state=which, issues=out, age=int(time.time() - gh_cache["ilist:" + which][0]))
+
+
+def issue_detail(n, fresh=False):
+    d = gh_json(f"issue:{n}", 45, ["issue", "view", str(n), "--json", IVIEW_FIELDS], fresh)
+    out = issue_row(d)
+    out["tok"] = tok_maps()[1].get(n, 0)
+    out["usd"] = usd_maps()[1].get(n, 0)
+    out["chain"] = issue_chain(n)
+    out.update(url=d["url"], milestone=(d.get("milestone") or {}).get("title", ""), body=HTMLC.sub("", d.get("body") or "").strip()[:14000],
+               thread=[note((c.get("author") or {}).get("login", ""), c["createdAt"], "comment", c.get("body"), c.get("url", "")) for c in d.get("comments") or []],
+               age=int(time.time() - gh_cache[f"issue:{n}"][0]))
+    return out
+
+
+# --- agent runs: the exact prompt and result of every agent that worked on a PR or built an issue (read-only).
+# err.txt is never read or served: it holds session tokens. Page code lives in board/runs.js, shared by /prs and /issues. ---
+import difflib
+from datetime import datetime
+
+RUNS_JS = PC / "board" / "runs.js"
+RUN_RESULT = {"review": "verdict.md", "gate": "verdict.md", "ui": "ui-verdict.md", "fix": "fix-report.md", "build": "build-report.md"}
+RUN_ID = re.compile(r"p(\d+)/([A-Za-z0-9][A-Za-z0-9._-]*)|i(\d+)")
+BRIEF_HEAD = re.compile(r"[Pp]inned head:?\s*`?([0-9a-f]{12,40})|^head ([0-9a-f]{12,40})", re.M)
+
+
+def _local(iso):
+    """GitHub's UTC time as the local wall-clock string the ledger uses."""
+    return datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone().replace(tzinfo=None).isoformat(timespec="seconds")
+
+
+def _full_ledger():
+    rows = []
+    try:
+        for ln in (WORK / "ledger.jsonl").read_text(errors="replace").splitlines():
+            try:
+                rows.append(json.loads(ln))
+            except ValueError:
+                pass
+    except OSError:
+        pass
+    return rows
+
+
+def _run_row(rid, name, d, agents):
+    role = "build" if rid[0] == "i" else name.split(".")[0].rsplit("-", 1)[-1]
+    brief = (d / "brief.md").read_text(errors="replace")
+    files = [f for f in d.iterdir() if f.is_file() and f.name != "err.txt"]
+    start, end = (d / "brief.md").stat().st_mtime, max(f.stat().st_mtime for f in files)
+    res = d / RUN_RESULT.get(role, "verdict.md")
+    first = ((res.read_text(errors="replace").splitlines() or [""])[0][:80]) if res.is_file() else ""
+    m = BRIEF_HEAD.search(brief[:6000])
+    best = min(agents, key=lambda r: abs(datetime.fromisoformat(r["ts"]).timestamp() - end), default=None)
+    near = best is not None and abs(datetime.fromisoformat(best["ts"]).timestamp() - end) < 120
+    return dict(id=rid, name=name, role=role, start=datetime.fromtimestamp(start).isoformat(timespec="seconds"),
+                end=datetime.fromtimestamp(end).isoformat(timespec="seconds"), first=first, head=((m.group(1) or m.group(2)) if m else "")[:12],
+                secs=int(best["secs"]) if near and best.get("secs") else None, model=(best.get("model") or "") if near else "", size=len(brief))
+
+
+def _agent_rows(*keys):
+    """Ledger rows for one agent run each, only for these ledger keys (parallel chains write to the same file)."""
+    return [r for r in _full_ledger() if r.get("stage") == "agent" and r.get("ts") and str(r.get("pr")) in keys]
+
+
+def pr_runs(n):
+    built = []  # issues whose build run opened this PR
+    for st in (WORK / "issues").glob("*/STATE.json"):
+        try:
+            if str(json.loads(st.read_text()).get("pr")) == str(n) and (st.parent / "brief.md").is_file():
+                built.append(st.parent)
+        except (ValueError, OSError):
+            pass
+    agents = _agent_rows(str(n), *(f"i{d.name}" for d in built))
+    base = WORK / "prs" / str(n)
+    runs = [_run_row(f"p{n}/{d.name}", d.name, d, agents) for d in sorted(base.iterdir())
+            if d.is_dir() and (d / "brief.md").is_file()] if base.is_dir() else []
+    runs += [_run_row(f"i{d.name}", "issue build", d, agents) for d in built]
+    return sorted(runs, key=lambda r: r["start"])
+
+
+def _timeline(n, tag=""):
+    """Everything except the agent runs themselves (the page draws those as rows of their own, in time order)."""
+    ev = []
+    for r in _full_ledger():
+        if str(r.get("pr")) == str(n) and r.get("stage") != "agent" and r.get("ts"):
+            bits = " ".join(f"{k}={str(v)[:90]}" for k, v in r.items() if k not in ("ts", "pr", "tail", "turns", "cost", "rc", "model", "stage", "issue") and v not in (None, "None", ""))
+            ev.append((r["ts"][:19], "ledger", f"{tag}{r.get('stage')} {bits}".strip()))
+    try:
+        if not str(n).isdigit():  # an issue's own build rows carry "i<issue>"; there is no PR to read
+            return ev
+        d = gh_json(f"pr:{n}", 45, ["pr", "view", str(n), "--json", VIEW_FIELDS])
+        for c in d.get("commits") or []:
+            ev.append((_local(c["committedDate"]), "commit", f"{tag}{c['oid'][:8]} {c.get('messageHeadline', '')[:100]}"))
+        for c in d.get("comments") or []:
+            if MARKER.search(c.get("body") or ""):
+                x = note("", c["createdAt"], "comment", c.get("body"))
+                ev.append((_local(c["createdAt"]), "comment", f"{tag}{x['tag']} {x['first']}"[:200]))
+    except Exception:
+        pass
+    return ev
+
+
+def runs_view(kind, n):
+    if kind == "pr":
+        runs = pr_runs(n)
+        return dict(groups=[dict(label=f"Pull Request #{n}", runs=runs)], timeline=sorted(_timeline(n)))
+    agents = _agent_rows(f"i{n}")
+    groups, ev, b = [], [], WORK / "issues" / str(n)
+    if (b / "brief.md").is_file():
+        groups.append(dict(label="Issue Build", runs=[_run_row(f"i{n}", "issue build", b, agents)]))
+    d = gh_json(f"issue:{n}", 45, ["issue", "view", str(n), "--json", IVIEW_FIELDS])
+    prs = {q["number"] for q in d.get("closedByPullRequestsReferences") or []} | ({int(p)} if (p := (issue_chain(n) or {}).get("pr")) else set())
+    for pn in sorted(prs):
+        runs = [r for r in pr_runs(pn) if r["id"][0] == "p"]
+        if runs:
+            groups.append(dict(label=f"Pull Request #{pn}", runs=runs))
+        ev += _timeline(pn, f"#{pn} ")
+    if groups and groups[0]["label"] == "Issue Build":
+        ev += _timeline(f"i{n}")
+    return dict(groups=groups, timeline=sorted(ev))
+
+
+def run_detail(rid):
+    m = RUN_ID.fullmatch(rid)
+    if not m:
+        raise ValueError("bad run id")
+    if m.group(3):
+        d, role, pr = WORK / "issues" / m.group(3), "build", None
+    else:
+        pr, d = m.group(1), WORK / "prs" / m.group(1) / m.group(2)
+        role = m.group(2).split(".")[0].rsplit("-", 1)[-1]
+    ok_parent = (WORK / "issues") if pr is None else (WORK / "prs" / pr)
+    if not (d / "brief.md").is_file() or d.resolve().parent != ok_parent.resolve():
+        raise ValueError("no such run")
+    cap = lambda p, k: p.read_text(errors="replace")[:k] if p.is_file() else ""
+    brief = cap(d / "brief.md", 60000)
+    prev = diff = ""
+    if pr is not None:
+        runs = pr_runs(pr)
+        same = [r for r in runs if r["role"] == role]
+        i = next((j for j, r in enumerate(same) if r["id"] == rid), 0)
+        if i:
+            pb = cap(WORK / "prs" / pr / same[i - 1]["name"] / "brief.md", 60000)
+            prev = same[i - 1]["name"]
+            diff = "".join(difflib.unified_diff(pb.splitlines(True), brief.splitlines(True), same[i - 1]["name"], d.name, n=1))[:60000]
+    return dict(brief=brief, result=cap(d / RUN_RESULT.get(role, "verdict.md"), 40000), out=cap(d / "out.jsonl", 20000),
+                diff=diff, prev=prev, same=bool(prev) and not diff,
+                extra=sorted(f.name for f in d.iterdir() if f.is_file() and f.name not in ("err.txt", "brief.md", "out.jsonl", "no-gh") and f.name != RUN_RESULT.get(role)))
+
+
+SPEND_PAGE = PRS_PAGE.parent / "spend.html"
+WIKI_PAGE = PRS_PAGE.parent / "wiki.html"  # the loop diagram, its rules, and per-step prompt/model editing (2026-11-16)
+ISSUE_REF =re.compile(r"(?:refs|fix(?:es)?|closes)\s+#(\d+)", re.I)
+table_cache = {"at": 0, "data": None}
+
+
+def spend_table():
+    """Tokens per pull request and per issue, all time, from the ledger. An issue's figure is its build run plus every PR tied to it
+    (GitHub's closing link, an issue-<n> branch name, or 'refs #n' in the PR title). Titles come from one GitHub read, cached 10 min."""
+    if table_cache["data"] and time.time() - table_cache["at"] < 5:
+        return table_cache["data"]
+    today = time.strftime("%Y-%m-%d")
+    per, days, dusd, by_model = {}, {}, {}, {}
+    for r in spend_runs():
+        if r["end"]:
+            continue
+        d = per.setdefault(r["pr"], dict(tok=0, today=0, usd=0.0, usd_today=0.0, unpriced=0, runs=0, missing=0, last="", models={}))
+        tok, usd = r["tok"] or 0, r["usd"] or 0.0
+        d["tok"] += tok
+        d["usd"] += usd
+        d["runs"] += 1
+        d["missing"] += r["tok"] is None
+        d["unpriced"] += r["usd"] is None
+        d["last"] = max(d["last"], r["ts"])
+        if r["ts"].startswith(today):
+            d["today"] += tok
+            d["usd_today"] += usd
+        m = r.get("real") or str(r["model"]).replace("codex:", "")
+        for bag in (d["models"], by_model):
+            e = bag.setdefault(m, [0, 0.0])
+            e[0] += tok
+            e[1] += usd
+        days[r["ts"][:10]] = days.get(r["ts"][:10], 0) + tok
+        dusd[r["ts"][:10]] = dusd.get(r["ts"][:10], 0.0) + usd
+    try:
+        idx = {q["number"]: q for q in gh_json("spendidx", 600, ["pr", "list", "--state", "all", "--limit", "400", "--json",
+                                                                  "number,title,state,headRefName,closingIssuesReferences"])}
+    except Exception:
+        idx = {}
+    try:
+        names = {q["number"]: q for q in gh_json("spendiss", 600, ["issue", "list", "--state", "all", "--limit", "700", "--json", "number,title,state"])}
+    except Exception:
+        names = {}
+    prs, iss = [], {}
+    for n, d in per.items():
+        if isinstance(n, str):
+            if n[:1] == "i" and n[1:].isdigit():
+                e = iss.setdefault(int(n[1:]), dict(tok=0, today=0, usd=0.0, usd_today=0.0, prs=[], build=0))
+                e["tok"] += d["tok"]
+                e["today"] += d["today"]
+                e["usd"] += d["usd"]
+                e["usd_today"] += d["usd_today"]
+                e["build"] += d["tok"]
+            continue
+        q = idx.get(n) or {}
+        links = {i["number"] for i in q.get("closingIssuesReferences") or []}
+        links |= {int(x) for x in re.findall(r"issue-(\d+)", q.get("headRefName") or "")}
+        links |= {int(x) for x in ISSUE_REF.findall(q.get("title") or "")}
+        links.discard(n)
+        prs.append(dict(n=n, title=q.get("title", ""), state=q.get("state", ""), chain=(chain_state(n) or {}).get("status", ""),
+                        issues=sorted(links), **d))
+        for i in links:
+            e = iss.setdefault(i, dict(tok=0, today=0, usd=0.0, usd_today=0.0, prs=[], build=0))
+            e["tok"] += d["tok"]
+            e["today"] += d["today"]
+            e["usd"] += d["usd"]
+            e["usd_today"] += d["usd_today"]
+            e["prs"].append(n)
+    issues = [dict(n=i, title=(names.get(i) or {}).get("title", ""), state=(names.get(i) or {}).get("state", ""), **e) for i, e in iss.items()]
+    data = dict(prs=prs, issues=issues, total=sum(d["tok"] for d in per.values()), today=days.get(today, 0),
+                usd=sum(d["usd"] for d in per.values()), usd_today=dusd.get(today, 0.0),
+                unpriced=sum(d["unpriced"] for d in per.values()), runs=sum(d["runs"] for d in per.values()),
+                models=[dict(model=k, tok=v[0], usd=v[1]) for k, v in sorted(by_model.items(), key=lambda x: -x[1][1])],
+                rates=dict(rate_used), rates_at=time.strftime("%Y-%m-%d %H:%M", time.localtime(table["at"])) if table["at"] else "",
+                days=[dict(day=k, tok=v, usd=dusd.get(k, 0.0)) for k, v in sorted(days.items())][-10:], since=min((r["ts"] for r in spend_runs()), default="")[:10],
+                unlinked=sum(1 for q in prs if not q["issues"]))
+    table_cache.update(at=time.time(), data=data)
+    return data
+
+
+def tok_maps():
+    t = spend_table()
+    return {q["n"]: q["tok"] for q in t["prs"]}, {i["n"]: i["tok"] for i in t["issues"]}
+
+
+def usd_maps():
+    t = spend_table()
+    return {q["n"]: round(q["usd"], 2) for q in t["prs"]}, {i["n"]: round(i["usd"], 2) for i in t["issues"]}
+
+
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        path = self.path.split("?")[0]
+        if (rm := re.fullmatch(r"/api/(pr|issue)/(\d+)/runs", path)):
+            try:
+                data = runs_view(rm.group(1), int(rm.group(2)))
+            except Exception as e:
+                data = {"error": str(e)[:300]}
+            body, ctype = json.dumps(data).encode(), "application/json"
+        elif path.startswith("/api/run/"):
+            try:
+                data = run_detail(path[len("/api/run/"):])
+            except Exception as e:
+                data = {"error": str(e)[:300]}
+            body, ctype = json.dumps(data).encode(), "application/json"
+        elif path == "/runs.js":
+            body, ctype = RUNS_JS.read_bytes(), "text/javascript; charset=utf-8"
+        elif self.path.startswith("/api/state"):
+            try:
+                body, ctype = json.dumps({**state(int(m.group(1)) if (m := re.search(r"[?&]pr=(\d+)", self.path)) else None), "build": BUILD}).encode(), "application/json"
+            except Exception as e:  # a half-written file must not kill the page
+                body, ctype = json.dumps({"error": str(e)}).encode(), "application/json"
+        elif self.path.startswith("/api/issue"):
+            q = self.path.split("?")
+            fresh = len(q) > 1 and "fresh=1" in q[1]
+            m = re.fullmatch(r"/api/issue/(\d+)", q[0])
+            try:
+                if m:
+                    data = issue_detail(int(m.group(1)), fresh)
+                else:
+                    w = re.search(r"state=(\w+)", q[1]) if len(q) > 1 else None
+                    data = issue_list(w.group(1) if w else "open", fresh)
+            except Exception as e:
+                data = {"error": str(e)[:300]}
+            body, ctype = json.dumps(data).encode(), "application/json"
+        elif self.path.startswith("/api/pr"):
+            q = self.path.split("?")
+            fresh = len(q) > 1 and "fresh=1" in q[1]
+            m = re.fullmatch(r"/api/pr/(\d+)", q[0])
+            dm = re.fullmatch(r"/api/pr/(\d+)/diff", q[0])
+            try:
+                if dm:
+                    data = pr_diff(int(dm.group(1)), fresh)
+                elif m:
+                    data = pr_detail(int(m.group(1)), fresh)
+                else:
+                    w = re.search(r"state=(\w+)", q[1]) if len(q) > 1 else None
+                    refresh_pick()
+                    data = pr_list(w.group(1) if w else "open", fresh)
+            except Exception as e:
+                data = {"error": str(e)[:300]}
+            body, ctype = json.dumps(data).encode(), "application/json"
+        elif self.path.split("?")[0].rstrip("/") == "/api/spend":
+            try:
+                data = spend_table()
+            except Exception as e:
+                data = {"error": str(e)[:300]}
+            body, ctype = json.dumps(data).encode(), "application/json"
+        elif self.path.split("?")[0].rstrip("/") == "/api/flow":  # the chain's program (pr-chain/flow.json); the wiki draws it
+            try:
+                data = json.loads((ROOT / "chain" / "flow.json").read_text())
+            except Exception as e:
+                data = {"error": str(e)[:300]}
+            body, ctype = json.dumps(data).encode(), "application/json"
+        elif self.path.split("?")[0].rstrip("/") == "/wiki":
+            body, ctype = WIKI_PAGE.read_bytes(), "text/html; charset=utf-8"
+        elif self.path.split("?")[0].rstrip("/") == "/spend":
+            body, ctype = SPEND_PAGE.read_bytes(), "text/html; charset=utf-8"
+        elif self.path.split("?")[0].rstrip("/") == "/config":
+            body, ctype = CONFIG_PAGE.read_bytes(), "text/html; charset=utf-8"
+        elif self.path.split("?")[0].rstrip("/") == "/api/config":
+            try:
+                data = config_state()
+            except Exception as e:
+                data = {"error": str(e)[:300]}
+            body, ctype = json.dumps(data).encode(), "application/json"
+        elif self.path.split("?")[0].rstrip("/") == "/issues":
+            body, ctype = ISSUES_PAGE.read_bytes(), "text/html; charset=utf-8"
+        elif self.path.split("?")[0].rstrip("/") == "/prs":
+            body, ctype = PRS_PAGE.read_bytes(), "text/html; charset=utf-8"
+        elif self.path.startswith("/three/"):
+            name = self.path.split("/")[-1].split("?")[0]
+            if name not in ("three.module.js", "three.core.js") or not (VENDOR / name).exists():
+                self.send_error(404)
+                return
+            if name not in vendor_cache:
+                vendor_cache[name] = (VENDOR / name).read_bytes()
+            body, ctype = vendor_cache[name], "text/javascript; charset=utf-8"
+        else:
+            body, ctype = PAGE.replace("__BUILD__", BUILD).encode(), "text/html; charset=utf-8"
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        route = self.path.split("?")[0].rstrip("/")
+        if route not in ("/api/config", "/api/loop"):
+            self.send_error(404)
+            return
+        origin = self.headers.get("Origin")
+        if not (self.headers.get("Content-Type") or "").startswith("application/json") or (
+                origin and origin.split("://", 1)[-1] != (self.headers.get("Host") or "")):
+            self.send_error(403, "same-origin JSON only")  # a page on another site cannot save config (audit 11-14)
+            return
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(n).decode() or "{}")
+            if not isinstance(body, dict):
+                raise ValueError("body must be a JSON object")
+            if route == "/api/loop":
+                ok, msg = start_loop() if body.get("action") == "start" else (False, "action must be start")
+                data = {} if ok else {"error": msg}
+            else:
+                ok, msg = apply_config(body)
+                data = config_state() if ok else {"error": msg}
+            data["saved"] = msg
+        except Exception as e:
+            ok, data = False, {"error": f"bad request: {e}"[:300]}
+        payload = json.dumps(data).encode()
+        self.send_response(200 if ok else 400)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(payload)
+
+
+if __name__ == "__main__":
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8790
+    ThreadingHTTPServer(("127.0.0.1", port), H).serve_forever()

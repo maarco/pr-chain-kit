@@ -1,0 +1,57 @@
+name: PR Gates DoD
+
+# Definition-of-done check (#724). Controlled by .github/pr-gates.toml
+# (pr_gates.dod.enabled): when false, the job exits 0 and posts nothing. When true, the script posts exactly ONE check run
+# (pr_gates.dod.check_name, default dod/ready-for-review) whose summary
+# names every failed item. It never posts comments.
+
+# Only target/default-branch events run this privileged workflow. Review events
+# can load PR workflow code and must not be added here.
+# Every event checks out the trusted base, never the PR head or merge ref.
+# The script reads PR facts through the API and never executes PR code.
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review, edited]
+    branches: [main, "release/**", "integration/**"]
+  issue_comment:
+    types: [created, edited, deleted]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: Pull request number to reevaluate
+        required: true
+        type: number
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+  checks: write
+
+jobs:
+  dod:
+    if: github.event_name != 'issue_comment' || github.event.issue.pull_request != null
+    name: definition-of-done
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.base.sha || github.event.repository.default_branch }}
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      - name: Run pr-gates definition-of-done check
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}
+          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python scripts/pr_gates_dod.py \
+            --config .github/pr-gates.toml \
+            --repo "${{ github.repository }}" \
+            --pr "$PR_NUMBER" \
+            --head-sha "$EVENT_HEAD_SHA" \
+            --post

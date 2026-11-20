@@ -1,0 +1,65 @@
+# pr-chain.toml — every project-specific value the chain uses, in one file.
+# Env vars always win over this file (KIT_REPO, KIT_CHECKOUT, KIT_WORK, PR_CHAIN_WT_ROOT,
+# PR_CHAIN_MODELS_FILE, PR_CHAIN_FLOW, PR_CHAIN_CONFIG — the same names the scripts already read).
+# Relative paths resolve against this repo's root; ~ expands. Copy this file, fill it in, done.
+# A worked example for a real repo: examples/kollab/pr-chain.toml.
+
+[repo]
+slug = "owner/name"            # the GitHub repo the chain works on
+default_branch = "main"
+checkout = "~/dev/name"        # a local checkout of slug; its default branch stays read-only
+python = ""                    # interpreter with the repo's dev deps; empty = <checkout>/.venv/bin/python
+import_guard = ""              # a module name; if set, tests in a worktree must import it FROM the worktree
+src_globs = ["src"]            # PYTHONPATH roots, globbed inside a worktree (e.g. ["packages/*/src", "src"])
+rules_doc = "CONTRIBUTING.md"  # the repo rules file every agent skims (repo-relative)
+
+[accounts]
+authors = ["you", "your-bot"]  # the chain only ever works on PRs these accounts opened
+trusted = ["you"]              # only these accounts can approve or give feedback at the human gate
+merger = "your-bot"            # the gh account that merges and writes labels
+approver_of = { "your-bot" = "you" }  # the non-author account named as approver per PR author (fallback: merger)
+checks = ["ci/tests"]          # required CI checks the chain waits for
+
+[paths]
+work = "~/backups/pr-chain"          # ledger.jsonl, prs/<n>/, logs/, scratch-home/ (never the checkout)
+worktree_root = "~/wt/pr-chain"      # one worktree per stage lives here
+lane_root = "~/wt"                   # where sibling lane worktrees live (stale-lane detection); empty = worktree_root's parent
+
+[labels]
+human_approved = "human-approved"    # label that sends an AWAIT-HUMAN PR to CI + merge
+blocked = ["wontfix", "duplicate", "invalid", "question", "status/blocked", "status/needs-info",
+           "status/needs-repro", "status/ready-for-human"]   # the chain never picks issues with these
+
+[changelog]
+# Files no fixer or builder may edit (the project's changelog(s)), plus the fragment rule: a PR that
+# closes an issue must add <fragment_dir>/<issue>.<section>.md with a "- ... (#issue)" bullet.
+forbidden = ["CHANGELOG.md"]
+fragment_dir = "changes"
+
+[ui]
+enabled = true                       # false: no UI vision review, no screenshots, no stack
+paths_regex = '(\.tsx$|\.css$|\.html$)'   # a diff touching these paths needs a UI review
+proof_regex = 'frontend/tests/.+\.mjs$'   # browser-proof test files the UI reviewer is told to run
+frontend_dir = ""                    # frontend folder inside the repo; node_modules is linked from the main checkout
+stamp_file = ""                      # the stack stamps this file; a dirty stamp alone never blocks a worktree drop
+stack_script = ""                    # script with `up --wt W --dir D --python P` / `down --dir D` (see examples/kollab/ui_stack.py)
+shoot_script = ""                    # screenshot helper (default: chain/ui_shoot.py)
+term_shots_script = ""               # terminal-screenshot helper for PRs that add tmux specs (see examples/kollab/term_shots.py)
+playwright_browsers_path = ""        # browser cache for agents with a scratch HOME; empty = let playwright find it
+
+[agent]
+# Extra env every agent command runs with (the app's "don't touch my real config" switches).
+env = {}
+
+[tripwire]
+# Settings file watched for damage while an agent runs: gone/unreadable, a setting removed, or a
+# credential/endpoint/repo key changed stops every chain. Empty settings_file disables the tripwire.
+settings_file = ""
+
+[project]
+# Per-project section for the agents' shared field guide: repo map, local check commands, forbidden
+# paths/ports. The generic guide (chain/prompts/field-guide.md) plus this file is what every stage reads.
+field_guide = ""
+
+[notify]
+command = ""                         # pages you when the loop is down (called with one message argument); empty = off

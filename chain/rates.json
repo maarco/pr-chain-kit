@@ -1,0 +1,11 @@
+{
+  "_about": "Override file. US dollars per 1,000,000 tokens. pr-chain-board gets model prices from the public LiteLLM table, downloaded once a day into the pr-chain work folder (litellm-rates.json). A model listed here uses these numbers instead, matched by name prefix. Runs go through subscriptions, so no money is actually charged per token. Edit a number here and the board picks it up within a minute.",
+  "_looked_up": "2026-11-13",
+  "_sources": [
+    "https://venturebeat.com/ai/glm-5-3-hits-the-api-at-1-4-4-4-per-million-tokens",
+    "https://pricepertoken.com/pricing-page/model/z-ai-glm-5.3",
+    "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
+  ],
+  "_note": "glm-5.3 stays here because LiteLLM lists it only under provider prefixes with different prices, so the bare name has no single rate there; these numbers equal its zai/glm-5.3 entry. gpt-6-luna was removed from this file on 2026-11-13: the LiteLLM entry has the same numbers. Claude models: the dollar amount the Claude harness reports per run wins over the table. gpt-6-luna prompts over 272k tokens bill at a higher tier that the per-run totals cannot show, so its figure is a floor.",
+  "glm-5.3": {"input": 1.40, "cached_input": 0.26, "cache_write": 0.0, "output": 4.40}
+}

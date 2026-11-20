@@ -1,0 +1,181 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PR Chain · Wiki</title>
+<style>
+:root{--bg:oklch(0.145 0 0);--card:oklch(0.185 0 0);--raise:oklch(0.269 0 0);--well:oklch(0.165 0 0);--fg:oklch(0.985 0 0);--mid:oklch(0.82 0 0);--muted:oklch(0.62 0 0);--faint:oklch(0.44 0 0);
+--hi:#78be21;--bad:oklch(0.704 0.191 22.216);--warn:oklch(0.769 0.188 70.08);--r:0.625rem;
+--sans:ui-sans-serif,system-ui,-apple-system,"SF Pro Text","Segoe UI",sans-serif;--mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,monospace;color-scheme:dark}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%;text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--fg);font:12px/1.5 var(--sans);-webkit-font-smoothing:antialiased;letter-spacing:.005em}
+a{color:inherit;text-decoration:none}a:hover{color:var(--fg)}
+main{max-width:1360px;margin:0 auto;padding:12px 20px 40px}
+.top{display:flex;justify-content:space-between;align-items:baseline;gap:16px;flex-wrap:wrap}
+.brand{font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);font-weight:500;display:flex;gap:18px;flex-wrap:wrap}
+.brand a{color:var(--faint)}.brand a.on{color:var(--fg)}
+@media(max-width:520px){.brand{gap:12px;letter-spacing:.08em}.brand a{white-space:nowrap}}
+.meta{color:var(--muted);font-size:11px;display:flex;gap:16px;flex-wrap:wrap}.meta b{color:var(--mid);font:400 11px var(--mono)}
+h2{font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--faint);margin:26px 0 8px;font-weight:500;display:flex;justify-content:space-between;align-items:baseline;gap:10px;flex-wrap:wrap}
+h2 span{letter-spacing:.02em;text-transform:none;color:var(--muted);font-weight:400}
+.ok{color:var(--hi)}.bad{color:var(--bad)}.warn{color:var(--warn)}.dim{color:var(--muted)}.f{color:var(--faint)}.mono{font-family:var(--mono)}
+.msg{font:11px var(--mono);color:var(--muted)}.msg.ok{color:var(--hi)}.msg.bad{color:var(--bad)}
+input,select,textarea{background:var(--well);border:0;border-radius:6px;color:var(--fg);font:11.5px var(--mono);padding:5px 9px;outline:none}
+input:focus,select:focus,textarea:focus{background:var(--raise)}
+.act{display:flex;gap:14px;align-items:baseline;flex-wrap:wrap;font-size:11px}
+.act a{color:var(--muted);cursor:pointer;user-select:none}.act a:hover{color:var(--fg)}
+.act a.go{color:var(--hi)}.act a[aria-disabled=true]{color:var(--faint);pointer-events:none}
+.card{background:var(--card);border-radius:var(--r);padding:12px 14px;min-width:0}
+/* flow diagram */
+.lane{display:flex;align-items:center;flex-wrap:wrap;gap:4px 0}
+.lane+.lane{margin-top:10px}
+.lname{width:84px;flex:none;font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--faint)}
+.node{background:var(--well);border-radius:6px;padding:5px 8px;cursor:pointer;min-width:0;text-align:left;color:var(--mid);font:inherit;border:0}
+.node b{display:block;font:500 12px var(--sans);color:var(--fg)}
+.node i{display:block;font:normal 10.5px var(--mono);color:var(--faint);white-space:nowrap}
+.node:hover{background:var(--raise)}.node.on{background:var(--raise);box-shadow:inset 2px 0 0 var(--hi)}
+.node.nomodel b{color:var(--mid)}
+.arr{color:var(--faint);padding:0 3px;font:12px var(--mono)}
+.back{font:10.5px var(--mono);color:var(--warn);padding:0 4px}
+.ends{margin-top:12px;display:flex;flex-wrap:wrap;gap:4px 14px;font:10.5px var(--mono);color:var(--faint)}
+.ends a{color:var(--muted);cursor:pointer}.ends a:hover{color:var(--fg)}
+/* stage detail */
+.detail{margin-top:10px;display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.4fr);gap:10px}
+@media(max-width:900px){.detail{grid-template-columns:1fr}.lname{width:100%}}
+.detail h3{font:600 15px/1.2 var(--sans);margin:0 0 6px;letter-spacing:-.01em}
+.detail p{margin:0 0 8px;color:var(--mid);max-width:70ch}
+.detail ul{margin:0 0 8px;padding-left:16px;color:var(--mid)}.detail li{margin:2px 0}
+.kv{display:grid;grid-template-columns:90px minmax(0,1fr);gap:4px 10px;align-items:center;margin:8px 0}
+.kv .k{font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:var(--faint)}
+.kv select{width:100%;max-width:340px}
+.pr-tabs{display:flex;gap:14px;font:11px var(--mono);margin-bottom:6px;flex-wrap:wrap}
+.pr-tabs a{color:var(--faint);cursor:pointer}.pr-tabs a.on{color:var(--fg)}
+textarea.ed{width:100%;min-height:420px;resize:vertical;line-height:1.5}
+/* tables */
+table{width:100%;border-collapse:collapse}
+td{padding:6px 8px;vertical-align:top;border-top:1px solid oklch(0.21 0 0)}
+td.k{font:500 11px var(--mono);white-space:nowrap;color:var(--mid)}td.w{color:var(--mid)}td.n{color:var(--muted)}
+tr.hit td{background:var(--raise)}
+@media(max-width:600px){#ends tr,#prog tr,#lims tr{display:grid;grid-template-columns:1fr;padding:6px 0;border-top:1px solid oklch(0.21 0 0)}#ends td,#prog td,#lims td{border:0;padding:1px 8px}}
+.setup{display:flex;gap:26px;align-items:flex-end;flex-wrap:wrap}
+.setup label{display:flex;flex-direction:column;gap:4px;font-size:11px;color:var(--muted)}
+.setup input[type=number]{width:64px;font-size:15px}
+</style></head><body><main>
+<div class="top"><div class="brand"><a href="/">Board</a><a href="/prs">Pull Requests</a><a href="/issues">Issues</a><a href="/spend">Spend</a><a href="/config">Config</a><a class="on" href="/wiki">Wiki</a></div><div class="meta" id="meta"></div></div>
+
+<h2>The Loop <span>click a step to see its rules, its model and its prompt</span></h2>
+<div class="card" id="flow"></div>
+<div class="detail" id="detail"></div>
+
+<h2>Chain Program <span>flow.json: the steps one chain runs, in order, and where each outcome goes. Edit flow.json to change the chain</span></h2>
+<div class="card"><table id="prog"></table></div>
+
+<h2>Limits <span>flow.json limits and agent_calls; -1 means no limit</span></h2>
+<div class="card"><table id="lims"></table></div>
+
+<h2>Loop Setup <span>saved to board-config.json and the NO-BUILD file; the loop reads them every lap</span></h2>
+<div class="card"><div class="setup">
+ <label>Threads (1-4)<input type="number" id="threads" min="1" max="4"></label>
+ <label>Build issues when no PR is free<select id="build"><option value="1">On</option><option value="0">Off</option></select></label>
+ <div class="act"><a class="go" id="savesetup">Save</a><span class="msg" id="setupmsg"></span></div>
+</div></div>
+
+<h2>End States <span>flow.json end_states: where a PR stops, the label it shows on GitHub, what happens next</span></h2>
+<div class="card"><table id="ends"></table></div>
+</main>
+<script>
+const $=id=>document.getElementById(id),esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+// One entry per step of the real loop (pr-chain-loop) and chain (pr-chain run). role = models.json key; prompts = files in prompts/.
+const STEPS={
+ resume:{t:'Resume',lane:'loop',sub:'every 3 min',role:null,prompts:[],
+  d:'Lands PRs a person approved, PRs that were waiting on CI, and merges that were refused once the PR changed. Runs beside the chains under its own lock.',
+  r:['A human-approved label added after the gate comment is an approval; a later comment counts as a change request unless its first line says approved, LGTM or looks good.','A comment on an AWAIT-HUMAN PR starts a whole fixer chain inside resume.','Log: logs/resume.log']},
+ pick:{t:'Pick',lane:'loop',sub:'pr-chain pick',role:null,prompts:[],
+  d:'Lists open PRs and marks which are FREE. Order: priority label (or the best label of the issues it fixes), then clean before conflicted, then smallest.',
+  r:['A PR that ended at its current head (RESTING, STUCK, POLICY-HOLD, AWAIT-HUMAN, merged) is not free until a push or a person changes it.','Machinery failures (NO-VERDICT, ERROR, CI-TIMEOUT, BUILD-FAILED) are handed out again, 3 runs per head.']},
+ run:{t:'Run Chains',lane:'loop',sub:'up to threads',role:null,prompts:[],
+  d:'Starts pr-chain run <PR> --land for each free PR, up to threads. Pick marks only the PRs in focus free (flow.json prs_at_once), so with prs_at_once 1 one PR runs and the other threads sit idle: no other PR is free and no issue is built until the focus PR merges or parks (threads above 1 matter only when prs_at_once is raised or -1). Resume still lands approved PRs beside it. Every chain process alive counts against the thread count, including ones a person started.',
+  r:['One slot is kept for Auto Build while no build runs, so an urgent issue can jump ahead of lower-priority PRs.','Each chain writes logs/run-<pr>.log.']},
+ auto:{t:'Auto Build',lane:'loop',sub:'free slot, no free PR',role:'build',prompts:['build.md','scout.md'],
+  d:'Builds the most urgent free issue into a draft PR; with no free issue it scouts for one. At most 3 builds at once, one new build per lap.',
+  r:['Off when the NO-BUILD file exists (Loop Setup below).','A build that made nothing holds the next one back for a short wait.','A built PR that passes goes through the same chain, CI and merge.']},
+ nap:{t:'Nap',lane:'loop',sub:'10 s or 20 s',role:null,prompts:[],
+  d:'Waits, then starts the next lap. A STOP file (pr-chain stop) ends the loop after the stage in flight.',r:[]},
+ carry:{t:'Carry',lane:'chain',sub:'skip repeats',role:'gate',prompts:['addendum.md'],
+  d:'Looks for an earlier audit PASS at this head. Same head: review and audit are skipped. Head moved only by merging main: a short merge-only addendum covers the new head.',
+  r:['The addendum agent gets no field guide.','An addendum that does not pass sends the PR to a full audit.']},
+ fold:{t:'Update Branch',lane:'chain',sub:'fold main, read CI',role:null,prompts:[],
+  d:'Merges main into the branch when it is behind (plain merge, no model). Then reads CI: a red required check sends its failing lines straight to the fixer, and no reviewer runs on that head.',
+  r:['A failure main also had in its last 6 runs is rerun once instead of fixed.','A CodeQL false positive rests the PR until an owner dismisses the alert.','Still behind after 3 folds: MAIN-MOVING.']},
+ review:{t:'Review',lane:'chain',sub:'read-only',role:'review',prompts:['review.md','review-fix.md'],
+  d:'A fresh agent reads a clean copy at the exact head, builds the acceptance list from the issue, runs probes, and writes verdict.md with PASS or FAIL on line 1.',
+  r:['Nothing reviews its own work: every stage is a new agent.','Agents have no GitHub access; the script posts their files.','Follow-up bullets become ranked issues, at most 3 per verdict.']},
+ fix:{t:'Fix',lane:'chain',sub:'red-first',role:'fix',prompts:['fix.md'],
+  d:'A new agent triages every finding, fixes the cause and its siblings red-first, and commits locally. The script checks the tree and pushes, then Review runs again.',
+  r:['Ends FIXED, DISPUTE, BLOCKED <why> or BLOCKED POLICY <why>.','BLOCKED POLICY only when the fix itself needs a forbidden act (history rewrite, force push) or the PR declares an owner-only hold. An agent\'s own slip on a safety rule is never a reason.','Cap: 4 review rounds, then RESTING. Same findings twice in a row: RESTING.','Rested 6 times with new findings in one area: a redesign agent (redesign.md, fixed model) tries twice, then STUCK.']},
+ audit:{t:'Audit',lane:'chain',sub:'gate',role:'gate',prompts:['review.md'],
+  d:'After a review PASS, a different agent audits the PR with the review brief. FAIL goes back to a fixer.',r:['Cap: 2 audits per run.']},
+ ui:{t:'UI Review',lane:'chain',sub:'UI PRs only',role:'ui',prompts:['ui-review.md'],
+  d:'Builds a scratch web UI stack, then a fresh vision agent takes the shot of the changed behavior. Line 1 of ui-verdict.md: PASS, FAIL, NOT-SHOWN or STACK-BROKEN.',
+  r:['FAIL goes to a UI fixer and only the vision review reruns, at most 3 times.','A defect in markup the PR did not touch never fails it; it becomes a follow-up issue.','STACK-BROKEN is the stack\'s fault, not the PR\'s: BUILD-FAILED, retried.']},
+ gate:{t:'Human Gate',lane:'chain',sub:'you',role:null,prompts:[],
+  d:'UI PRs only: the screenshots are posted on the PR and it waits as AWAIT-HUMAN. Add the human-approved label to approve, or comment to send changes to a fixer.',
+  r:['An approval stands for that head and any main-only move of it.','A label older than the newest screenshots does not count; remove and add it again.']},
+ ci:{t:'CI',lane:'chain',sub:'required checks',role:null,prompts:[],
+  d:'Waits for required checks. Still running: the PR ends WAITING-CI, its slot is freed, and Resume lands it when CI is green.',
+  r:['Red: CI-RED, the next run sends the failing lines to a fixer first.','Main moved while waiting: fold, merge-only addendum, and the UI verdict carries when no web UI file changed.']},
+ merge:{t:'Merge',lane:'chain',sub:'merge commit',role:null,prompts:[],
+  d:'Approves as the non-author account and merges with a merge commit. A refusal ends LAND-STOPPED with the reason; Resume tries again once the PR changes, 3 times per head.',
+  r:['The PR body needs an explicit Closes/Fixes/Refs #N line for the definition-of-done check.']},
+ guide:{t:'Every Agent',lane:'rules',sub:'field-guide.md',role:null,prompts:['field-guide.md'],
+  d:'Inlined into every review, audit, fix, build, UI review and redesign brief: what each answer costs, which file replaces each GitHub action, safety rules, reading limits, the repo map and the CI checks with their local commands.',r:[]}
+};
+const LANES=[['loop','Loop Lap',['resume','pick','run','auto','nap']],['chain','Each Chain',['carry','fold','review','fix','audit','ui','gate','ci','merge']],['rules','Rules',['guide']]];
+const BACK={fix:'↺ Review'};
+let F=null,D=null,S=null,cur='review',tab=0;const draft={};
+async function load(){try{D=await(await fetch('/api/config')).json()}catch(e){$('flow').textContent='Board server not answering';return}
+ try{S=await(await fetch('/api/state')).json()}catch(e){S=null}
+ try{F=await(await fetch('/api/flow')).json()}catch(e){F=null}
+ meta();flow();detail();prog();lims();ends();setup()}
+function meta(){$('meta').innerHTML=S?`<span>Loop <b class="${S.loop_on?'ok':'bad'}">${S.loop_on?'running':'not running'}</b></span><span>Threads <b>${D.threads}</b></span><span>Building <b>${D.build_issues?'on':'off'}</b></span>`:''}
+function label(role){return role?(D.labels[role]||D.models[role][0]):'no model'}
+function flow(){$('flow').innerHTML=LANES.map(([k,name,ids])=>`<div class="lane"><span class="lname">${name}</span>${ids.map((id,i)=>{const s=STEPS[id];
+ return `${i?'<span class="arr">→</span>':''}<button class="node${id===cur?' on':''}${s.role?'':' nomodel'}" data-s="${id}"><b>${s.t}</b><i>${s.role?esc(label(s.role)):esc(s.sub)}</i></button>${BACK[id]?`<span class="back">${BACK[id]}</span>`:''}`}).join('')}${k==='loop'?'<span class="back">↺ next lap</span>':''}</div>`).join('')+
+ `<div class="ends">Ends: ${F?Object.keys(F.end_states).filter(k=>!F.end_states[k].unused).map(k=>`<a data-e="${esc(k)}">${esc(k)}</a>`).join(''):''}</div>`}
+function detail(){const s=STEPS[cur],ps=s.prompts.filter(n=>D.prompts.some(p=>p.name===n));if(tab>=ps.length)tab=0;
+ const named=Object.keys(D.named||{}).map(n=>'cmd:'+n),val=s.role?D.models[s.role][0]:'',opts=[...new Set([val,...named])];
+ const left=`<div class="card"><h3>${s.t}</h3><p>${esc(s.d)}</p>${s.r.length?'<ul>'+s.r.map(x=>`<li>${esc(x)}</li>`).join('')+'</ul>':''}
+ ${s.role?`<div class="kv"><span class="k">Model</span><select id="model">${opts.map(o=>`<option${o===val?' selected':''}>${esc(o)}</option>`).join('')}</select>
+ <span class="k">Runs as</span><span class="mono dim">${esc(D.labels[s.role]||'')}</span><span class="k">Source</span><span class="mono f">${esc(D.models[s.role][1])}</span></div>
+ <div class="act"><a class="go" id="savemodel" aria-disabled="true">Save Model</a><span class="msg" id="modelmsg"></span></div>
+ <p class="f" style="margin-top:8px">The ${esc(s.role)} model is shared by every step that uses it. Add a new command line on the Config page.</p>`:'<p class="f">No model: the script does this step itself.</p>'}</div>`;
+ const right=ps.length?`<div class="card"><div class="pr-tabs">${ps.map((n,i)=>`<a data-t="${i}" class="${i===tab?'on':''}">${n}</a>`).join('')}</div>
+ <textarea class="ed" id="ed" spellcheck="false">${esc(draft[ps[tab]]??D.prompts.find(p=>p.name===ps[tab]).text)}</textarea>
+ <div class="act"><a class="go" id="saveprompt" aria-disabled="${!(ps[tab] in draft)}">Save Prompt</a><a id="revert">Revert</a><span class="msg" id="prmsg">The old text is kept in prompts/.history. {{SLOTS}} the chain fills cannot be removed.</span></div></div>`:
+ `<div class="card f">No prompt: this step runs no agent.</div>`;
+ $('detail').innerHTML=left+right;
+ if(s.role)$('model').onchange=()=>$('savemodel').setAttribute('aria-disabled',$('model').value===val);
+ if(s.role)$('savemodel').onclick=()=>post({models:{[s.role]:$('model').value}},$('modelmsg'));
+ if(ps.length){const n=ps[tab];$('ed').oninput=e=>{draft[n]=e.target.value;$('saveprompt').setAttribute('aria-disabled','false')};
+  $('revert').onclick=()=>{delete draft[n];detail()};
+  $('saveprompt').onclick=()=>post({save_prompt:{name:n,text:draft[n]}},$('prmsg'),()=>delete draft[n]);
+  $('detail').querySelectorAll('[data-t]').forEach(a=>a.onclick=()=>{tab=+a.dataset.t;detail()})}}
+const lim=v=>v<0?'no limit':String(v);
+const order=()=>Object.keys(F.nodes);  // the order flow.json lists them: the page reads like the file
+const link=t=>`<a href="#${F.nodes[t]?'n':'e'}-${esc(t)}">${esc(t)}</a>`;
+function prog(){if(!F){$('prog').innerHTML='<tr><td class="n">flow.json is not readable</td></tr>';return}
+ $('prog').innerHTML=order().map(n=>{const d=F.nodes[n],L=d.limit?`counts ${esc(d.count)}; past ${esc(lim(F.limits[d.limit]?.value))} (${esc(d.limit)}) it goes to ${link(d.on_limit)}`:'';
+  const what=esc(d.do)+(d.kind==='agent'?` <span class="f">agent, ${esc(d.args.role)} model</span>`:'');
+  return `<tr id="n-${esc(n)}"><td class="k">${esc(n)}</td><td class="w">${what}${L?`<br><span class="n">${L}</span>`:''}</td><td class="n">${Object.entries(d.next).map(([o,t])=>`${esc(o)} &rarr; ${link(t)}`).join('<br>')}</td></tr>`}).join('')}
+function lims(){if(!F)return;const r=Object.entries(F.limits).map(([k,v])=>[k,v.value,v.what]).concat(Object.entries(F.agent_calls||{}).map(([k,v])=>[`calls: ${k}`,v,`tool calls one ${k} agent may make (told in its brief; nothing counts them yet)`]));
+ $('lims').innerHTML=r.map(([k,v,w])=>`<tr><td class="k">${esc(k)}</td><td class="w${v<0?' ok':''}">${esc(lim(v))}</td><td class="n">${esc(w)}</td></tr>`).join('')}
+function ends(){if(!F){$('ends').innerHTML='<tr><td class="n">flow.json is not readable</td></tr>';return}
+ $('ends').innerHTML=Object.entries(F.end_states).filter(([k,v])=>!v.unused).map(([k,v])=>`<tr id="e-${esc(k)}" data-row="${esc(k)}"><td class="k">${esc(k)}</td><td class="w">${esc(v.means)}${v.label?` <span class="f">label ${esc(v.label)}</span>`:''}</td><td class="n">${esc(v.then)}</td></tr>`).join('')}
+function setup(){$('threads').value=D.threads;$('build').value=D.build_issues?'1':'0'}
+$('savesetup').onclick=()=>{const t=+$('threads').value;if(!(t>=1&&t<=4)){$('setupmsg').className='msg bad';$('setupmsg').textContent='threads must be 1-4';return}
+ post({threads:t,build_issues:$('build').value==='1'},$('setupmsg'))};
+$('flow').onclick=e=>{const n=e.target.closest('[data-s]');if(n){cur=n.dataset.s;tab=0;flow();detail();return}
+ const a=e.target.closest('[data-e]');if(a){const r=document.querySelector(`tr[data-row="${CSS.escape(a.dataset.e)}"]`);document.querySelectorAll('tr.hit').forEach(x=>x.classList.remove('hit'));r.classList.add('hit');r.scrollIntoView({block:'center',behavior:'smooth'})}};
+async function post(body,msg,after){msg.className='msg';msg.textContent='Saving';try{const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}),j=await r.json();
+ if(!r.ok||j.error){msg.className='msg bad';msg.textContent=j.error||('error '+r.status);return}
+ if(after)after();const keep=j.saved;await load();const m=$(msg.id);if(m){m.className='msg ok';m.textContent=keep}}catch(e){msg.className='msg bad';msg.textContent='Save failed: '+e}}
+load();
+</script></body></html>

@@ -1,0 +1,8 @@
+{
+  "build": "cmd:codex-luna-max",
+  "fix": "cmd:codex-luna-max",
+  "gate": "cmd:claude-haiku-max",
+  "review": "cmd:codex-luna-max",
+  "scout": "cmd:codex-luna-max",
+  "ui": "cmd:codex-luna-max"
+}

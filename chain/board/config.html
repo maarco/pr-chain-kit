@@ -1,0 +1,219 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PR Chain · Config</title>
+<style>
+:root{--bg:oklch(0.145 0 0);--card:oklch(0.185 0 0);--raise:oklch(0.269 0 0);--well:oklch(0.165 0 0);--fg:oklch(0.985 0 0);--mid:oklch(0.82 0 0);--muted:oklch(0.62 0 0);--faint:oklch(0.44 0 0);
+--hi:#78be21;--bad:oklch(0.704 0.191 22.216);--warn:oklch(0.769 0.188 70.08);--r:0.625rem;
+--sans:ui-sans-serif,system-ui,-apple-system,"SF Pro Text","Segoe UI",sans-serif;--mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,monospace;color-scheme:dark}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%;text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--fg);font:12px/1.5 var(--sans);-webkit-font-smoothing:antialiased;letter-spacing:.005em}
+a{color:inherit;text-decoration:none}a:hover{color:var(--fg)}
+main{max-width:1360px;margin:0 auto;padding:12px 20px 40px}
+.top{display:flex;justify-content:space-between;align-items:baseline;gap:16px;flex-wrap:wrap}
+.brand{font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);font-weight:500;display:flex;gap:18px;flex-wrap:wrap}
+.brand a{color:var(--faint)}.brand a.on{color:var(--fg)}
+@media(max-width:520px){.brand{gap:12px;letter-spacing:.08em}.brand a{white-space:nowrap}}
+.meta{color:var(--muted);font-size:11px;display:flex;gap:16px;flex-wrap:wrap;min-width:0}.meta b{color:var(--mid);font:400 11px var(--mono);overflow-wrap:anywhere}
+h2{font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--faint);margin:26px 0 8px;font-weight:500;display:flex;justify-content:space-between;align-items:baseline;gap:10px;flex-wrap:wrap}
+h2 span{letter-spacing:.02em;text-transform:none;color:var(--muted);font-weight:400}
+.mono{font-family:var(--mono)}
+.ok{color:var(--hi)}.bad{color:var(--bad)}.warn{color:var(--warn)}.dim{color:var(--muted)}.f{color:var(--faint)}
+/* actions: plain words, green when they commit something */
+.act{display:flex;gap:14px;align-items:baseline;flex-wrap:wrap;font-size:11px}
+.act a{color:var(--muted);cursor:pointer;user-select:none}.act a:hover{color:var(--fg)}
+.act a.go{color:var(--hi)}.act a.go:hover{color:oklch(0.88 0.17 128)}.act a.del:hover{color:var(--bad)}
+.act a[aria-disabled=true]{color:var(--faint);pointer-events:none}
+.msg{font:11px var(--mono);color:var(--muted)}.msg.ok{color:var(--hi)}.msg.bad{color:var(--bad)}
+input,select,textarea{background:var(--well);border:0;border-radius:6px;color:var(--fg);font:11.5px var(--mono);padding:5px 9px;outline:none}
+input:focus,select:focus,textarea:focus{background:var(--raise)}
+input::placeholder,textarea::placeholder{color:var(--faint)}
+/* loop strip */
+.strip{display:grid;grid-template-columns:minmax(0,1.6fr) minmax(0,1fr);gap:10px;margin-top:14px}
+.card{background:var(--card);border-radius:var(--r);padding:12px 14px;min-width:0}
+.card .lb{font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--faint);font-weight:500}
+.stats{display:flex;gap:26px;align-items:flex-end;flex-wrap:wrap;margin-top:6px}
+.stat{display:flex;flex-direction:column}.stat b{font:500 22px/1.1 var(--mono);font-variant-numeric:tabular-nums}.stat span{font-size:11px;color:var(--muted)}
+.stat input{width:58px;font-size:15px;padding:3px 8px}
+.proc{font:11px var(--mono);color:var(--faint);margin-top:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.proc b{color:var(--muted);font-weight:400}.proc i{font-style:normal;color:var(--faint);display:inline-block;width:42px}
+.big{font:600 18px/1.2 var(--sans);margin-top:6px;letter-spacing:-.01em}
+.note{color:var(--faint);font-size:11px;margin-top:8px;max-width:820px}
+/* per stage */
+.stages{background:var(--card);border-radius:var(--r);padding:4px 6px}
+.st{display:grid;grid-template-columns:64px minmax(180px,250px) minmax(0,1fr) 92px;gap:2px 14px;padding:8px 8px;border-radius:6px;align-items:center}
+.st+.st{box-shadow:0 -1px 0 oklch(0.21 0 0)}
+.st .n{font:500 11px var(--mono);color:var(--mid)}
+.st select{width:100%;cursor:pointer}
+.st .sum{font:11px var(--mono);color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.st .src{font-size:11px;color:var(--faint);text-align:right;white-space:nowrap}
+.st .src.edit{color:var(--warn)}
+.st .line{grid-column:2/5}
+.sum b,.uses b.m{color:var(--fg);font-weight:500}.sep{color:var(--faint);padding:0 6px}
+.line{font:10.5px/1.55 var(--mono);color:var(--faint);overflow-wrap:anywhere}
+.line .fl{color:oklch(0.52 0 0)}.line .mv{color:var(--hi)}.line .slot{color:var(--warn)}
+.bar{display:flex;justify-content:space-between;align-items:baseline;gap:14px;flex-wrap:wrap;padding:8px 8px 6px}
+/* stage profiles */
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:10px}
+.pf{background:var(--card);border-radius:var(--r);padding:11px 13px 10px;display:flex;flex-direction:column;gap:8px;min-width:0}
+.pf.on{background:var(--raise)}
+.pf .hd{display:flex;justify-content:space-between;align-items:baseline;gap:8px}
+.pf .nm{font:600 13px var(--sans);letter-spacing:-.005em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pf .tag{font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:var(--hi)}
+.pf dl{display:grid;grid-template-columns:44px minmax(0,1fr);gap:1px 10px;margin:0;font:11px var(--mono)}
+.pf dt{color:var(--faint)}.pf dd{margin:0;color:var(--mid);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pf dd.raw{color:var(--muted)}
+.pf.new{background:var(--well);justify-content:center}
+.pf.new input{width:100%}
+/* commands */
+.cm{background:var(--card);border-radius:var(--r);padding:11px 13px;margin-bottom:10px}
+.cm .hd{display:grid;grid-template-columns:minmax(0,auto) minmax(0,1fr) auto;gap:4px 18px;align-items:baseline}
+.cm .nm{font:600 13px var(--mono);letter-spacing:-.01em}
+.cm .nm input{font:600 13px var(--mono);width:220px;max-width:100%}
+.cm .uses{font-size:11px;color:var(--faint);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.cm .uses b{color:var(--muted);font-weight:400}
+.cm textarea{display:block;width:100%;margin-top:9px;resize:vertical;min-height:2.6em;field-sizing:content;line-height:1.55;font-size:11px;color:var(--mid);overflow-wrap:anywhere}
+.cm.new{background:var(--well)}
+.cm textarea.pr{max-height:30em;overflow:auto;field-sizing:fixed;min-height:14em;font-size:11.5px;color:var(--fg)}
+.cm .dirty{color:var(--warn);font-size:11px}
+@media (max-width:860px){
+ .strip{grid-template-columns:minmax(0,1fr)}
+ .st{grid-template-columns:56px minmax(0,1fr) auto}.st .src{grid-column:3;grid-row:1}.st .sum{grid-column:2/4;grid-row:2}.st .line{grid-column:1/4}
+ .grid{grid-template-columns:minmax(0,1fr)}.stats{gap:18px}main{padding:12px 14px 40px}
+ .cm .hd{grid-template-columns:minmax(0,1fr) auto}.cm .uses{grid-column:1/3;grid-row:2}
+}
+</style></head><body><main>
+<div class="top"><div class="brand"><a href="/">Board</a><a href="/prs">Pull Requests</a><a href="/issues">Issues</a><a href="/spend">Spend</a><a class="on" href="/config">Config</a><a href="/wiki">Wiki</a></div><div class="meta" id="meta"></div></div>
+
+<div class="strip">
+ <div class="card">
+  <div class="lb">Loop</div>
+  <div class="stats">
+   <div class="stat"><b id="now">–</b><span id="nowl">chains running</span></div>
+   <div class="stat"><b id="agents">–</b><span id="agentsl">agent processes</span></div>
+   <div class="stat"><input id="threads" type="number" min="1" max="4" step="1"><span>max threads · now <b id="cur" style="font:inherit;color:var(--mid)">–</b> · PRs at once <b id="pao" style="font:inherit;color:var(--mid)">–</b> (flow.json; threads above it run nothing while a focus PR is in flight)</span></div>
+   <div class="act" style="margin-bottom:3px"><a id="saveth" class="go">Set Threads</a><span class="msg" id="thmsg"></span></div>
+  </div>
+  <div class="proc" id="loopcmd"></div>
+  <div id="chaincmds"></div>
+ </div>
+ <div class="card">
+  <div class="lb">Issue Building</div>
+  <div class="big" id="bstate">–</div>
+  <div class="act" style="margin-top:6px"><a id="blockiss"></a><span class="msg" id="bmsg"></span></div>
+  <div class="note">Blocking means the chain never turns issues into PRs and never scouts, on any path. Open PRs keep flowing.</div>
+ </div>
+</div>
+
+<h2>Per Stage <span>what the next chain runs · <span class="mono" id="mfile"></span></span></h2>
+<div class="stages"><div id="stages" class="dim" style="padding:8px">Reading the config…</div>
+ <div class="bar"><div class="act"><a id="savemod" class="go">Save Stages</a><a id="resetmod">Discard Edits</a><span class="msg" id="mmsg"></span></div>
+ <span class="f" style="font-size:11px">A running chain keeps what it started with. Each save keeps a backup beside models.json.</span></div>
+</div>
+
+<h2>Stage Profiles <span>a named set of six stage commands · applying one writes models.json</span></h2>
+<div class="grid" id="profiles"></div>
+<div class="act" style="margin-top:8px"><span class="msg" id="pmsg"></span></div>
+
+<h2>Commands <span>one full command line per name · <span class="mono">&lt;brief.md&gt;</span> is where the chain puts the brief path</span></h2>
+<div id="commands"></div>
+<h2>Prompts <span>the brief each stage agent gets · the next agent reads it · old text kept in <span class="mono">prompts/.history</span></span></h2>
+<div class="msg" id="prmsg"></div><div id="prompts"></div>
+<div class="act"><span class="msg" id="cmsg"></span></div>
+<div class="note">Precedence for a stage: a command flag, then the env var PR_CHAIN_&lt;STAGE&gt;_MODEL, then models.json, then the built-in model. A stage set to a command runs that line exactly. Never gpt-6-astra. A command still used by a stage or a profile cannot be deleted.</div>
+</main><script>
+const $=i=>document.getElementById(i),esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const ROLES=["review","fix","gate","ui","build","scout"];
+let D=null;const stageDraft={};const cmdDraft={};let newCmd=null;
+// "codex · gpt-6-luna · high" from a full command line
+function parse(cmd){cmd=String(cmd||'');
+ const tool=/\bcodex\b/.test(cmd)?'codex':/\bclaude\b/.test(cmd)?'claude':'custom';
+ const m=cmd.match(/(?:^|\s)(?:-m|--model)[\s=]+['"]?([\w.:-]+)/),e=cmd.match(/model_reasoning_effort=(\w+)|--effort[\s=]+(\w+)/);
+ return {tool,model:m?m[1]:'',effort:e?(e[1]||e[2]):''}}
+function summary(cmd){const p=parse(cmd),sep='<span class="sep">·</span>';
+ return [esc(p.tool),p.model?`<b>${esc(p.model)}</b>`:'',p.effort?esc(p.effort):''].filter(Boolean).join(sep)}
+function hl(cmd){return esc(cmd).replace(/(^|\s)(--?[\w-]+)/g,'$1<span class="fl">$2</span>')
+ .replace(/(<span class="fl">(?:-m|--model)<\/span>\s+)([\w.:-]+)/g,'$1<span class="mv">$2</span>').replace(/&lt;brief\.md&gt;/g,'<span class="slot">&lt;brief.md&gt;</span>')}
+const names=()=>Object.keys(D.named||{});
+const stageVal=r=>r in stageDraft?stageDraft[r]:(D.models[r]||[])[0]||'';
+const cmdOf=v=>v.startsWith('cmd:')&&D.named[v.slice(4)]?D.named[v.slice(4)].cmd:null;
+function src(r){const s=(D.models[r]||[])[1]||'';return s.includes('env ')?'env var':s.includes('models.json')?'models.json':s.includes('flag')?'flag':'built-in'}
+
+function paintLoop(){
+ $('now').textContent=D.running.chains;$('agents').textContent=D.running.agents;$('nowl').textContent=D.running.chains===1?'chain running':'chains running';$('agentsl').textContent=D.running.agents===1?'agent process':'agent processes';$('cur').textContent=D.threads;
+ if(document.activeElement!==$('threads'))$('threads').value=D.threads;$('pao').textContent=D.prs_at_once==null?'no limit':D.prs_at_once;
+ $('loopcmd').innerHTML=D.running.loop_cmd?`<i>loop</i><b>${esc(D.running.loop_cmd)}</b>`:'<i>loop</i>not running';
+ $('chaincmds').innerHTML=(D.running.chain_cmds||[]).map(c=>`<div class="proc" title="${esc(c.cmd)}"><i>chain</i><b>${esc(c.cmd)}</b></div>`).join('')||'<div class="proc"><i>chain</i>none out</div>';
+ const bs=$('bstate');bs.textContent=D.build_issues?'Allowed':'Blocked';bs.className='big '+(D.build_issues?'ok':'bad');
+ const bb=$('blockiss');bb.textContent=D.build_issues?'Block Issue Building':'Allow Issue Building';bb.className=D.build_issues?'del':'go';
+ $('meta').innerHTML=`<span>models <b>${esc(D.models_file)}</b></span>`;$('mfile').textContent='models.json';
+}
+function paintStages(){
+ const box=$('stages');if(box.contains(document.activeElement)&&document.activeElement.tagName==='SELECT')return;
+ box.className='';
+ box.innerHTML=ROLES.map(r=>{const v=stageVal(r),c=cmdOf(v)||(D.commands||{})[r]||'',edited=r in stageDraft&&stageDraft[r]!==(D.models[r]||[])[0];
+  const opts=names().map(n=>`<option value="cmd:${esc(n)}"${v==='cmd:'+n?' selected':''}>${esc(n)}</option>`).join('')
+   +(v&&!v.startsWith('cmd:')?`<option value="${esc(v)}" selected>${esc(v)} (model name)</option>`:'')
+   +(v.startsWith('cmd:')&&!D.named[v.slice(4)]?`<option value="${esc(v)}" selected>${esc(v.slice(4))} (missing)</option>`:'');
+  return `<div class="st"><span class="n">${r}</span><select data-r="${r}">${opts}</select><span class="sum">${summary(c)}</span><span class="src${edited?' edit':''}">${edited?'edited':esc(src(r))}</span><div class="line">${hl(c)}</div></div>`}).join('');
+ const dirty=ROLES.some(r=>r in stageDraft&&stageDraft[r]!==(D.models[r]||[])[0]);
+ $('savemod').setAttribute('aria-disabled',!dirty);$('resetmod').style.display=dirty?'':'none';
+}
+function paintProfiles(){
+ if($('profiles').contains(document.activeElement))return;
+ const cur=Object.fromEntries(ROLES.map(r=>[r,stageVal(r)]));
+ $('profiles').innerHTML=(D.profiles||[]).map(p=>`<div class="pf${p.active?' on':''}"><div class="hd"><span class="nm" title="${esc(p.name)}">${esc(p.name)}</span>${p.active?'<span class="tag">Active</span>':''}</div>
+  <dl>${ROLES.map(r=>{const v=p.models[r]||'';return `<dt>${r}</dt><dd class="${v.startsWith('cmd:')?'':'raw'}" title="${esc(v)}">${v?esc(v.startsWith('cmd:')?v.slice(4):v):'<span class="f">built-in</span>'}</dd>`}).join('')}</dl>
+  <div class="act">${p.active?'<a aria-disabled="true">Applied</a>':`<a class="go" data-apply="${esc(p.name)}">Apply</a>`}<a data-load="${esc(p.name)}">Load Into Stages</a><a class="del" data-del="${esc(p.name)}">Delete</a></div></div>`).join('')
+ +`<div class="pf new"><div class="lb" style="font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--faint)">New Profile</div>
+  <input id="pname" spellcheck="false" placeholder="profile name" autocomplete="off">
+  <div class="f" style="font-size:11px">Saves the six stage values shown above, edits included.</div>
+  <div class="act"><a class="go" id="savep">Save Stages As Profile</a></div></div>`;
+ $('savep').onclick=()=>post({save_profile:$('pname').value.trim(),models:Object.fromEntries(ROLES.map(r=>[r,stageVal(r)]))},$('pmsg'));
+}
+function usesText(u){const a=[];if(u.stages.length)a.push(`stages <b>${esc(u.stages.join(', '))}</b>`);if(u.profiles.length)a.push(`profiles <b>${esc(u.profiles.join(', '))}</b>`);return a.length?'used by '+a.join(' · '):'not used'}
+function paintCommands(){
+ if($('commands').contains(document.activeElement))return;
+ const rows=Object.entries(D.named||{}).map(([n,o])=>{const t=n in cmdDraft?cmdDraft[n]:o.cmd,dirty=n in cmdDraft&&cmdDraft[n]!==o.cmd,used=o.uses.stages.length||o.uses.profiles.length;
+  return `<div class="cm"><div class="hd"><span class="nm">${esc(n)}</span><span class="uses">${summary(t)}<span class="sep">·</span>${usesText(o.uses)}</span>
+   <div class="act">${dirty?'<span class="dirty">edited</span>':''}<a class="go" data-save="${esc(n)}"${dirty?'':' aria-disabled="true"'}>Save</a><a data-dup="${esc(n)}">Duplicate</a><a class="del" data-cdel="${esc(n)}"${used?' aria-disabled="true" title="still used"':''}>Delete</a></div></div>
+   <textarea data-c="${esc(n)}" spellcheck="false" rows="2">${esc(t)}</textarea></div>`}).join('');
+ const nw=newCmd?`<div class="cm new"><div class="hd"><span class="nm"><input id="ncname" spellcheck="false" placeholder="command name" autocomplete="off" value="${esc(newCmd.name)}"></span><span class="uses">${summary(newCmd.cmd)}</span>
+   <div class="act"><a class="go" id="ncsave">Add Command</a><a id="nccancel">Cancel</a></div></div><textarea id="nccmd" spellcheck="false" rows="2">${esc(newCmd.cmd)}</textarea></div>`
+  :`<div class="act" style="margin:2px 0 4px"><a class="go" id="ncopen">New Command</a></div>`;
+ $('commands').innerHTML=rows+nw;
+ if($('ncopen'))$('ncopen').onclick=()=>{const first=Object.values(D.named||{})[0];newCmd={name:'',cmd:first?first.cmd:"claude -p 'Read <brief.md> and follow it exactly.' --model haiku"};paintCommands();$('ncname').focus()};
+ if($('ncsave'))$('ncsave').onclick=()=>post({save_command:{name:$('ncname').value.trim(),cmd:$('nccmd').value}},$('cmsg'),()=>{newCmd=null});
+ if($('nccancel'))$('nccancel').onclick=()=>{newCmd=null;paintCommands()};
+}
+function paint(){if(!D)return;paintLoop();paintStages();paintProfiles();paintCommands();paintPrompts()}
+
+async function load(){try{const r=await(await fetch('/api/config')).json();if(!r.error){D=r;paint()}}catch(e){}}
+async function post(body,msg,after){try{const r=await(await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();
+ msg.textContent=r.error?r.error:(r.saved||'saved');msg.className='msg '+(r.error?'bad':'ok');
+ if(!r.error){if(after)after();D=r;document.activeElement&&document.activeElement.blur&&document.activeElement.blur();paint()}}catch(e){msg.textContent=String(e);msg.className='msg bad'}}
+
+$('saveth').onclick=()=>post({threads:parseInt($('threads').value,10)},$('thmsg'));
+$('blockiss').onclick=()=>post({build_issues:!D.build_issues},$('bmsg'));
+$('stages').onchange=e=>{const r=e.target.dataset.r;if(!r)return;stageDraft[r]=e.target.value;e.target.blur();paintStages()};
+$('savemod').onclick=()=>post({models:Object.fromEntries(ROLES.map(r=>[r,stageVal(r)]))},$('mmsg'),()=>{for(const k in stageDraft)delete stageDraft[k]});
+$('resetmod').onclick=()=>{for(const k in stageDraft)delete stageDraft[k];paintStages()};
+$('profiles').onclick=e=>{const a=e.target.closest('a');if(!a)return;
+ if(a.dataset.apply)post({apply_profile:a.dataset.apply},$('pmsg'),()=>{for(const k in stageDraft)delete stageDraft[k]});
+ else if(a.dataset.del)post({delete_profile:a.dataset.del},$('pmsg'));
+ else if(a.dataset.load){const p=(D.profiles||[]).find(x=>x.name===a.dataset.load);if(p){ROLES.forEach(r=>{if(p.models[r])stageDraft[r]=p.models[r]});paintStages();$('mmsg').textContent=`loaded ${p.name}; Save Stages to use it`;$('mmsg').className='msg'}}};
+$('commands').oninput=e=>{const t=e.target;
+ if(t.dataset.c){cmdDraft[t.dataset.c]=t.value;const card=t.closest('.cm');card.querySelector('.uses').innerHTML=summary(t.value)+`<span class="sep">·</span>`+usesText(D.named[t.dataset.c].uses);
+  const s=card.querySelector('[data-save]');const dirty=t.value!==D.named[t.dataset.c].cmd;s.setAttribute('aria-disabled',!dirty)}
+ if(t.id==='nccmd'||t.id==='ncname'){newCmd={name:$('ncname').value,cmd:$('nccmd').value};t.closest('.cm').querySelector('.uses').innerHTML=summary(newCmd.cmd)}};
+$('commands').onclick=e=>{const a=e.target.closest('a');if(!a)return;
+ if(a.dataset.save){const n=a.dataset.save;post({save_command:{name:n,cmd:cmdDraft[n]}},$('cmsg'),()=>{delete cmdDraft[n]})}
+ else if(a.dataset.cdel)post({delete_command:a.dataset.cdel},$('cmsg'));
+ else if(a.dataset.dup){const n=a.dataset.dup;newCmd={name:n+'-copy',cmd:n in cmdDraft?cmdDraft[n]:D.named[n].cmd};paintCommands();$('ncname').focus();$('ncname').select()}};
+const promptDraft={};
+function paintPrompts(){if($('prompts').contains(document.activeElement))return;
+ $('prompts').innerHTML=(D.prompts||[]).map(p=>{const v=p.name in promptDraft?promptDraft[p.name]:p.text,dirty=v!==p.text;
+  return `<div class="cm"><div class="hd"><span class="nm">${esc(p.name)}</span><span class="uses">${esc(p.use)}</span><span>${dirty?'<span class="dirty">Unsaved </span>':''}<a href="#" data-psave="${esc(p.name)}" aria-disabled="${!dirty}">Save</a></span></div><textarea class="pr" spellcheck="false" data-p="${esc(p.name)}">${esc(v)}</textarea></div>`}).join('')}
+$('prompts').oninput=e=>{const t=e.target;if(!t.dataset.p)return;promptDraft[t.dataset.p]=t.value;
+ const card=t.closest('.cm'),orig=(D.prompts.find(p=>p.name===t.dataset.p)||{}).text;card.querySelector('[data-psave]').setAttribute('aria-disabled',t.value===orig)};
+$('prompts').onclick=e=>{const a=e.target.closest('a[data-psave]');if(!a)return;e.preventDefault();if(a.getAttribute('aria-disabled')==='true')return;
+ const n=a.dataset.psave;post({save_prompt:{name:n,text:promptDraft[n]}},$("prmsg"),()=>{delete promptDraft[n]})};
+load();setInterval(load,10000);
+</script></body></html>

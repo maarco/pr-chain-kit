@@ -1,0 +1,26 @@
+{
+  "all-luna": {
+    "build": "cmd:codex-luna-high",
+    "fix": "cmd:codex-luna-high",
+    "gate": "cmd:codex-luna-high",
+    "review": "cmd:codex-luna-high",
+    "scout": "cmd:codex-luna-high",
+    "ui": "cmd:codex-luna-high"
+  },
+  "claude-stock": {
+    "build": "cmd:claude-haiku-high",
+    "fix": "cmd:claude-haiku-high",
+    "gate": "cmd:claude-opus-high",
+    "review": "cmd:claude-haiku-high",
+    "scout": "cmd:claude-haiku-high",
+    "ui": "cmd:claude-opus-high"
+  },
+  "kollab-example": {
+    "build": "cmd:codex-luna-max",
+    "fix": "cmd:codex-luna-max",
+    "gate": "cmd:claude-opus-max",
+    "review": "cmd:claude-haiku-max",
+    "scout": "cmd:claude-haiku-high",
+    "ui": "cmd:claude-opus-high"
+  }
+}

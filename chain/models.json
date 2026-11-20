@@ -1,0 +1,8 @@
+{
+  "build": "cmd:claude-sonnet-high",
+  "fix": "cmd:claude-sonnet-high",
+  "gate": "cmd:claude-opus-high",
+  "review": "cmd:claude-sonnet-high",
+  "scout": "cmd:claude-sonnet-high",
+  "ui": "cmd:claude-sonnet-high"
+}

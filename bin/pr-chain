@@ -1,0 +1,2886 @@
+#!/usr/bin/env python3
+"""pr-chain: review -> (fail) -> fix -> re-review loop for one PR at a time. A fresh agent runs every stage.
+
+Usage:
+  pr-chain pick [--all]                      table of open PRs and who owns them; the first eligible row is the next target
+  pr-chain run <pr> [options]                run the loop on one PR
+  pr-chain auto [options]                    first eligible PR; none -> first free issue (build, open DRAFT PR, run it); none -> scout files issues
+  pr-chain issue <n> [options]               build one issue into a DRAFT PR, then run the loop on it
+  pr-chain scout [options]                   a scout agent files new bug issues (status/ready-for-agent) and exits
+  pr-chain resume [options]                  PRs waiting on a person: label human-approved -> CI + merge; comment -> fixer, loop restarts
+  pr-chain land <pr> [options]               skip review/fix: gate + land the PR at its current head
+  pr-chain models                            effective model per role (review/fix/gate/ui/build/scout) and its source
+  pr-chain status                            one line per PR the chain has touched
+  pr-chain stop                              ask a running chain to stop after its current stage
+  pr-chain clean <pr>                        remove the PR's leftover worktrees (never --force)
+
+Options for run/auto/land:
+  --max-rounds N      review/fix rounds before giving up (default 4)
+  --review-model M    haiku (default) | sonnet | opus | codex[:slug]
+  --fix-model M       haiku (default) | codex:gpt-6-luna | ...
+  --gate-model M      final AUDITOR of the review stage's work, default opus; runs only after the reviewer says PASS; --no-gate skips it
+  --max-audits N      audits per PR before NEEDS-HUMAN (default 2)
+  --land              after PASS + gate + green CI, approve (non-author account) and merge. Without it the chain stops at READY.
+  --ui-model M        vision model for UI PRs (default opus): runs ui-slop-review on real screenshots, assumes the UI is wrong
+  --max-ui N          UI review failures before UI-FAILED (default 3); a FAIL goes to a fixer and only the UI review reruns
+  --no-human          skip the human screenshot gate (post-UI-review PASS goes straight to CI/land)
+  --vision-ok         a person already reviewed this head: skip the vision review and the human gate
+  --build-model/--scout-model M, --scout-max N   builder for issues / scout and its issue cap
+  --no-post           do not post verdict comments on the PR
+  Model defaults: flag > env PR_CHAIN_<ROLE>_MODEL > <repo>/chain/models.json
+    ({"review": "codex:gpt-6-luna", "fix": "codex:gpt-6.1-terra", ...}) > built-in. See `pr-chain models`.
+  --dry-run           print what would happen, launch nothing, write nothing remote
+
+Stages (each one a NEW agent): fold main in (no model) -> REVIEW (read-only) -> FAIL: FIX (new agent, red-first, commits
+locally, the script pushes with an ordinary push) -> REVIEW again (new agent) ... -> PASS: GATE (non-Haiku) -> CI wait -> LAND.
+Guards: one chain at a time, one claim per PR, STOP file, the settings-file damage tripwire after every agent (when
+[tripwire] settings_file is set), per-agent tool-call budgets and agent timeout from flow.json (-1 = no limit),
+no force push, never gpt-6-astra, repeated identical findings stop the loop (NEEDS-HUMAN).
+Work, ledger and logs: the [paths] work folder (ledger.jsonl, prs/<n>/r<k>-<role>/). Uses the vendored agent-kit
+(kit.py, land/fold.py, land/land_pr.py). Every project-specific value lives in pr-chain.toml (see chain/config.py).
+"""
+import argparse
+import calendar
+import hashlib
+import json
+import math
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+os.environ.setdefault("KIT_AGENT", "pr-chain")
+ROOT = Path(__file__).resolve().parents[1]          # the pr-chain-kit repo root
+sys.path.insert(0, str(ROOT / "chain"))
+from config import CFG, kit_env_defaults  # noqa: E402  one pr-chain.toml holds every project value
+kit_env_defaults()                                 # KIT_* env defaults from the toml, before kit reads them
+os.environ.setdefault("KIT_WORK", str(CFG.work))
+sys.path.insert(0, str(ROOT / "agent-kit"))
+import kit  # noqa: E402
+import chain_engine  # noqa: E402  the chain runs flow.json (chain/ENGINE.md)
+
+CHAIN = ROOT / "chain"                          # the engine folder: flow.json, prompts/, models.json, ...
+PROMPTS = CHAIN / "prompts"
+WORK = kit.WORK
+# Every chain worktree lives in one folder, so disk use is in one place.
+WT_ROOT = CFG.worktree_root
+
+
+# The loop process itself (python running bin/pr-chain-loop), not any shell whose command text mentions it
+# (11-14 21:00: a watcher shell holding that text made the watchdog skip a restart).
+LOOP_PROC = r"^[^ ]*python[^ ]* -B [^ ]*bin/pr-chain-loop"
+
+
+def loop_alive(pat=LOOP_PROC):
+    """Is the loop process running? The doctor asks from inside `resume`, a child of the loop, and macOS pgrep leaves a
+    caller's ancestors out of its matches unless given -a: without it every doctor pass logged "loop is not running" (days of rows)."""
+    return not sh("pgrep", "-a", "-f", pat).returncode
+
+
+def wt_for(d):
+    """The worktree for one stage folder: prs/1090/r1-review -> <WT_ROOT>/pr-1090-r1-review, issues/7 -> issue-7."""
+    parts = Path(d).relative_to(WORK).parts
+    kind = {"prs": "pr", "issues": "issue"}.get(parts[0], parts[0])
+    return WT_ROOT / "-".join((kind,) + parts[1:])
+
+
+def retire_wt(d):
+    """Before a stage folder is renamed aside: drop its worktree, or move a dirty one aside the same way."""
+    wt = wt_for(d)
+    if wt.exists():
+        drop_wt(wt)
+    if wt.exists():
+        sh("git", "-C", str(CHECKOUT), "worktree", "move", str(wt), str(wt.with_name(wt.name + f".old{int(time.time())}")))
+WORK.mkdir(parents=True, exist_ok=True)
+LEDGER = WORK / "ledger.jsonl"
+STOPFILE = WORK / "STOP"
+LOCK = WORK / "chain.lock"          # pre-threads global lock; cleaned up if left by a dead run
+LOCKS = WORK / "locks"             # per-key locks: locks/<pr> per chain, locks/ops for multi-PR commands
+NO_BUILD = WORK / "NO-BUILD"       # present: issue building and scouting are blocked (toggle on the board /config page)
+CLAIMS = WORK / "claims"
+OUR_AUTHORS = CFG.authors  # the chain only ever works on PRs these accounts opened; outside contributors' PRs are never touched
+EXCLUDE = WORK / "exclude.txt"          # lines: "<pr> <reason>"  (held by the maintainer or owned by someone else)
+SCRATCH_HOME = WORK / "scratch-home"    # HOME for every python/node command an agent runs
+SCRATCH_HOME.mkdir(parents=True, exist_ok=True)
+REPO, CHECKOUT, PY = kit.REPO, kit.CHECKOUT, kit.PYTHON
+TRIPWIRE_CFG = CFG.tripwire_file or WORK / "absent-tripwire"  # damage tripwire; off when [tripwire] is unset
+UI_RE = re.compile(CFG.ui_paths_re)
+DRY = False
+MARK = "<!-- pr-chain:"                     # every comment the chain posts starts with this, so it is never read as human feedback
+SHOTS_BRANCH = "pr-chain-shots"             # orphan branch that only holds screenshots for human-gate comments
+SHOTS_REPO = WORK / "shots-repo"
+HUMAN_LABEL = CFG.human_label
+FLOW = json.loads((CHAIN / "flow.json").read_text())  # the step graph: every node, outcome and end state; limits come from here
+LIM = {k: math.inf if v["value"] < 0 else v["value"] for k, v in FLOW["limits"].items()}  # -1 = no limit; test_flow.py keeps them in sync
+CAPS = {k: math.inf if v < 0 else v for k, v in FLOW["agent_calls"].items()}  # tool calls per stage, told to the agent in its brief
+_t = float(os.environ.get("CHAIN_AGENT_TIMEOUT") or LIM["agent_timeout_minutes"] * 60)
+AGENT_TIMEOUT = None if _t < 0 or math.isinf(_t) else _t  # seconds one agent may run; None = no timeout
+CHAIN_LABELS = {k: v["label"] for k, v in FLOW["end_states"].items() if v.get("label")}  # a parked PR shows why on GitHub
+NEEDS_PERSON_LABEL = FLOW["needs_person_label"]
+TRUSTED = CFG.trusted          # only these accounts can approve or give feedback at the human gate
+EXCLUDE_ISSUES = WORK / "exclude-issues.txt"  # lines: "<issue> <reason>"
+BLOCK_LABELS = set(CFG.block_labels)
+UI_SHOOT = CFG.ui_shoot_script
+UI_STACK = CFG.ui_stack_script  # starts/owns the app stack for UI review (up/down), project-provided
+TERM_SHOTS = CFG.term_shots_script or WORK / "absent-term-shots"  # terminal screenshots from a PR's own tmux specs
+UV = shutil.which("uv") or "/opt/homebrew/bin/uv"
+
+
+def now():
+    return time.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def log(msg):
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def sh(*cmd, cwd=None, check=False, env=None, timeout=300):
+    try:
+        p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, env=env, timeout=timeout)
+    except subprocess.TimeoutExpired:  # a hung git/gh/fold call ends the chain through die(), not with STATE left at running
+        raise RuntimeError(f"{' '.join(map(str, cmd[:5]))}: timed out after {timeout} s") from None
+    if check and p.returncode:
+        raise RuntimeError(f"{' '.join(map(str, cmd[:5]))}: {(p.stderr or p.stdout)[-300:]}")
+    return p
+
+
+GH_RETRY_WAIT = (10, 30)  # seconds before the 2nd and 3rd try
+GH_TRANSIENT = re.compile(r"Something went wrong|HTTP 50[0234]|timed out|connection reset|EOF|i/o timeout|try again", re.I)
+
+
+def gh_json(*args):
+    """GitHub read. A transient GitHub error is tried again twice (#598 died on one right after a push, 11-14)."""
+    for wait in (*GH_RETRY_WAIT, None):
+        try:
+            p = sh("gh", *args, check=True)
+            return json.loads(p.stdout or "null")
+        except RuntimeError as e:
+            if wait is None or not GH_TRANSIENT.search(str(e)):
+                raise
+            time.sleep(wait)
+
+
+def ledger(**kw):
+    kw["ts"] = now()
+    with open(LEDGER, "a") as fh:
+        fh.write(json.dumps(kw) + "\n")
+
+
+def state_path(pr):
+    d = WORK / "prs" / str(pr)
+    d.mkdir(parents=True, exist_ok=True)
+    return d / "STATE.json"
+
+
+def set_state(pr, **kw):
+    p = state_path(pr)
+    cur = json.loads(p.read_text()) if p.exists() else {}
+    cur.update(kw, updated=now())
+    p.write_text(json.dumps(cur, indent=1))
+    return cur
+
+
+# End states caused by the machinery, not by the PR's code: `pick` hands the PR out again at the same head,
+# at most RETRY_CAP times per head. Every other end state stays parked until the head moves.
+RETRYABLE = tuple(k for k, v in FLOW["end_states"].items() if v.get("retryable"))  # flow.json "retryable": true
+RETRY_CAP = LIM["retry_cap"]
+LAND_TRIES = LIM["land_tries"]  # `resume` lands a LAND-STOPPED PR again when the PR changed on GitHub, this many times per head
+
+
+def die(pr, status, why):
+    log(f"#{pr} {status}: {why}")
+    sp = state_path(pr)
+    cur = json.loads(sp.read_text()) if sp.exists() else {}
+    key = "land_tries" if status == "LAND-STOPPED" else "retries" if status in RETRYABLE else None
+    extra = {}
+    if key:  # counted per head: a new head starts from zero
+        h = cur.get("head") or ""
+        extra[key] = {h: (cur.get(key) or {}).get(h, 0) + 1}
+    if status == "RESTING":  # models could not finish it: back after 1, 2, 4, then 8 h at one head; never parked for a person
+        # Key the rest on the head GitHub shows now. STATE.head goes stale when the chain folds main in (or a fixer pushes) and
+        # then rests, and owner_reason honours a rest only at the PR's own head: #1101 was handed out again every 40 s (11-16).
+        h = live_head(pr) or cur.get("head") or ""
+        k = (cur.get("rests") or {}).get(h, 0) + 1
+        extra.update(head=h, rests={h: k}, rest_until=time.time() + 3600 * min(LIM["rest_hours_max"], 2 ** (k - 1)), rest_total=(cur.get("rest_total") or 0) + 1)
+    set_state(pr, status=status, why=why, **extra)
+    tried = max((extra.get("retries") or {}).values(), default=0)
+    try:  # one visible chain/* label per parked state (flow.json end_states.*.label); every other end state clears it
+        chain_label(pr, CHAIN_LABELS.get(status) or (NEEDS_PERSON_LABEL if tried >= RETRY_CAP else None))
+    except Exception as e:  # noqa: BLE001 - a label must never change how a chain ended
+        log(f"#{pr} label failed: {str(e)[:120]}")
+    ledger(pr=pr, stage="end", status=status, why=why)
+    release(pr)
+    if status == "LAND-STOPPED" and not DRY:  # ready+approved+green = the merge bot merges it: a refused merge goes back to draft
+        sh("gh", "pr", "ready", str(pr), "-R", REPO, "--undo")  # (#549 merged by itself after its merge was refused, 11-14)
+    if status in ("MERGED", "CLOSED") and not DRY:  # a resolved PR must not keep the approval label
+        sh("gh", "pr", "edit", str(pr), "-R", REPO, "--remove-label", HUMAN_LABEL)
+    try:  # this chain is over: its worktrees and code indexes go now (a merged or closed PR also loses the dirty ones), so the disk does not fill
+        cleanup_pr(pr, force=status in ("MERGED", "CLOSED"))
+    except Exception as e:  # noqa: BLE001 - tidying up must never change how a chain ended
+        log(f"#{pr} cleanup failed: {str(e)[:120]}")
+    return status
+
+
+def chain_label(pr, want):
+    """Keep at most one chain/* label on the PR (written by the merger gh account); None removes it."""
+    sp = state_path(pr)
+    cur = (json.loads(sp.read_text()) if sp.exists() else {}).get("chain_label") or None
+    if DRY or cur == want:
+        return
+    if cur:
+        sh("gh", "pr", "edit", str(pr), "-R", REPO, "--remove-label", cur)
+    if want:
+        sh("gh", "label", "create", want, "-R", REPO, "--force", "--color", "fbca04", "--description", FLOW["labels"][want][:100])
+        sh("gh", "pr", "edit", str(pr), "-R", REPO, "--add-label", want)
+    set_state(pr, chain_label=want or "")
+
+
+# ---------------------------------------------------------------- ownership / pick
+# the watched app may rewrite some keys itself (update stamps, session state); those are not settings damage.
+# The user-set keys beside them (github_repo, check_enabled, check_interval_hours, ...) stay watched.
+CFG_GUARD = re.compile(r"((^|_)(api_?key|key|token|secret|password)|base_url|repo)$", re.I)
+
+
+def cfg_snapshot():
+    """Every setting in the tripwire settings file as dotted path -> short digest of its value (never the value itself).
+    A string instead when the file is absent or not JSON."""
+    if not TRIPWIRE_CFG.exists():
+        return "absent"
+    try:
+        data = json.loads(TRIPWIRE_CFG.read_bytes())
+    except ValueError:
+        return "unreadable"
+    out = {}
+
+    def walk(node, path):
+        if isinstance(node, dict) and node:
+            for k, v in node.items():
+                walk(v, path + (str(k),))
+        else:
+            out[".".join(path)] = hashlib.sha256(json.dumps(node, sort_keys=True).encode()).hexdigest()[:16]
+    walk(data, ())
+    return out
+
+
+def cfg_damage(before, after):
+    """Compare two snapshots. Returns (damage, changed), setting names only.
+    damage stops every chain: the file gone or unreadable, a setting removed, or a credential, endpoint or repo changed.
+    changed is any other edit. Live app sessions on this machine save settings while an agent runs (each new session
+    saves its approval mode; the update check saves four stamps; a person adds a profile), so those are recorded, not stopped:
+    15 stops on 2026-11-14 were all such writes, none an agent's."""
+    if not isinstance(after, dict):
+        return ([f"the file is {after}"] if isinstance(before, dict) else []), []
+    if not isinstance(before, dict):
+        return [], []
+    gone = [k for k in before if k not in after]
+    edited = [k for k in before if k in after and before[k] != after[k]]
+    hot = [k for k in edited if CFG_GUARD.search(k.rsplit(".", 1)[-1])]
+    return gone + hot, [k for k in edited if k not in hot] + [k for k in after if k not in before]
+
+
+def excluded():
+    out = {}
+    if EXCLUDE.exists():
+        for line in EXCLUDE.read_text().splitlines():
+            m = re.match(r"\s*(\d+)\s*(.*)", line)
+            if m:
+                out[int(m.group(1))] = m.group(2) or "excluded"
+    return out
+
+
+def pid_alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def chain_pushed(head):
+    """True when this head is a commit the chain pushed itself (ledger push row, or a fix row that says pushed)."""
+    try:
+        with open(LEDGER) as fh:
+            return any(head in ln and ('"stage": "push"' in ln or '"stage": "fold"' in ln) for ln in fh)
+    except OSError:
+        return False
+
+
+def owner_reason(p, ps_text):
+    """Why the PR is not free to take, or None. Heuristic: a running agent, a live claim, a fresh push, an unfinished lane."""
+    n = p["number"]
+    if p["author"]["login"] not in OUR_AUTHORS:
+        return "not ours: outside contributor PR, the chain never touches it"
+    if n in excluded():
+        return "excluded: " + excluded()[n]
+    claim = CLAIMS / str(n)
+    if claim.exists():
+        pid = (claim / "pid").read_text().strip() if (claim / "pid").exists() else ""
+        if pid_alive(pid):
+            return f"claimed by live chain pid {pid}"
+    sp = state_path(n)
+    if sp.exists():
+        st = json.loads(sp.read_text())
+        released = False  # chain/needs-person holds a PR (NEEDS-PERSON at any head, a retry cap at its head) until a person removes it
+        if st.get("chain_label") == NEEDS_PERSON_LABEL and (st.get("status") == "NEEDS-PERSON" or st.get("head") == p["headRefOid"]):
+            if "labels" not in p or NEEDS_PERSON_LABEL in {lb["name"] if isinstance(lb, dict) else lb for lb in p["labels"] or []}:
+                return f"needs a person: remove the {NEEDS_PERSON_LABEL} label to let the chain try again ({st.get('why', '')[:50]})"
+            released = True  # run_chain starts the counters over
+        if st.get("status") == "AWAIT-HUMAN":  # at any head: `pr-chain resume` owns it and reruns the chain itself when the PR's own code moved
+            return "waiting for the human gate (approve with the human-approved label, or comment)"
+        if st.get("status") == "WAITING-CI" and not st.get("ci_settled"):  # settled: resume handed it to the next free thread
+            return ("waiting for CI before its review; resume starts the chain when the checks finish" if st.get("ci_wait") == "review"
+                    else "waiting for CI; resume lands it when the checks finish")
+        if st.get("status") == "RESTING" and st.get("head") == p["headRefOid"] and time.time() < (st.get("rest_until") or 0):
+            return f"resting until {time.strftime('%H:%M', time.localtime(st['rest_until']))} ({st.get('why', '')[:50]})"
+        if not released and st.get("status") not in (None, "running") and st.get("head") == p["headRefOid"] \
+                and st.get("status") not in ("CLAIMED", "STOPPED", "RESTING", "WAITING-CI"):
+            tried = (st.get("retries") or {}).get(st.get("head") or "", 0)
+            if st.get("status") not in RETRYABLE:
+                return f"chain already ended {st.get('status')} at this head ({st.get('why', '')[:50]})"
+            if tried >= RETRY_CAP:
+                return f"chain ended {st.get('status')} {tried} times at this head; needs a person ({st.get('why', '')[:50]})"
+    pats = [rf"lane-{n}\b", rf"luna-{n}\w*", rf"{CFG.lane_root.name}-wt\S*\b{n}\b", rf"[Pp][Rr] ?#?{n}\b", rf"pr-chain \S+ {n}\b"]
+    for line in ps_text.splitlines():
+        if "pr-chain pick" in line or "pr-chain status" in line:
+            continue
+        if any(re.search(x, line) for x in pats):
+            return "running agent process mentions it"
+    for wt in CFG.lane_root.glob(f"lane-{n}*"):
+        st = sh("git", "-C", str(wt), "status", "--porcelain").stdout.strip()
+        if st:
+            return f"lane worktree {wt.name} has uncommitted work"
+    for status in (Path.home() / "backups" / "pr-lanes").glob(f"*{n}*/STATUS.md"):
+        last = [ln for ln in status.read_text().splitlines() if ln.strip()][-1:] or [""]
+        fresh = time.time() - status.stat().st_mtime < 3 * 3600
+        if fresh and not re.search(r"LANE (DONE|BLOCKED)", last[0]):
+            return f"lane {status.parent.name} STATUS does not say DONE/BLOCKED"
+    try:
+        c = gh_json("api", f"repos/{REPO}/commits/{p['headRefOid']}")
+        age = time.time() - calendar.timegm(time.strptime(c["commit"]["committer"]["date"], "%Y-%m-%dT%H:%M:%SZ"))
+        if age < LIM["head_min_age_minutes"] * 60 and not chain_pushed(p["headRefOid"]):  # the chain's own fixer push never blocks the chain
+            return "head pushed less than 45 min ago"
+    except Exception:
+        pass
+    return None
+
+
+def list_prs():
+    fields = ("number,title,isDraft,headRefName,headRefOid,mergeStateStatus,author,isCrossRepository,additions,deletions,files,"
+              "body,labels,closingIssuesReferences")
+    return gh_json("pr", "list", "-R", REPO, "--state", "open", "--limit", "100", "--json", fields)
+
+
+def linked_issues(p):
+    """Issue numbers a PR says it fixes: GitHub's closing refs, `Fixes #N` in the body, `(#N)` in the title, `issue-N` in the branch."""
+    found = {r["number"] for r in p.get("closingIssuesReferences") or []}
+    found |= {int(x) for x in re.findall(r"(?:fix(?:es|ed)?|close[sd]?|resolve[sd]?)\s+#(\d+)", p.get("body") or "", re.I)}
+    found |= {int(x) for x in re.findall(r"\(#(\d+)\)", p.get("title") or "")}
+    found |= {int(x) for x in re.findall(r"issue-(\d+)", p.get("headRefName") or "")}
+    return found
+
+
+def label_prio(labels):
+    """0-3 from the best `priority/pN` label, 9 when there is none."""
+    names = [lb["name"] if isinstance(lb, dict) else lb for lb in labels or []]
+    return min([int(x[-1]) for x in names if re.fullmatch(r"priority/p[0-3]", x)] or [9])
+
+
+def issue_prios():
+    """Open issue number -> 0-3 priority (9 = no label)."""
+    rows = gh_json("issue", "list", "-R", REPO, "--state", "open", "--limit", "500", "--json", "number,labels")
+    return {i["number"]: label_prio(i["labels"]) for i in rows}
+
+
+def rank(prs, prios=None):
+    """Free PRs first, then by priority (the PR's own label or its best linked issue's), then clean before DIRTY, then smallest."""
+    ps_text = sh("/bin/ps", "-axo", "command").stdout
+    if prios is None:
+        prios = issue_prios() if prs else {}
+    rows = []
+    for p in prs:
+        why = owner_reason(p, ps_text)
+        ui = any(UI_RE.search(f["path"]) for f in p["files"])
+        prio = min([label_prio(p.get("labels"))] + [prios.get(n, 9) for n in linked_issues(p)])
+        rows.append(dict(p, owner=why, ui=ui, size=p["additions"] + p["deletions"], prio=prio))
+    rows.sort(key=lambda r: (r["owner"] is not None, r["prio"], r["mergeStateStatus"] == "DIRTY", r["size"]))
+    return rows
+
+
+FOCUS = WORK / "focus.json"  # the PRs the chain is finishing now (flow.json prs_at_once; default: one at a time)
+IN_FLIGHT = ("waiting for CI", "claimed by live chain", "running agent")
+
+
+def focus(rows):
+    """Keep the focus PRs still in flight (free, waiting on their own CI, or running), fill up to prs_at_once with the best free
+    PRs, and hold every other free PR. 11-17: with each parked PR freeing its slot, 55 PRs sat in CI at once and none closed."""
+    by = {r["number"]: r for r in rows}
+    try:
+        keep = [k for k in json.loads(FOCUS.read_text()) if k in by and (not by[k]["owner"] or by[k]["owner"].startswith(IN_FLIGHT))]
+    except (OSError, ValueError):
+        keep = []
+    keep += [r["number"] for r in rows if not r["owner"] and r["number"] not in keep][:max(0, LIM["prs_at_once"] - len(keep))]
+    if not DRY:
+        FOCUS.write_text(json.dumps(keep))
+    for r in rows:
+        if not r["owner"] and r["number"] not in keep:
+            r["owner"] = "one at a time: " + ", ".join(f"#{k}" for k in keep) + " first"
+    return keep
+
+
+def cmd_pick(a):
+    rows = rank(list_prs())
+    cmd_pick.focus = focus(rows) if LIM["prs_at_once"] != math.inf else []
+    print(f"{'PR':>5} {'size':>6} {'state':8} {'ui':2} {'author':12} owner/free")
+    for r in rows:
+        if r["owner"] and not a.all:
+            continue
+        print(f"{r['number']:>5} {r['size']:>6} {r['mergeStateStatus']:8} {'UI' if r['ui'] else '-':2} "
+              f"{r['author']['login'][:12]:12} {r['owner'] or 'FREE'}")
+    free = [r for r in rows if not r["owner"]]
+    cmd_pick.prio = free[0]["prio"] if free else 9  # auto compares it with the best free issue (issue_jumps_queue)
+    print(f"\nnext target: #{free[0]['number']}" if free else "\nno free PR")
+    return free[0]["number"] if free else None
+
+
+def issue_jumps_queue(pr_prio, issue_prio):
+    """A free p0/p1 issue is built before a free PR of lower priority; anything else waits for the PRs."""
+    return issue_prio <= 1 and issue_prio < pr_prio
+
+
+def claim(pr):
+    CLAIMS.mkdir(parents=True, exist_ok=True)
+    d = CLAIMS / str(pr)
+    if d.exists():
+        pid = (d / "pid").read_text().strip() if (d / "pid").exists() else ""
+        if pid_alive(pid):
+            return False
+        shutil.rmtree(d)
+    d.mkdir()
+    (d / "pid").write_text(str(os.getpid()))
+    return True
+
+
+def release(pr):
+    d = CLAIMS / str(pr)
+    if d.exists():
+        shutil.rmtree(d, ignore_errors=True)
+
+
+# ---------------------------------------------------------------- agents
+
+# --- model defaults: CLI flag > env PR_CHAIN_<ROLE>_MODEL > chain/models.json > built-in ---
+MODEL_ROLES = {"review": "haiku", "fix": "haiku", "gate": "opus", "ui": "opus", "build": "haiku", "scout": "haiku"}
+MODELS_FILE = Path(os.environ.get("PR_CHAIN_MODELS_FILE", str(CHAIN / "models.json")))
+
+
+def model_defaults():
+    """Effective default model per role and where each came from."""
+    cfg = {}
+    if MODELS_FILE.exists():
+        try:
+            cfg = json.loads(MODELS_FILE.read_text())
+        except Exception as e:
+            raise SystemExit(f"pr-chain: bad {MODELS_FILE}: {e}")
+        unknown = set(cfg) - set(MODEL_ROLES)
+        if unknown:
+            raise SystemExit(f"pr-chain: unknown roles in {MODELS_FILE}: {sorted(unknown)}; valid: {sorted(MODEL_ROLES)}")
+    out = {}
+    for role, builtin in MODEL_ROLES.items():
+        env = os.environ.get(f"PR_CHAIN_{role.upper()}_MODEL")
+        if env:
+            out[role] = (env, f"env PR_CHAIN_{role.upper()}_MODEL")
+        elif cfg.get(role):
+            out[role] = (str(cfg[role]), str(MODELS_FILE))
+        else:
+            out[role] = (builtin, "built-in")
+        if "astra" in out[role][0].lower():
+            raise SystemExit(f"refusing: gpt-6-astra is banned ({role} from {out[role][1]})")
+    return out
+
+# --- named commands (board /config, 2026-11-13): a stage value "cmd:<name>" runs commands.json[<name>] verbatim,
+# with <brief.md> replaced by the brief path. Profiles in profiles.json map the six stages to these names.
+COMMANDS_FILE = MODELS_FILE.with_name("commands.json")
+BRIEF_SLOT = "<brief.md>"
+
+
+class Cmd(str):
+    """A stage model resolved from a named command. Its str value is the short model label (codex:gpt-6-luna, opus)
+    so logs, the ledger, spend pricing and PR comments read as before; .template is what actually runs."""
+    def __new__(cls, label, template, name):
+        s = super().__new__(cls, label)
+        s.template, s.name = template, name
+        return s
+
+
+def read_commands():
+    try:
+        data = json.loads(COMMANDS_FILE.read_text())
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        raise SystemExit(f"pr-chain: bad {COMMANDS_FILE}: {e}")
+    return data if isinstance(data, dict) else {}
+
+
+def command_template(model):
+    """Full command line for a cmd:<name> stage value, else None."""
+    if getattr(model, "template", None):
+        return model.template
+    if not str(model).startswith("cmd:"):
+        return None
+    name = model[4:]
+    t = read_commands().get(name)
+    if not isinstance(t, str) or not t.strip():
+        raise SystemExit(f"pr-chain: no command named {name!r} in {COMMANDS_FILE}")
+    if BRIEF_SLOT not in t:
+        raise SystemExit(f"pr-chain: command {name!r} has no {BRIEF_SLOT} slot, so its agent would never see the brief")
+    if "astra" in t.lower():
+        raise SystemExit("refusing: gpt-6-astra is banned")
+    return t
+
+
+def cmd_label(template):
+    """Short model label for a full command: codex:<-m value>, or the claude --model value."""
+    m = re.search(r"(?:^|\s)(?:-m|--model)[\s=]+['\"]?([A-Za-z0-9._:-]+)", template)
+    name = m.group(1) if m else "custom"
+    return f"codex:{name}" if re.search(r"\bcodex\b", template) else name
+
+
+def resolve_cmd(model):
+    """cmd:<name> -> Cmd (label + template); anything else unchanged."""
+    t = command_template(model)
+    return Cmd(cmd_label(t), t, str(model)[4:]) if t and not isinstance(model, Cmd) else model
+
+
+def runner(model):
+    """(kind, name). Never astra."""
+    if "astra" in model.lower():
+        raise SystemExit("refusing: gpt-6-astra is banned")
+    t = command_template(model)
+    if t:
+        model = cmd_label(t)
+    if model.startswith("codex"):
+        slug = model.split(":", 1)[1] if ":" in model else "gpt-6.1-terra"
+        return "codex", slug
+    return "claude", model
+
+
+def agent_cmd(model, prompt="Read <brief.md> and follow it exactly.", brief=BRIEF_SLOT):
+    """The exact command one agent runs. The board /config page renders this; keep the default prompt as a placeholder."""
+    t = command_template(model)
+    if t:
+        return shlex.split(t.replace(BRIEF_SLOT, str(brief)))
+    kind, name = runner(model)
+    if kind == "claude":
+        return ["claude", "-p", prompt, "--model", name, "--effort", os.environ.get("CHAIN_EFFORT", "high"),
+                "--strict-mcp-config", "--disable-slash-commands",
+                "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions",
+                "--tools", "Bash,Read,Grep,Glob,Write,Edit"]
+    inner = (f"export TERM=xterm-256color COLORTERM=truecolor; codex exec --dangerously-bypass-approvals-and-sandbox "
+             f"-m {name} -c model_reasoning_effort=high {shlex.quote(prompt)} </dev/null")
+    return ["zsh", "-lic", inner]
+
+
+def run_agent(role, model, brief, cwd, outdir, pr):
+    """Run one fresh agent to completion, synchronously. Returns dict(rc, secs, turns, cost)."""
+    kind, name = runner(model)
+    outdir.mkdir(parents=True, exist_ok=True)
+    nogh = outdir / "no-gh"
+    nogh.mkdir(exist_ok=True)
+    env = {k: v for k, v in os.environ.items() if k not in ("GH_TOKEN", "GITHUB_TOKEN")}
+    env.update(GH_CONFIG_DIR=str(nogh), GIT_TERMINAL_PROMPT="0", **CFG.agent_env)
+    prompt = f"Read {brief} and follow it exactly."
+    before = cfg_snapshot()
+    cmd = agent_cmd(model, prompt, brief=brief)
+    t0 = time.time()
+    via = f" via command {model.name}" if getattr(model, "name", None) else ""
+    log(f"#{pr} {role} agent start: {kind}:{name}{via} cwd={cwd}")
+    if DRY:
+        log(f"[dry] would run: {' '.join(shlex.quote(c) for c in cmd[:6])} ...")
+        return dict(rc=0, secs=0, turns=None, cost=None, dry=True)
+    with open(outdir / "out.jsonl", "w") as out, open(outdir / "err.txt", "w") as err:
+        try:
+            rc = subprocess.run(cmd, cwd=str(cwd), env=env, stdin=subprocess.DEVNULL, stdout=out, stderr=err,
+                                timeout=AGENT_TIMEOUT).returncode
+        except subprocess.TimeoutExpired:
+            rc = 124
+    turns = cost = None
+    try:
+        for line in reversed((outdir / "out.jsonl").read_text().splitlines()):
+            if '"type":"result"' in line.replace(" ", ""):
+                j = json.loads(line)
+                turns, cost = j.get("num_turns"), j.get("total_cost_usd")
+                break
+    except Exception:
+        pass
+    res = dict(rc=rc, secs=int(time.time() - t0), turns=turns, cost=cost)
+    ledger(stage="agent", pr=pr, role=role, model=model, dir=str(outdir), **res)
+    damage, changed = cfg_damage(before, cfg_snapshot())
+    if changed:  # a live app session or a person saved a setting meanwhile: on the record, not a stop
+        ledger(stage="config-changed", pr=pr, role=role, paths=changed[:12])
+    if damage:
+        ledger(stage="TRIPWIRE", pr=pr, role=role, why=f"{TRIPWIRE_CFG} damaged during an agent run", paths=damage[:12])
+        STOPFILE.write_text("config.json damaged during an agent run (" + ", ".join(damage[:6])
+                            + "); check it against ~/backups/pr-chain/backup before anything else\n")
+        raise SystemExit(f"TRIPWIRE: {TRIPWIRE_CFG} damaged (" + ", ".join(damage[:6]) + "); chain stopped, STOP file written")
+    return res
+
+
+# ---------------------------------------------------------------- git helpers
+def branch_head(info):
+    if info["isCrossRepository"]:
+        return info["headRefOid"]
+    return sh("gh", "api", f"repos/{REPO}/git/ref/heads/{info['headRefName']}", "--jq", ".object.sha", check=True).stdout.strip()
+
+
+def fetch(info):
+    src = f"refs/pull/{info['number']}/head" if info["isCrossRepository"] else f"refs/heads/{info['headRefName']}"
+    sh("git", "-C", str(CHECKOUT), "fetch", "-q", "origin", "main", src, check=True)
+    return sh("git", "-C", str(CHECKOUT), "rev-parse", "origin/main", check=True).stdout.strip()
+
+
+def contains_main(head, main):
+    return sh("git", "-C", str(CHECKOUT), "merge-base", "--is-ancestor", main, head).returncode == 0
+
+
+def pr_info(pr):
+    return gh_json("pr", "view", str(pr), "-R", REPO, "--json",
+                   "number,state,title,body,isDraft,headRefName,headRefOid,mergeStateStatus,author,isCrossRepository,"
+                   "closingIssuesReferences,files,baseRefName")
+
+
+def live_head(pr):
+    """The PR's head on GitHub right now, or None when GitHub does not answer (or in a dry run)."""
+    if DRY:
+        return None
+    try:
+        return branch_head(pr_info(pr))
+    except Exception:  # a failed lookup must never keep a PR from ending
+        return None
+
+
+def pr_state(pr):
+    """OPEN, MERGED or CLOSED as GitHub says right now, or None when it does not answer."""
+    try:
+        return gh_json("pr", "view", str(pr), "-R", REPO, "--json", "state")["state"]
+    except Exception:  # noqa: BLE001 - unknown means "do not delete anything"
+        return None
+
+
+def make_wt(path, ref, branch=None):
+    if path.exists():
+        return
+    mode = ["-b", branch] if branch else ["--detach"]
+    sh("git", "-C", str(CHECKOUT), "worktree", "prune")  # a folder deleted by hand stays registered and blocks the add
+    sh("git", "-C", str(CHECKOUT), "worktree", "add", "-q", *mode, str(path), ref, check=True)
+    fe = path / CFG.ui_frontend_dir if CFG.ui_frontend_dir else None
+    nm = (CHECKOUT / CFG.ui_frontend_dir / "node_modules") if CFG.ui_frontend_dir else None
+    if fe and nm and fe.exists() and not (nm / "vite").exists():  # 11-17: it was found empty and every UI review died STACK-DOWN
+        r = sh("npm", "ci", "--no-audit", "--no-fund", cwd=nm.parent, timeout=900)
+        log(f"shared frontend node_modules had no vite; npm ci rc={r.returncode}")
+    if fe and nm and fe.exists() and nm.exists() and not (fe / "node_modules").exists():
+        (fe / "node_modules").symlink_to(nm)
+
+
+STAMPED = CFG.ui_stamp_file  # the UI stack stamps it for the build; stacks before 11-13 left it modified
+
+
+def stop_procs_in(path):
+    """Stop every process whose working folder is inside path (an agent can leave an app daemon running in its worktree;
+    two such leftovers ran for 8 and 19 hours on 11-14). SIGTERM, then SIGKILL after 30 s for the ones still there."""
+    root = str(Path(path).resolve())
+    out = subprocess.run(["/usr/sbin/lsof", "-a", "-d", "cwd", "-Fpn", "-c", ""], capture_output=True, text=True).stdout
+    pids, pid = [], None
+    for ln in out.splitlines():
+        if ln.startswith("p"):
+            pid = int(ln[1:])
+        elif ln.startswith("n") and pid and pid != os.getpid() and (ln[1:] == root or ln[1:].startswith(root + "/")):
+            pids.append(pid)
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        live = []
+        for q in pids:
+            try:
+                os.kill(q, sig)
+                live.append(q)
+            except OSError:
+                pass
+        if not live or sig == signal.SIGKILL:
+            break
+        for _ in range(30):
+            time.sleep(1)
+            if not any(_alive(q) for q in live):
+                return pids
+    return pids
+
+
+def _alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+CODE_INDEX = Path.home() / ".cache" / "codebase-memory-mcp"  # agents index their worktree there; one file set per folder
+
+
+def drop_index(path):
+    """Remove the code index an agent built for this worktree (67 GB of dead indexes filled the disk on 11-14)."""
+    stem = str(Path(path).resolve()).lstrip("/").replace("/", "-")
+    for suf in (".db", ".db-wal", ".db-shm"):
+        try:
+            (CODE_INDEX / (stem + suf)).unlink()
+        except OSError:
+            pass
+
+
+def drop_wt(path, force=False, quiet=False):
+    """Remove one stage worktree and its code index. `force` is for a PR that merged or closed: nothing in its worktrees is
+    worth keeping, so a dirty one goes too, and a folder git no longer knows (a renamed `.old<ts>` round) is deleted.
+    `quiet`: a worktree that cannot go yet is not logged (the doctor tries again every lap)."""
+    drop_index(path)
+    stop_procs_in(path)
+    link = path / CFG.ui_frontend_dir / "node_modules" if CFG.ui_frontend_dir else None
+    if link and link.is_symlink():
+        link.unlink()
+    if path.exists():
+        dirty = sh("git", "-C", str(path), "status", "--porcelain").stdout.splitlines()
+        if [ln[3:] for ln in dirty] == [STAMPED]:  # the build stamp alone is modified: nothing worth keeping, and it blocks the remove
+            sh("git", "-C", str(path), "checkout", "--", STAMPED)
+        p = sh("git", "-C", str(CHECKOUT), "worktree", "remove", *(["--force"] if force else []), str(path))
+        inside = str(path.resolve()).startswith((str(WORK.resolve()) + os.sep, str(WT_ROOT.resolve()) + os.sep))
+        if p.returncode and force and inside and path.exists() and "not a working tree" in p.stderr:
+            shutil.rmtree(path, ignore_errors=True)  # an orphan: git lost its registration when the round folder was renamed aside
+        elif p.returncode and not quiet:
+            log(f"leftover worktree {path} ({p.stderr.strip()[:120]}); `pr-chain clean` retries")
+
+
+def pr_leftovers(pr):
+    """What the stages of one PR left on this Mac: worktrees (registered or orphan), UI stack build output, code indexes."""
+    pdir = WORK / "prs" / str(pr)
+    stem = str(WT_ROOT).lstrip("/").replace("/", "-") + f"-pr-{pr}-"
+    return (list(pdir.glob("*/wt")) + list(WT_ROOT.glob(f"pr-{pr}-*"))
+            + [s / n for s in pdir.glob("*/stack") for n in STACK_SCRATCH if (s / n).is_dir()]
+            + list(CODE_INDEX.glob(stem + "*")))
+
+
+def cleanup_pr(pr, force=False, quiet=False):
+    """A chain that ended needs none of the working copies its stages made. Remove every worktree of the PR (with the code
+    index each built), the UI stacks' build output and orphan round worktrees. `force` (the PR merged or closed) also
+    removes dirty worktrees and unregistered folders. Branches, verdicts, briefs and the ledger stay.
+    Leftovers of finished PRs are what fills the disk. Returns how many worktrees went."""
+    if DRY:
+        return 0
+    claim = CLAIMS / str(pr)
+    if claim.exists() and pid_alive((claim / "pid").read_text().strip() if (claim / "pid").exists() else ""):
+        return 0  # a chain is working on it right now
+    pdir = WORK / "prs" / str(pr)
+    gone = 0
+    for wt in list(pdir.glob("*/wt")) + list(WT_ROOT.glob(f"pr-{pr}-*")):  # */wt: worktrees made before 11-14, and `.old<ts>` orphans
+        if wt.exists():
+            drop_wt(wt, force=force, quiet=quiet)
+            gone += not wt.exists()
+    for stack in pdir.glob("*/stack"):
+        clean_stack(stack)
+    stem = str(WT_ROOT).lstrip("/").replace("/", "-") + f"-pr-{pr}-"
+    for f in CODE_INDEX.glob(stem + "*"):  # indexes of worktrees that were removed some other way
+        try:
+            f.unlink()
+        except OSError:
+            pass
+    if gone:
+        sh("git", "-C", str(CHECKOUT), "worktree", "prune")
+        ledger(pr=pr, stage="cleanup", worktrees=gone, forced=force)
+        log(f"#{pr} cleaned {gone} leftover worktree(s)" + (" of a finished PR" if force else ""))
+    return gone
+
+
+def src_path(wt):
+    return os.pathsep.join([str(p) for p in sorted(wt.glob("packages/*/src"))] + [str(wt)])
+
+
+def render(tpl, **kv):
+    text = (PROMPTS / tpl).read_text()
+    for k, v in {"{{ENV}}": "".join(f" {a}={b}" for a, b in CFG.agent_env.items()),   # extra env from pr-chain.toml [agent]
+                 "{{RULES_DOC}}": CFG.rules_doc,                                      # the repo's own contributor rules
+                 "{{FE}}": CFG.ui_frontend_dir, "{{FRAG_DIR}}": CFG.fragment_dir,
+                 "{{PW_CACHE}}": (f"PLAYWRIGHT_BROWSERS_PATH={CFG.playwright_browsers} " if CFG.playwright_browsers else "")}.items():
+        text = text.replace(k, v)
+    if "{{GUIDE}}" in text:  # the shared field guide every stage gets; it uses the same placeholders as the briefs
+        guide = (PROMPTS / "field-guide.md").read_text().strip()
+        if CFG.field_guide and CFG.field_guide.exists():  # the per-project section: repo map, local check commands
+            guide += "\n\n" + CFG.field_guide.read_text().strip()
+        text = text.replace("{{GUIDE}}", guide)
+    if "CALLS" in kv:  # one sentence for the call budget; flow.json agent_calls -1 = no limit, never "inf tool calls"
+        kv["CALLS_RULE"] = ("No tool-call limit: take the calls the job needs, then write your file." if kv["CALLS"] == math.inf
+                            else f"You have {kv['CALLS']} tool calls. At {kv.get('CALLS_SOFT', kv['CALLS'])} stop exploring and write your file.")
+    for k, v in kv.items():
+        text = text.replace("{{" + k + "}}", str(v))
+    left = re.findall(r"\{\{[A-Z_]+\}\}", text)
+    if left:
+        raise RuntimeError(f"unfilled placeholders in {tpl}: {set(left)}")
+    return text
+
+
+def scrub(text):
+    """Public text: no local paths, no model names (audit 11-14: 37 of 110 comments carried paths, 7 named the model)."""
+    text = re.sub(r"(?:/Users/[^/\s]+|~)/[^\s`'\")\]]*", "<local path>", text)
+    text = re.sub(r"\(?\b(?:codex|claude|cmd):[\w.:-]+\)?", "", text, flags=re.I)
+    text = re.sub(r"(?im)^(\W*)(?:haiku|opus|sonnet|luna|fable|codex|gpt[-\w.]*|claude)\s+(audit|review|reviewer|verdict)\b",
+                  lambda m: m.group(1) + m.group(2).capitalize(), text)
+    if len(text) > 9000:  # keep both ends: a verdict ends with Findings and Follow-up, a PR body with How to see it and Not done
+        text = text[:4400] + "\n\n(middle cut: the full text was over 9000 characters)\n\n" + text[-4400:]
+    return text
+
+
+# ---------------------------------------------------------------- stages
+FOLD_LOCK = WORK / "fold.lock"
+
+
+def heal_train():
+    """The shared fold worktree must be clean before each fold. A crash mid-merge (the full disk, 11-14 12:29) left a merge open
+    there and every later fold stopped with "train worktree is dirty". Called under FOLD_LOCK, so no fold is using it; the
+    worktree is the chain's own scratch, rebuilt from origin/main."""
+    if kit.TRAIN.exists() and sh("git", "-C", str(kit.TRAIN), "status", "--porcelain").stdout.strip():
+        sh("git", "-C", str(kit.TRAIN), "merge", "--abort")
+        if sh("git", "-C", str(kit.TRAIN), "status", "--porcelain").stdout.strip():
+            shutil.rmtree(kit.TRAIN, ignore_errors=True)
+        ledger(stage="train-heal", path=str(kit.TRAIN))
+    if not kit.TRAIN.exists():  # fold.py merges main in this one long-lived worktree
+        sh("git", "-C", str(CHECKOUT), "worktree", "prune")
+        sh("git", "-C", str(CHECKOUT), "worktree", "add", "-q", "--detach", str(kit.TRAIN), "origin/main", check=True)
+
+
+class FoldRed(RuntimeError):
+    """fold.py merged main in but tests failed (rc 3): the fixer gets the output (#937 ended ERROR before)."""
+
+
+def fold(pr, info):
+    """Merge main into the PR branch with fold.py when the head lacks main. Returns the new head or None on conflict."""
+    main = fetch(info)
+    head = branch_head(info)
+    if contains_main(head, main):
+        return head
+    if info["isCrossRepository"]:  # a fork branch: GitHub's own ordinary merge of main, allowed when maintainers can edit
+        old = info["headRefOid"]
+        p = sh("gh", "pr", "update-branch", str(pr), "-R", REPO)
+        ledger(pr=pr, stage="update-branch", rc=p.returncode, tail=(p.stdout + p.stderr)[-200:])
+        if DRY:
+            return old
+        if p.returncode:
+            raise RuntimeError("fork PR is behind main and update-branch was refused: " + (p.stderr or p.stdout)[-160:])
+        for _ in range(12):
+            time.sleep(5)
+            new = pr_info(pr)["headRefOid"]
+            if new != old:
+                return new
+        raise RuntimeError("update-branch did not move the fork PR head within 60 s")
+    log(f"#{pr} behind main: fold")
+    if DRY:
+        log("[dry] would run fold.py --push")
+        return head
+    import fcntl
+    with open(FOLD_LOCK, "a") as lk:  # fold.py works in ONE shared worktree: one fold at a time (#954 + #790 collided, 11-14)
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        heal_train()
+        p = sh(sys.executable, str(ROOT / "agent-kit" / "land" / "fold.py"), str(pr), "--push", timeout=900)
+    ledger(pr=pr, stage="fold", rc=p.returncode, tail=(p.stdout + p.stderr)[-300:])
+    if p.returncode == 0:
+        info2 = pr_info(pr)
+        return branch_head(info2)
+    if p.returncode == 2:
+        sh("git", "-C", str(kit.TRAIN), "merge", "--abort")
+        return None
+    if p.returncode == 3:
+        sh("git", "-C", str(kit.TRAIN), "merge", "--abort")
+        raise FoldRed((p.stdout + p.stderr)[-3000:])
+    raise RuntimeError(f"fold.py failed rc={p.returncode}: {(p.stdout + p.stderr)[-300:]}")
+
+
+def fold_or_red(pr):
+    try:
+        return fold(pr, pr_info(pr))
+    except FoldRed as e:
+        return e
+
+
+def issues_text(info):
+    out = []
+    for ref in info["closingIssuesReferences"]:
+        i = gh_json("issue", "view", str(ref["number"]), "-R", REPO, "--json", "number,title,body,state")
+        out.append(f"# #{i['number']} ({i['state']}): {i['title']}\n\n{i['body'] or ''}\n")
+    return "\n".join(out) or "No linked issue.\n"
+
+
+def parse_verdict(path):
+    if not path.exists():
+        return None
+    first = path.read_text().strip().splitlines()[:1]
+    w = (first[0].strip().strip("`*# ").upper() if first else "")
+    return w if w in ("PASS", "FAIL") else None  # NOT-SHOWN is no answer since 11-16: the reviewer shoots it or FAILs
+
+
+STACK_SCRATCH = ("dist", "home", "project", "shim")  # one UI review's build output and scratch HOME; logs and stack.json stay
+
+
+def clean_stack(stack):
+    """A finished UI stage removes its OWN stack's build and scratch dirs (~1 GB each; 4.7 GB piled up by 11-14 and filled the disk).
+    Only this stage's folder, only after its stack is down; nothing older is swept."""
+    keep = stack / "home-logs"  # the daemons' own logs live in the scratch HOME: keep them, they explain a STACK-BROKEN
+    for f in (stack / "home").rglob("*.log") if (stack / "home").is_dir() else []:
+        if f.is_file():
+            dst = keep / f.relative_to(stack / "home")
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(f, dst)
+    for name in STACK_SCRATCH:
+        target = stack / name
+        if target.is_dir() and not target.is_symlink():
+            shutil.rmtree(target, ignore_errors=True)
+
+
+def finding_key(text):
+    """Same files named in the findings two rounds running means the fix did not land (or the finding is wrong).
+    Follow-up items (review.md rule 5) are not findings."""
+    body = text.split("Findings:", 1)[-1].split("Follow-up:", 1)[0]
+    files = sorted(set(re.findall(r"([\w./-]+\.[A-Za-z]{1,4}):\d+", body)))
+    return hashlib.sha1(("|".join(files) or body[-400:] or text[-400:]).encode()).hexdigest()[:10]
+
+
+FOLLOWUP_PRIO = {"0": "priority/p1", "1": "priority/p1", "2": "priority/p2", "3": "priority/p3"}
+
+
+def file_followups(pr, vp, area=None):
+    """Every `Follow-up:` bullet in a verdict is a problem main already has that the PR does not cause. Each distinct one
+    becomes its own issue (at most 3 per verdict), labelled by its P level so pick_issue() takes the harmful ones first.
+    Filed keys are kept in STATE, so the same item is never filed twice for one PR."""
+    text, sp = (vp.read_text() if vp and vp.exists() else ""), state_path(pr)
+    if "Follow-up:" not in text or DRY:
+        return
+    st = json.loads(sp.read_text()) if sp.exists() else {}
+    if st.get("followup_issue") and "followups" not in st:
+        return  # filed under the older one-issue-per-PR rule: do not file its items again
+    filed, new = dict(st.get("followups") or {}), 0
+    for ln in text.split("Follow-up:", 1)[1].splitlines()[1:]:
+        if not ln.startswith("- "):
+            if ln.strip():
+                break
+            continue
+        key = re.sub(r":\d+", "", ln.strip())[:200]
+        if key in filed or new >= 3:
+            continue
+        parts = ln[2:].split(" - ")
+        lvl = re.match(r"P([0-3])\b", parts[0].strip())
+        labels = ["bug", FOLLOWUP_PRIO[lvl.group(1)] if lvl else "priority/p3"] + ([area] if area else [])
+        c = sh("gh", "issue", "create", "-R", REPO, "--title", f"Follow-up from #{pr}: {parts[1] if len(parts) > 1 else parts[0]}"[:120],
+               "--body", scrub(f"Found while reviewing #{pr}. main has the same problem and that PR does not cause it.\n\n{ln}"),
+               *[x for lb in labels for x in ("--label", lb)])
+        m = re.search(r"/issues/(\d+)", c.stdout)
+        ledger(pr=pr, stage="followup-issue", ok=bool(m), labels=labels, url=c.stdout.strip()[-80:], tail=(c.stderr or "")[-100:])
+        if m:
+            filed[key] = int(m.group(1))
+            new += 1
+    if new:
+        set_state(pr, followups=filed, followup_issue=st.get("followup_issue") or next(iter(filed.values())))
+
+
+def post_verdict(pr, kind, head, main, vp):
+    """One public verdict comment per stage kind and head; a rerun at the same head does not post again."""
+    sp = state_path(pr)
+    posted = (json.loads(sp.read_text()).get("posted") if sp.exists() else None) or []
+    key = f"{kind}@{head}"
+    if key in posted or not vp.exists():
+        return
+    verdict = parse_verdict(vp)
+    body = f"{MARK}verdict -->\nIndependent review, pinned head {head[:12]}, base {main[:12]}: {verdict}\n\n{scrub(vp.read_text())}"
+    if sh("gh", "pr", "comment", str(pr), "-R", REPO, "--body", body).returncode == 0:
+        set_state(pr, posted=(posted + [key])[-40:])
+
+
+def judged_by_current_rules(vp):
+    """True when no prompt or field-guide file (generic or per-project) changed after the verdict file was written."""
+    files = list(PROMPTS.glob("*.md")) + ([CFG.field_guide] if CFG.field_guide and CFG.field_guide.exists() else [])
+    return vp.stat().st_mtime >= max(f.stat().st_mtime for f in files)
+
+
+def review(pr, rnd, kind, model, post, old=None, extra="", fix_too=False):
+    """One fresh read-only reviewer at the PR's exact head. Returns (verdict, verdict_path, head)."""
+    info = pr_info(pr)
+    main = fetch(info)
+    head = branch_head(info)
+    if not contains_main(head, main):
+        return "BEHIND", None, head
+    d = WORK / "prs" / str(pr) / f"r{rnd}-{kind}"
+    vp = d / "verdict.md"
+    if vp.exists() and head in vp.read_text():  # resume: this exact head was already judged
+        v = parse_verdict(vp)
+        # A FAIL written before the newest prompt or field-guide edit is judged again: the rules it was judged by have changed
+        # (#1055, 11-16: a stale test count was a P2 FAIL, the guide made it P3, and the old FAIL was replayed six times).
+        if v != "FAIL" or DRY or judged_by_current_rules(vp):
+            return v, vp, head
+    if d.exists() and not DRY:
+        retire_wt(d)
+        d.rename(d.with_name(d.name + f".old{int(time.time())}"))
+    d.mkdir(parents=True, exist_ok=True)
+    wt = wt_for(d)
+    if not DRY:
+        make_wt(wt, head)
+        (d / "pr.md").write_text(f"# #{pr}: {info['title']}\n\nauthor: {info['author']['login']}\n\n{info['body'] or ''}\n")
+        (d / "issues.md").write_text(issues_text(info))
+    caps = CAPS[kind] + (CAPS["fix"] if fix_too else 0)
+    kv = dict(PR=pr, KIND=kind, HEAD=head, MAIN=main, WT=wt, DIR=d, EXTRA=extra, CALLS=caps, CALLS_SOFT=caps - 8,
+              SCRATCH_HOME=SCRATCH_HOME, SRC=src_path(wt), PY=PY)
+    if kind == "addendum":
+        kv.update(OLD=old, OLD_BASE=sh("git", "-C", str(CHECKOUT), "merge-base", old, main).stdout.strip())
+    brief = d / "brief.md"
+    if not DRY:
+        brief.write_text(render("addendum.md" if kind == "addendum" else "review.md", **kv)
+                         + (render("review-fix.md", **kv) if fix_too else ""))
+    res = run_agent(kind, model, brief, wt if wt.exists() else d, d, pr)  # start in the pinned worktree; outputs go to DIR
+    verdict = parse_verdict(vp) if not DRY else "DRY"
+    if fix_too and verdict == "PASS" and not DRY and self_changed(wt, head):  # never passes its own code: a fresh reviewer judges it
+        vp.write_text("FAIL\nThis reviewer passed the PR but also changed it; a fresh reviewer judges those changes.\n"
+                      + vp.read_text().split("\n", 1)[-1])
+        verdict = "FAIL"
+    if not DRY:
+        if not (fix_too and verdict == "FAIL"):  # a failed review-fix keeps its worktree: fix() checks and pushes from it
+            drop_wt(wt)
+        ledger(pr=pr, stage="verdict", kind=kind, round=rnd, head=head, verdict=verdict, model=model, **res)
+        if verdict and post:
+            post_verdict(pr, kind, head, main, vp)
+            if kind != "addendum":
+                file_followups(pr, vp)  # on any verdict, not only PASS
+    return verdict, vp, head
+
+
+def self_changed(wt, head):
+    """True when an agent committed or left edits in a worktree that started at head."""
+    if not wt.exists():
+        return False
+    moved = sh("git", "-C", str(wt), "rev-parse", "HEAD").stdout.strip() != head
+    return moved or bool(sh("git", "-C", str(wt), "status", "--porcelain", "--untracked-files=no").stdout.strip())
+
+
+def fix(pr, rnd, model, verdict_path, head, last_head, done_in=None, prompt="fix.md"):
+    """One fresh fixer. It commits locally in a worktree; this function pushes (ordinary push) when the checks pass."""
+    info = pr_info(pr)
+    if info["state"] != "OPEN":
+        return None, "PR is not open"
+    if info["isCrossRepository"]:
+        return None, "fork PR: only the author can push"
+    if branch_head(info) != head:
+        return None, "branch moved since the review"
+    if done_in:  # review-fix: the reviewer already fixed it in its own worktree; only the checks and the push run here
+        d, wt, res = done_in, wt_for(done_in), {}
+        if not wt.exists():
+            return None, "fixer made no commit"
+    else:
+        d = WORK / "prs" / str(pr) / f"r{rnd}-fix"
+        if d.exists() and not DRY:
+            retire_wt(d)
+            d.rename(d.with_name(d.name + f".old{int(time.time())}"))
+        d.mkdir(parents=True, exist_ok=True)
+        wt = wt_for(d)
+        if DRY:
+            run_agent("fix", model, d / "brief.md", d, d, pr)
+            return None, "dry run"
+        make_wt(wt, head)
+        (d / "pr.md").write_text(f"# #{pr}: {info['title']}\n\n{info['body'] or ''}\n")
+        (d / "issues.md").write_text(issues_text(info))
+        main = fetch(info)
+        state = "main is already merged in; nothing to resolve."
+        if not contains_main(head, main):
+            m = sh("git", "-C", str(wt), "merge", "--no-edit", "origin/main")
+            if m.returncode:
+                files = sh("git", "-C", str(wt), "diff", "--name-only", "--diff-filter=U").stdout.split()
+                state = ("`git merge origin/main` stopped with CONFLICTS. Resolve them first, keep both sides' intent, "
+                         f"`git commit --no-edit`. Conflicted files: {', '.join(files)}")
+            else:
+                state = "origin/main was merged in cleanly (merge commit made)."
+        brief = d / "brief.md"
+        brief.write_text(render(prompt, PR=pr, ROUND=rnd, HEAD=head, VERDICT=verdict_path.read_text()[:6000], VERDICT_DIR=(verdict_path.parent if verdict_path.name in ("verdict.md", "ui-verdict.md") else
+                                             "none: the script wrote this verdict itself (red CI, the merge gate, a conflict or the finding history)"),
+                                MERGE_STATE=state,
+                                WT=wt, DIR=d, BRANCH=info["headRefName"], SCRATCH_HOME=SCRATCH_HOME, SRC=src_path(wt), PY=PY,
+                                CALLS=CAPS["redesign" if prompt == "redesign.md" else "fix"], CALLS_SOFT=CAPS["redesign" if prompt == "redesign.md" else "fix"] - 10))
+        res = run_agent("fix", model, brief, wt, d, pr)
+    rep = d / "fix-report.md"
+    status = (rep.read_text().strip().splitlines()[-1] if rep.exists() and rep.read_text().strip() else "NO-REPORT")
+    new = sh("git", "-C", str(wt), "rev-parse", "HEAD").stdout.strip()
+    dirty = sh("git", "-C", str(wt), "status", "--porcelain", "--untracked-files=no").stdout.strip()
+    ledger(pr=pr, stage="fix", round=rnd, status=status, new_head=new, dirty=bool(dirty), model=model, **res)
+    nb = d / "new-pr-body.md"
+    if nb.exists():
+        e = sh("gh", "pr", "edit", str(pr), "-R", REPO, "--body-file", str(nb))
+        ledger(pr=pr, stage="pr-body", rc=e.returncode, tail=(e.stderr or e.stdout)[-160:])
+    try:
+        if status.startswith("BLOCKED") or status == "NO-REPORT":
+            return None, f"fixer said {status}"
+        if status == "DISPUTE":
+            return "DISPUTE", rep.read_text()[-3000:]
+        if dirty:
+            return None, "fixer left uncommitted changes"
+        if new == head:
+            if status == "FIXED" and nb.exists():
+                return head, "body-only fix posted"
+            return None, "fixer made no commit"
+        changed = sh("git", "-C", str(wt), "diff", "--name-only", f"{head}..{new}").stdout.split()
+        # A merge of main drags main's own files into head..new; a release commit there edits CHANGELOG.md.
+        # Blame the fixer only for a changelog file that is also in the PR's own delta (merge-base(main)..new).
+        if any(c in CFG.changelog_forbidden for c in own_delta(wt, new, changed)):
+            return None, "fixer edited a CHANGELOG file"
+        flagged = redfirst_flags(wt, head, new)
+        bad = ruff_added(wt, head, new, changed)
+        if bad:
+            return None, "ruff failed on lines the fix added: " + "; ".join(bad)[:200]
+        if branch_head(pr_info(pr)) != head:
+            return None, "branch moved while the fixer worked"
+        p = sh("git", "-C", str(wt), "push", "origin", f"HEAD:refs/heads/{info['headRefName']}", timeout=300)
+        if p.returncode:
+            return None, "push refused: " + p.stderr[-200:]
+        ledger(pr=pr, stage="push", round=rnd, head=new, redfirst_flags=flagged)
+        return new, ("red-first warning: " + ", ".join(flagged)) if flagged else "pushed"
+    finally:
+        drop_wt(wt)
+
+
+def own_delta(wt, new, changed):
+    """The PR's own files among `changed`: what a merge of main brought in does not count as the agent's work.
+    merge-base(origin/main, new)..new is the PR delta; a release commit's CHANGELOG.md on main is not in it."""
+    r = sh("git", "-C", str(wt), "diff", "--name-only", f"origin/main...{new}")
+    if r.returncode:  # no origin/main ref here: fall back to the raw range rather than skipping the guard
+        return changed
+    own = set(r.stdout.split())
+    return [c for c in changed if c in own]
+
+
+def ruff_added(wt, base, head, changed):
+    """Ruff findings that sit on lines this change added. Old violations in files it merely touched do not count."""
+    py = [c for c in changed if c.endswith(".py") and (wt / c).exists()]
+    if not py:
+        return []
+    r = sh(str(PY), "-m", "ruff", "check", "--output-format", "json", *[str(wt / c) for c in py],
+           cwd=wt, env=dict(os.environ, HOME=str(SCRATCH_HOME)))
+    try:
+        found = json.loads(r.stdout or "[]")
+    except ValueError:
+        return ["ruff output unreadable: " + (r.stdout or r.stderr)[-120:]]
+    added = {}
+    for c in py:
+        spans = []
+        for m in re.finditer(r"^@@ -\S+ \+(\d+)(?:,(\d+))? @@", sh("git", "-C", str(wt), "diff", "-U0", f"{base}..{head}", "--", c).stdout, re.M):
+            start, n = int(m.group(1)), int(m.group(2) or 1)
+            spans.append((start, start + n - 1))
+        added[str((wt / c).resolve())] = spans
+    out = []
+    for f in found:
+        spans = added.get(str(Path(f["filename"]).resolve()), [])
+        line = (f.get("location") or {}).get("row", 0)
+        if any(a <= line <= b for a, b in spans):
+            out.append(f"{Path(f['filename']).name}:{line} {f.get('code')} {f.get('message')}")
+    return out
+
+
+def redfirst_flags(wt, old, new):
+    """Test files the fixer added in an earlier commit and then edited again in a later one.
+    First parents only: commits a merge brings in (main, another branch) are not the fixer's."""
+    commits = sh("git", "-C", str(wt), "rev-list", "--reverse", "--first-parent", f"{old}..{new}").stdout.split()
+    added, flagged = set(), []
+    for c in commits:
+        for line in sh("git", "-C", str(wt), "show", "--name-status", "--format=", c).stdout.splitlines():
+            st, _, path = line.partition("\t")
+            if "test" not in path:
+                continue
+            if st == "A":
+                added.add(path)
+            elif st == "M" and path in added:
+                flagged.append(path)
+    return sorted(set(flagged))
+
+
+def ci_red(pr, head):
+    """One look, no waiting: the failed checks at this head when a required one is red, else []. Pending counts as not red."""
+    if DRY:
+        return []
+    info = gh_json("pr", "view", str(pr), "-R", REPO, "--json", "headRefOid,statusCheckRollup")
+    if info["headRefOid"] != head:
+        return []
+    bad = [c for c in info["statusCheckRollup"] if (c.get("conclusion") or c.get("state")) in ("FAILURE", "ERROR", "TIMED_OUT")]
+    bad = [c for c in bad if not land_owned(c)]
+    if any((c.get("name") or c.get("context")) in kit.CHECKS for c in bad):
+        return bad
+    # the merge step wants every check green, so a failing check outside the required set still blocks it (#1047 import-smoke);
+    # ci/tests shards roll up into ci/tests and count only through it
+    return [c for c in bad if not (c.get("name") or c.get("context") or "").startswith("ci/tests (")]
+
+
+def ci_rerun(pr, head, bad, why="fixer called the red CI flaky"):
+    """The fixer said a red check is flaky (does not reproduce, not in the PR's diff): rerun the failed jobs once per head and
+    wait for the result. False when this head was already rerun or nothing could be rerun, so the chain ends NEEDS-HUMAN."""
+    cur = json.loads(state_path(pr).read_text()) if state_path(pr).exists() else {}
+    done = cur.get("ci_reruns") or {}
+    if DRY or done.get(head):
+        return False
+    runs = sorted({m.group(1) for c in bad if (m := re.search(r"/runs/(\d+)/", c.get("detailsUrl") or ""))})
+    ok = [r for r in runs if sh("gh", "run", "rerun", r, "-R", REPO, "--failed").returncode == 0]
+    set_state(pr, ci_reruns={**done, head: len(ok)})
+    ledger(pr=pr, stage="ci-rerun", head=head, runs=ok)
+    if not ok:
+        return False
+    log(f"#{pr} {why}; reran failed jobs of run(s) {', '.join(ok)}; waiting")
+    time.sleep(90)  # let GitHub flip the rerun jobs to pending before they are read again
+    log(f"#{pr} CI after rerun: {wait_ci(pr, head)}")
+    return True
+
+
+FAILED_RE = re.compile(r"FAILED (\S+::\S+)")
+
+
+def failed_test_ids(bad):
+    """Test ids (`tests/x.py::name`) that failed in these checks' Actions jobs; None when a check has no job log."""
+    ids = set()
+    for c in bad:
+        m = re.search(r"/runs/(\d+)/job/(\d+)", c.get("detailsUrl") or "")
+        if not m:
+            return None
+        ids |= set(FAILED_RE.findall(sh("gh", "run", "view", m.group(1), "-R", REPO, "--job", m.group(2), "--log-failed", timeout=120).stdout))
+    return ids
+
+
+def main_failed_tests(n=6):
+    """Test ids that failed in main's last n CI runs."""
+    out = set()
+    for r in gh_json("run", "list", "-R", REPO, "--branch", "main", "--workflow", "ci.yml", "--limit", str(n), "--json", "databaseId,conclusion"):
+        if r.get("conclusion") == "failure":
+            out |= set(FAILED_RE.findall(sh("gh", "run", "view", str(r["databaseId"]), "-R", REPO, "--log-failed", timeout=180).stdout))
+    return out
+
+
+def main_flake_rerun(pr, head, bad):
+    """Every test failing at this head also failed on main lately, so it is not this PR's defect: rerun the failed jobs once
+    (the same once-per-head rerun a fixer can ask for) instead of spending a fixer round. True when that turned CI green.
+    #1057 on 11-14 went red on a network test main failed in 2 of its last 4 runs."""
+    ids = failed_test_ids(bad)
+    if not ids or DRY:
+        return False
+    flaky = main_failed_tests()
+    if not ids <= flaky:
+        return False
+    ledger(pr=pr, stage="ci-main-flake", head=head, tests=sorted(ids)[:5])
+    return ci_rerun(pr, head, bad, why="every failing test also failed on main lately (" + ", ".join(sorted(ids)[:2]) + ")") \
+        and not ci_red(pr, head)
+
+
+def ci_findings(pr, rnd, head, bad):
+    """Red CI becomes a findings file for the fixer, so no reviewer or vision model runs on a head whose tests fail."""
+    out = ["FAIL", f"head {head}", "Findings:"]
+    for c in bad:
+        name, m = c.get("name") or c.get("context"), re.search(r"/runs/(\d+)/job/(\d+)", c.get("detailsUrl") or "")
+        lines = []
+        if m:
+            log_ = sh("gh", "run", "view", m.group(1), "-R", REPO, "--job", m.group(2), "--log-failed", timeout=120).stdout
+            lines = [re.sub(r"^.*?Z ", "", ln)[:300] for ln in log_.splitlines() if re.search(r"FAILED |ERROR |Error:|\d+ failed", ln)][-25:]
+        else:  # a check run with no Actions job (CodeQL's results check, the dod check): its own summary is the evidence
+            lines = check_summary(c.get("detailsUrl"))
+        hint = ("make it pass; reproduce the failing tests locally first. Say BLOCKED when a failure does not reproduce and "
+                "nothing in this PR's diff touches it (a flaky test)")
+        if name == "CodeQL":  # CodeQL cannot run in a fix lane; without the alerts a fixer can only say BLOCKED (#1065)
+            lines += codeql_alerts(pr)
+            hint = ("CodeQL cannot run here; the open alerts below are its evidence. Fix each one in the code, or end DISPUTE "
+                    "with the evidence for an alert that is a false positive (only an owner can dismiss an alert)")
+        out.append(f"- P1 ci:0 - required CI check `{name}` is red at this head - {hint}")
+        out += ["    " + ln for ln in lines]
+    vp = WORK / "prs" / str(pr) / f"r{rnd}-ci.md"
+    vp.parent.mkdir(parents=True, exist_ok=True)
+    vp.write_text("\n".join(out) + "\n")
+    ledger(pr=pr, stage="ci-red", round=rnd, head=head, checks=[c.get("name") or c.get("context") for c in bad])
+    return vp
+
+
+GATE_LATER = ("threads_resolved", "base_current")  # the land step owns these: folds and review threads come later
+
+
+def check_summary(url):
+    """Title and summary lines of a check run that has no Actions job log (CodeQL's results check, the dod check).
+    [] when the link is not a check run or gh fails: evidence is best effort and never blocks the chain."""
+    m = re.search(r"/runs/(\d+)$", url or "")
+    if DRY or not m:
+        return []
+    try:
+        p = sh("gh", "api", f"repos/{REPO}/check-runs/{m.group(1)}", "--jq",
+               '[.output.title, .output.summary] | map(select(. != null)) | join("\\n")', timeout=60)
+    except RuntimeError:
+        return []
+    return [ln[:300] for ln in p.stdout.splitlines() if ln.strip()][:20]
+
+
+def codeql_alerts(pr):
+    """The PR's open CodeQL alerts as `rule path:line - message` lines. [] when gh fails."""
+    if DRY:
+        return []
+    jq = ('.[] | "\\(.rule.id) \\(.most_recent_instance.location.path):\\(.most_recent_instance.location.start_line) - '
+          '\\(.most_recent_instance.message.text | split("\\n")[0])"')
+    try:
+        p = sh("gh", "api", f"repos/{REPO}/code-scanning/alerts?ref=refs/pull/{pr}/head&state=open&per_page=50",
+               "--jq", jq, timeout=60)
+    except RuntimeError:
+        return []
+    return [ln[:300] for ln in p.stdout.splitlines() if ln.strip()][:25]
+
+
+def land_owned(c):
+    """A red dod/ready-for-review check whose only failed items are GATE_LATER ones: the land step owns those (the rule
+    gate_findings applies to the local run), so no fixer is handed a finding it cannot fix (#1065). The merge step still
+    needs the check green. An unreadable summary counts as not land-owned, so the check stays red."""
+    if (c.get("name") or c.get("context")) != "dod/ready-for-review":
+        return False
+    items = [ln[2:] for ln in check_summary(c.get("detailsUrl")) if ln.startswith("- ")]
+    return bool(items) and all(i.startswith(GATE_LATER) for i in items)
+
+
+def gate_findings(pr):
+    """Preflight: main's own merge-gate script (scripts/pr_gates_dod.py, the dod/ready-for-review check) run before any
+    reviewer, so a PR that cannot merge never reaches review, UI review or a person (#549 had no spec, 11-14).
+    Failures AND warnings are findings: the process is followed, not argued. A tool error never blocks."""
+    d = WORK / "gate"
+    d.mkdir(parents=True, exist_ok=True)
+    for src, dst in (("scripts/pr_gates_dod.py", "pr_gates_dod.py"), (".github/pr-gates.toml", "pr-gates.toml")):
+        (d / dst).write_text(sh("git", "-C", str(CHECKOUT), "show", f"origin/main:{src}").stdout)
+    p = sh(sys.executable, "-I", str(d / "pr_gates_dod.py"), "--config", str(d / "pr-gates.toml"), "--repo", REPO, "--pr", str(pr),
+           timeout=300)
+    if p.returncode not in (0, 1):
+        return []
+    items = []
+    for ln in p.stdout.splitlines():
+        if ln.startswith("Audited"):
+            break
+        if ln.startswith("- ") and not ln[2:].startswith(GATE_LATER):
+            items.append(ln[2:].strip())
+    return items
+
+
+def ci_runs_open(head):
+    """True when GitHub has a workflow run for this commit that is queued or running (CI is coming; nothing for a fixer).
+    Unreadable counts as open: never send a fixer on a guess (replay #1244 11-17: CI queued 40+ min on GitHub's side)."""
+    r = sh("gh", "run", "list", "-R", REPO, "--commit", head, "--json", "status", "--jq", '[.[] | select(.status != "completed")] | length')
+    return r.returncode != 0 or r.stdout.strip() not in ("0",)
+
+
+def ci_pending(pr, head):
+    """One look: True while a required check at this head has not finished and none has failed."""
+    info = gh_json("pr", "view", str(pr), "-R", REPO, "--json", "headRefOid,statusCheckRollup")
+    if info["headRefOid"] != head:
+        return False
+    res = kit.check_results(info["statusCheckRollup"])
+    need = [res.get(n) for n in kit.CHECKS]
+    if "CANCELLED" in need and rerun_cancelled(pr, head, info["statusCheckRollup"]):
+        return True
+    if any(v in ("FAILURE", "ERROR", "TIMED_OUT", "CANCELLED") for v in need):
+        return False
+    return any(v != "SUCCESS" for v in need)
+
+
+def rerun_cancelled(pr, head, rollup):
+    """A required check was cancelled (11-17: queued CI of PRs outside the focus was cancelled to free runners): rerun every
+    cancelled run at this head once, so no PR is reviewed or landed on CI that never ran. False when it was already rerun."""
+    st = json.loads(state_path(pr).read_text()) if state_path(pr).exists() else {}
+    done = st.get("cancel_reruns") or {}
+    if DRY or done.get(head):
+        return False
+    try:  # only the PR in focus: resume looks at every waiting PR, and rerunning them all would refill the queue just freed
+        if LIM["prs_at_once"] != math.inf and pr not in json.loads(FOCUS.read_text()):
+            return False
+    except (OSError, ValueError):
+        return False
+    runs = sorted({m.group(1) for c in rollup if (c.get("conclusion") or c.get("state")) == "CANCELLED"
+                   and (m := re.search(r"/runs/(\d+)/", c.get("detailsUrl") or ""))})
+    ok = [r for r in runs if sh("gh", "run", "rerun", r, "-R", REPO, "--failed").returncode == 0]
+    set_state(pr, cancel_reruns={**done, head: ok or ["none"]})
+    ledger(pr=pr, stage="ci-cancel-rerun", head=head, runs=ok)
+    log(f"#{pr} required CI was cancelled at {head[:8]}; reran {', '.join(ok) or 'nothing'}")
+    return bool(ok)
+
+
+def wait_ci(pr, head, minutes=45):
+    end = time.time() + minutes * 60
+    while time.time() < end and not DRY:
+        info = gh_json("pr", "view", str(pr), "-R", REPO, "--json", "headRefOid,statusCheckRollup,mergeStateStatus")
+        if info["headRefOid"] != head:
+            return "HEAD-MOVED"
+        res = kit.check_results(info["statusCheckRollup"])
+        need = {n: res.get(n) for n in kit.CHECKS}
+        if all(v == "SUCCESS" for v in need.values()):
+            return "GREEN"
+        if any(v in ("FAILURE", "ERROR", "TIMED_OUT", "CANCELLED") for v in need.values()):
+            return "RED " + ",".join(k for k, v in need.items() if v != "SUCCESS")
+        time.sleep(60)
+    return "GREEN" if DRY else "TIMEOUT"
+
+
+def land(pr, head, reviewer):
+    info = pr_info(pr)
+    author = info["author"]["login"]
+    approver = CFG.approver_of.get(author) or CFG.merger  # a non-author account approves the merge
+    if DRY:
+        log(f"[dry] would land #{pr} at {head[:8]}: approver {approver}, merger {kit.MERGER}")
+        return "DRY"
+    p = sh(sys.executable, str(ROOT / "agent-kit" / "land" / "land_pr.py"), str(pr), head, approver, head, reviewer, timeout=1500)
+    ledger(pr=pr, stage="land", rc=p.returncode, tail=(p.stdout + p.stderr)[-400:])
+    if p.returncode:
+        return "LAND-FAILED: " + (p.stdout + p.stderr)[-200:]
+    m = re.search(r"merge commit (\w{40})", p.stdout)
+    if m:
+        sh("git", "-C", str(CHECKOUT), "fetch", "-q", "origin", "main")
+        t1 = sh("git", "-C", str(CHECKOUT), "rev-parse", f"{m.group(1)}^2^{{tree}}").stdout.strip()
+        t2 = sh("git", "-C", str(CHECKOUT), "rev-parse", f"{head}^{{tree}}").stdout.strip()
+        ledger(pr=pr, stage="tree-check", same=(t1 == t2))
+        if t1 != t2:
+            return "MERGED-TREE-MISMATCH"
+    sh("git", "-C", str(CHECKOUT), "pull", "--ff-only", "-q")
+    return "MERGED"
+
+
+# ---------------------------------------------------------------- the loop
+def audit_extra(pr, wt_hint, first_head, head):
+    files = sorted((WORK / "prs" / str(pr)).glob("r*/verdict.md")) + sorted((WORK / "prs" / str(pr)).glob("r*/fix-report.md"))
+    listing = "\n".join(f"  - {f}" for f in files) or "  - none (the first review passed it untouched)"
+    return f"""## This is the final audit (you are the second pair of eyes)
+Earlier review agents reviewed this PR{', and fixer agents changed it' if first_head != head else ''}. They say it is ready. Audit their work; do not trust it.
+- Their verdicts and fix reports, oldest first (read them with `sed -n '1,80p'`):
+{listing}
+- Commits fixer agents added on top of the original head {first_head}: `git -C WT log --oneline {first_head}..{head}` (empty = no fixer ran).
+- For every earlier finding: confirm in the CODE that it is really fixed, not just claimed. For every fixer commit: red-first (a failing test
+  committed alone before the fix; the fix commit does not edit that test), nothing unrelated, no CHANGELOG edit, no secrets, no weakened assertion.
+- Then do your own complete review below as if you had not seen their verdicts.
+- In verdict.md add a line `Reviewer audit:` saying where an earlier reviewer or fixer was wrong or missed something, or `none`.
+"""
+
+
+DRIFT_TRIES = LIM["drift_tries"]  # how often one stage folds main in again when main moved under it, before the chain stops
+LAND_FIX_CAP = LIM["land_fix_cap"]  # landing-audit fixer runs per head on an approved PR (#1214), counted in STATE like `rests`
+CHANGELOG_RE = re.compile("^(?:" + "|".join(re.escape(c) for c in CFG.changelog_forbidden) +
+                          (rf"|{re.escape(CFG.fragment_dir)}/.+" if CFG.fragment_dir else "") + ")$")
+
+
+def main_only_move(old, new):
+    """True when old..new adds nothing but merges of main and changelog-entry commits (what fold.py and GitHub's
+    Update branch write). Needs origin/main and both commits fetched. The addendum reviewer checks the content."""
+    R = ("git", "-C", str(CHECKOUT))
+    if not old or old == new or sh(*R, "merge-base", "--is-ancestor", old, new).returncode:
+        return False
+    plain = sh(*R, "rev-list", "--no-merges", f"{old}..{new}", "--not", "origin/main")
+    merges = sh(*R, "rev-list", "--merges", f"{old}..{new}", "--not", "origin/main")
+    if plain.returncode or merges.returncode or not merges.stdout.split():
+        return False
+    for c in plain.stdout.split():  # a commit of the PR's own: only the changelog move is allowed
+        files = [f for f in sh(*R, "show", "--pretty=", "--name-only", c).stdout.splitlines() if f]
+        if not files or any(not CHANGELOG_RE.match(f) for f in files):
+            return False
+    for c in merges.stdout.split():  # every merge must bring in main, not some other branch
+        parents = sh(*R, "rev-list", "--parents", "-n", "1", c).stdout.split()[1:]
+        if not any(sh(*R, "merge-base", "--is-ancestor", p, "origin/main").returncode == 0 for p in parents):
+            return False
+    return True
+
+
+def audit_current(pr, a, tag, first_head):
+    """The full audit at the PR's current head. When main moved under it (BEHIND), fold main in and audit the new head.
+    Returns (verdict, path, head); verdict is CONFLICT when the fold conflicts and BEHIND when main kept moving."""
+    ghead = None
+    for _ in range(DRIFT_TRIES if DRIFT_TRIES != math.inf else 10**9):  # drift_tries -1 = no limit
+        g, gp, ghead = review(pr, tag, "gate", a.gate_model, not a.no_post,
+                              extra=audit_extra(pr, None, first_head, branch_head(pr_info(pr))))
+        if g != "BEHIND":
+            if g == "PASS":
+                file_followups(pr, gp)
+            return g, gp, ghead
+        log(f"#{pr} main moved before the audit could start: folding main in and auditing the new head")
+        ledger(pr=pr, stage="drift", where=f"audit {tag}", head=ghead)
+        if fold(pr, pr_info(pr)) is None:
+            return "CONFLICT", None, ghead
+    return "BEHIND", None, ghead
+
+
+def cover_moved_head(pr, a, old, tag, first_head):
+    """The head moved after `old` was audited. Moved only by merging main: the short merge-only addendum covers it.
+    Anything else, or an addendum that does not pass: the full audit. Returns (verdict, path, head, how)."""
+    info = pr_info(pr)
+    fetch(info)
+    cur = branch_head(info)
+    if main_only_move(old, cur):
+        g, gp, h = review(pr, tag, "addendum", a.gate_model, not a.no_post, old=old)
+        log(f"#{pr} merge-only addendum {old[:8]} -> {(h or cur)[:8]} ({a.gate_model}): {g}")
+        ledger(pr=pr, stage="addendum", old=old, head=h, verdict=g, model=a.gate_model)
+        if g in ("PASS", "BEHIND"):
+            return g, gp, h, "addendum"
+        log(f"#{pr} the addendum did not pass; running the full audit at the new head")
+    g, gp, h = audit_current(pr, a, tag, first_head)
+    ledger(pr=pr, stage="audit", n=tag, verdict=g, head=h, model=a.gate_model)
+    return g, gp, h, "audit"
+
+
+def carried_pass(pr, cur, review=False):
+    """review=True: the head an earlier run's REVIEW passed with no gate on it yet (#1223 11-16: a review PASS, a restart, then
+    a second full review): that review stands and the next run goes straight to the gate. A later FAIL voids it the same way."""
+    return _carried(pr, cur, review)
+
+
+def _carried(pr, cur, review):
+    """The head an EARLIER run audited as PASS, when the PR has only merged main since and no later verdict failed it.
+    Lets a new run cover the moved head with the short addendum instead of a full review plus audit (#1057, 11-14:
+    six full review+audit pairs passed the same diff while main moved nine times). None = review from scratch."""
+    d = WORK / "prs" / str(pr)
+    vs = sorted(list(d.glob("r*-review*/verdict.md")) + list(d.glob("r*-gate*/verdict.md")) + list(d.glob("r*-addendum*/verdict.md")),
+                key=lambda f: f.stat().st_mtime)
+    best = None
+    for v in vs:
+        w = parse_verdict(v)
+        m = re.search(r"(?m)^head ([0-9a-f]{40})\s*$", v.read_text())
+        if w == "FAIL":
+            best = None  # a later FAIL voids every earlier PASS
+        elif w == "PASS" and m and ("-review" in v.parent.name) == review:
+            best = m.group(1)
+    return best if best and (best == cur or main_only_move(best, cur)) else None
+
+
+REDESIGN_TRIES = LIM["redesign_tries"]  # strong redesign attempts before a whack-a-mole PR is STUCK
+REDESIGN_MODEL = "cmd:codex-sol-high"  # a strong agent triages and redesigns stuck PRs
+REST_STOP = LIM["rest_stop"]  # rests across all heads before a PR stops as STUCK (whack-a-mole: #1036 found a new hole 7 cycles running)
+
+
+def finding_history(pr, limit=15):
+    """Every distinct finding line from this PR's earlier FAIL verdicts, oldest first."""
+    seen, out = set(), []
+    for v in sorted((WORK / "prs" / str(pr)).glob("r*/verdict.md"), key=lambda f: f.stat().st_mtime):
+        t = v.read_text()
+        if not t.startswith("FAIL"):
+            continue
+        for ln in t.split("Findings:", 1)[-1].split("Follow-up:", 1)[0].splitlines():
+            key = re.sub(r":\d+", "", ln.strip())
+            if ln.startswith("- ") and key not in seen:
+                seen.add(key)
+                out.append(ln.strip()[:300])
+    return out[-limit:]
+
+
+def standing_approval(pr, info, st, cur):
+    """A person's approval of the screenshots at gate_head still covers `cur` when cur is that head or moved from it only by
+    merging main, and nothing a trusted person wrote after the approval asks for changes. So every end state keeps it:
+    #1057 (11-14) was approved, went CI-RED on a test main also fails, and its next run would have shot screenshots and asked
+    for the label again."""
+    gate = st["gate_head"]
+    if cur != gate:
+        fetch(info)
+        if not main_only_move(gate, cur):
+            return None
+    try:
+        kind, _ = human_signal(pr, st)
+    except Exception:  # noqa: BLE001 - GitHub unreadable: no approval, the normal run decides
+        return None
+    if kind != "approved":
+        return None
+    bad = ci_red(pr, cur)  # landing only re-reads a red check: #1184 (11-16) ended CI-RED 3 times, then needs-person, no fixer
+    if bad and not main_flake_rerun(pr, cur, bad):  # a test main also fails (#1057) is rerun and the approval stands
+        log(f"#{pr} approved, but required CI is red at {cur[:8]} on this PR's own tests: the normal run hands it to the fixer")
+        return None
+    log(f"#{pr} the approval of {gate[:8]} stands for {cur[:8]} (same code apart from merges of main): landing")
+    ledger(pr=pr, stage="approval-stands", gate_head=gate, head=cur)
+    return st
+
+
+def retire_head_verdicts(pr, cur):
+    """Retire the stored landing-audit and addendum verdicts that name `cur` (the same .old<ts> rename review() uses),
+    so the next run judges that head again instead of replaying a FAIL written before a text-only fix (#1214)."""
+    for d in (WORK / "prs" / str(pr)).glob("rland*"):
+        vp = d / "verdict.md"
+        if ".old" not in d.name and d.is_dir() and vp.exists() and cur in vp.read_text():
+            retire_wt(d)
+            d.rename(d.with_name(d.name + f".old{int(time.time())}"))
+
+
+def run_chain(pr, a, from_gate=False, approved=None, seed=None):
+    """One PR's chain. PR_CHAIN_ENGINE=flow runs it as flow.json dictates (chain_engine); the default stays the hand-written
+    loop below until the engine is proven on a real PR, then the loop is deleted (ENGINE.md, Proof before the switch)."""
+    for k in ("max_rounds", "max_audits", "max_ui"):  # --max-rounds -1 and friends: no limit, on both paths
+        if isinstance(getattr(a, k, None), int) and getattr(a, k) < 0:
+            setattr(a, k, math.inf)
+    if os.environ.get("PR_CHAIN_ENGINE", "py") == "flow":
+        return chain_engine.run(globals(), pr, a, from_gate=from_gate, approved=approved, seed=seed)
+    return _run_chain_py(pr, a, from_gate, approved, seed)
+
+
+def _run_chain_py(pr, a, from_gate=False, approved=None, seed=None):
+    """approved: the STATE of a PR whose screenshots a person approved (skip straight to CI and land).
+    seed: a verdict file (human feedback) that stands in for round 1's review, so the fixer takes it first."""
+    if STOPFILE.exists():
+        return die(pr, "STOPPED", f"STOP file present: {STOPFILE.read_text().strip()[:100]}")
+    if not claim(pr):  # another live chain owns it: touch nothing (die() would release its claim and overwrite its state)
+        log(f"#{pr} CLAIMED: another chain holds this PR; leaving it alone")
+        ledger(pr=pr, stage="claimed-skip")
+        return "CLAIMED"
+    prev = json.loads(state_path(pr).read_text()) if state_path(pr).exists() else {}  # how the last run ended
+    if not DRY:
+        set_state(pr, status="running", started=now(), why="", last_verdict="", ci_wait="", ci_settled=False)
+        chain_label(pr, None)  # the parked state clears while a chain runs; die() labels it again if it parks
+    info = pr_info(pr)
+    if info["state"] != "OPEN":
+        return die(pr, "CLOSED", f"PR is {info['state']}")
+    if info["author"]["login"] not in OUR_AUTHORS:
+        return die(pr, "NOT-OURS", "outside contributor PR: the chain only works on PRs opened by our own accounts")
+    ui = any(UI_RE.search(f["path"]) for f in info["files"])
+    first_head = branch_head(info)
+    st0 = json.loads(state_path(pr).read_text()) if state_path(pr).exists() else {}
+    rested = st0.get("rest_total") or 0
+    if not DRY and prev.get("chain_label") == NEEDS_PERSON_LABEL:
+        # owner_reason hands this PR out only after a person removed chain/needs-person (or a retry cap's head moved): start over
+        fresh = dict(retries={}, rest_total=0, rests={}, redesigns=0, stuck_lifts=0, stuck_head="") if prev.get("status") == "NEEDS-PERSON" else dict(retries={})
+        set_state(pr, **fresh)
+        st0 = dict(st0, **fresh)
+        rested = st0.get("rest_total") or 0
+        ledger(pr=pr, stage="needs-person-released", head=first_head)
+    elif not DRY and prev.get("status") == "STUCK" and (prev.get("stuck_head") or prev.get("head")) not in (None, "", first_head):
+        fetch(info)  # a STUCK from before 11-16 has no stuck_head: its last head stands in
+        if not main_only_move(prev.get("stuck_head") or prev["head"], first_head):  # a real push, not only a merge of main: what STUCK waited for
+            lifts = (prev.get("stuck_lifts") or 0) + 1
+            if lifts > LIM["stuck_lifts_max"]:
+                set_state(pr, head=first_head)
+                return die(pr, "NEEDS-PERSON", f"a new push lifted STUCK {lifts - 1} times and it came back each time; "
+                           f"remove the {NEEDS_PERSON_LABEL} label to let the chain try again")
+            set_state(pr, rest_total=0, rests={}, redesigns=0, stuck_lifts=lifts, stuck_head="")
+            st0, rested = dict(st0, rest_total=0, rests={}, redesigns=0), 0
+            log(f"#{pr} new push {first_head[:8]} lifts STUCK ({lifts} of {LIM['stuck_lifts_max']})")
+            ledger(pr=pr, stage="stuck-lifted", head=first_head, n=lifts)
+    if approved is None and not from_gate and seed is None and not DRY and ui and st0.get("gate_head") and st0.get("gate_at"):
+        approved = standing_approval(pr, info, st0, first_head)
+    if rested >= REST_STOP and not approved and not from_gate and (st0.get("redesigns") or 0) < REDESIGN_TRIES:  # `land` runs no review loop: no redesign, no STUCK (#1055, 11-16)
+        # whack-a-mole that the class note did not end: one strong agent redesigns the whole class before the PR is called STUCK
+        tries = (st0.get("redesigns") or 0) + 1
+        set_state(pr, redesigns=tries)
+        hv = WORK / "prs" / str(pr) / f"rd{tries}-history.md"
+        hv.write_text(f"FAIL\nhead {first_head}\nFindings:\n" + "\n".join(finding_history(pr, 25)) + "\n")
+        log(f"#{pr} rested {rested} times: redesign {tries} of {REDESIGN_TRIES} ({REDESIGN_MODEL})")
+        new_head, note = fix(pr, f"rd{tries}", resolve_cmd(REDESIGN_MODEL) if not DRY else REDESIGN_MODEL, hv, first_head, None,
+                             prompt="redesign.md")
+        ledger(pr=pr, stage="redesign", n=tries, head=new_head, note=(note or "")[:160])
+        if new_head and new_head != "DISPUTE":
+            set_state(pr, rest_total=0, rests={}, head=new_head)
+            rested, first_head = 0, new_head
+        else:
+            rested = REST_STOP  # the redesign could not land: STUCK below
+    if rested >= REST_STOP and not approved and not from_gate:
+        hist = finding_history(pr)
+        if not st0.get("stuck_issue") and hist and not DRY:
+            c = sh("gh", "issue", "create", "-R", REPO, "--label", "bug", "--title", f"Design needed: #{pr} keeps failing review in the same area"[:120],
+                   "--body", scrub(f"#{pr} came back {rested} times. Each fix closed one case and the next review found another, so the "
+                                   "approach itself needs a decision (for example an allowlist instead of blocking cases one by one).\n\n"
+                                   "Findings so far:\n" + "\n".join(hist)))
+            m = re.search(r"/issues/(\d+)", c.stdout)
+            if m:
+                set_state(pr, stuck_issue=int(m.group(1)))
+        if not DRY:  # parked at this head (owner_reason); a real new push lifts it at the top of the next run
+            set_state(pr, stuck_head=first_head, head=first_head)
+            iss = json.loads(state_path(pr).read_text()).get("stuck_issue")
+            sh("gh", "pr", "comment", str(pr), "-R", REPO, "--body", scrub(
+                f"{MARK}stuck head={first_head} -->\nThe chain stopped on this PR: it came back {rested} times with new findings in "
+                "the same area" + (f", so the approach needs a decision (#{iss})" if iss else "") + ". A new push that is more than a "
+                f"merge of main starts the chain again. After {LIM['stuck_lifts_max']} such restarts it waits for a person."))
+        return die(pr, "STUCK", f"rested {rested} times with new findings in the same area; design issue filed; a new push restarts it")
+    if seed is None and not from_gate and not approved and st0.get("ui_seed"):
+        if st0.get("head") == first_head and Path(st0["ui_seed"]).exists():
+            seed = Path(st0["ui_seed"])  # a failed final screenshot round: its findings go to the fixer first
+        set_state(pr, ui_seed="")
+    prev_key, extra, audits, rnd, ui_fails, drifts = None, "", 0, 0, 0, 0
+    if prev.get("status") == "WAITING-CI" and prev.get("ci_wait") == "review" and prev.get("ci_wait_round") and not from_gate and not approved:
+        rnd, prev_key = prev["ci_wait_round"] - 1, prev.get("ci_wait_key")  # parked for CI before its review: its round goes on
+    carried, covered = False, False  # carried: the earlier-PASS shortcut was used this run; covered: it passed
+    hist = finding_history(pr) if rested >= 2 else []
+    class_note = ""
+    if hist:  # whack-a-mole guard: every review in this run sees every earlier finding as one class
+        class_note = (f"This PR has come back {rested} times; each fix closed one case and the next review found another. Earlier findings:\n"
+                 + "\n".join(hist) + "\nTreat them as ONE class of defect. FAIL unless the design closes the whole class; when you fix, "
+                 "close the class (prefer allowing only known-safe cases over blocking dangerous ones one at a time).")
+    vp, ui_vp = None, None
+    need_ui = ui and not a.vision_ok  # a UI PR gets the vision review; --vision-ok says a person already did it
+    ready = from_gate or bool(approved)  # `land` skips the Haiku review and goes straight to the audit; an approval skips all review
+    if approved:
+        head, need_ui = approved["gate_head"], False
+    while not ready:
+        rnd += 1
+        if rnd > a.max_rounds:
+            return die(pr, "RESTING", f"round cap: no audited PASS after {a.max_rounds} rounds; the last fix is pushed and not reviewed yet; "
+                       "nothing to do by hand, the loop runs this PR again once its head is 45 min old")
+        if STOPFILE.exists():
+            return die(pr, "STOPPED", "STOP file")
+        fixed_in = None
+        if seed is not None:  # a person asked for changes: the fixer takes their comments before any new review
+            verdict, vp, head = "FAIL", seed, branch_head(pr_info(pr))
+            seed, src = None, "review replaced by a person's comments"
+            log(f"#{pr} human feedback goes to the fixer first ({vp.name})")
+        elif isinstance(folded := fold_or_red(pr), FoldRed):  # main merges in but tests fail: the fixer first, no reviewer
+            head = branch_head(pr_info(pr))
+            vp = WORK / "prs" / str(pr) / f"r{rnd}-fold-red.md"
+            vp.write_text(f"FAIL\nhead {head}\nFindings:\n- P1 fold:0 - tests fail once origin/main is merged into this branch - "
+                          "merge origin/main, reproduce, fix; say BLOCKED when main alone fails the same way\n"
+                          + "\n".join("    " + ln for ln in str(folded).splitlines()[-40:]) + "\n")
+            verdict, src = "FAIL", "review replaced by red tests in the fold"
+        elif folded is None:  # conflict: the fixer resolves it
+            vp = WORK / "prs" / str(pr) / f"r{rnd}-conflict.md"
+            vp.write_text("FAIL\nhead (conflict)\nFindings:\n- P1 merge-conflict:0 - the branch conflicts with main - "
+                          "`git merge origin/main` stops with conflicts; resolve them, keep both sides' intent\n")
+            verdict, head, src = "FAIL", branch_head(pr_info(pr)), "review replaced by a merge conflict"
+        elif (bad := ci_red(pr, branch_head(pr_info(pr)))) and not main_flake_rerun(pr, branch_head(pr_info(pr)), bad):
+            # red tests go to the fixer before any model reviews the head (a test main also fails is rerun once instead)
+            head = branch_head(pr_info(pr))
+            verdict, vp, src = "FAIL", ci_findings(pr, rnd, head, bad), "review replaced by red CI"
+            red_bad = bad
+        elif (gbad := gate_findings(pr)):  # the merge gate first: a PR that cannot merge gets no review yet
+            head = branch_head(pr_info(pr))
+            vp = WORK / "prs" / str(pr) / f"r{rnd}-gates.md"
+            vp.write_text(f"FAIL\nhead {head}\nFindings:\n" + "".join(
+                f"- P1 gates:0 - {g} - the merge gate (scripts/pr_gates_dod.py, check dod/ready-for-review) reports it. Fix the PR: "
+                "a feature needs a docs/specs file from docs/specs/TEMPLATE.md, a fix needs a Fix brief section (docs/specs/FIX_BRIEF.md), "
+                "PR body problems go in new-pr-body.md. A false positive (an id that is not a finding): say so with evidence, end BLOCKED\n"
+                for g in gbad))
+            verdict, src = "FAIL", "review replaced by the merge gates"
+            ledger(pr=pr, stage="gates", round=rnd, head=head, items=gbad)
+        elif not DRY and ci_pending(pr, branch_head(pr_info(pr))):
+            # flow.json ci_pending_wait: no agent judges a head while its required checks still run; the slot is freed
+            h = branch_head(pr_info(pr))  # ci_wait_at: when this head started waiting; resume hands it to a fixer after the limit
+            set_state(pr, ci_wait="review", head=h, ci_wait_at={h: (st0.get("ci_wait_at") or {}).get(h) or time.time()},
+                      ci_wait_round=rnd, ci_wait_key=prev_key)  # the next run goes on from this round
+            return die(pr, "WAITING-CI", "required checks still running; the review starts once none is pending")
+        elif not carried and not DRY and not extra and (old := carried_pass(pr, branch_head(pr_info(pr)))):
+            # an earlier run audited `old` as PASS and only main moved since: the merge-only addendum covers the new head
+            # (cover_moved_head falls back to the full audit by itself when the addendum does not pass)
+            if old == branch_head(pr_info(pr)):  # this very head was audited as PASS in an earlier run: nothing to review again
+                verdict, vp, head, src, carried, covered = "PASS", None, old, f"earlier audit of this head {old[:8]} stands", True, True
+            else:
+                g, gp, h, how = cover_moved_head(pr, a, old, f"{rnd}c", first_head)
+                verdict, vp, head, src = ("BEHIND" if g == "CONFLICT" else g), gp, h, f"earlier audit of {old[:8]} carried by {how}"
+                carried, covered = g not in ("BEHIND", "CONFLICT"), g == "PASS"
+        elif not carried and not DRY and not extra and (rold := carried_pass(pr, branch_head(pr_info(pr)), review=True)):
+            # an earlier run's review passed `rold`, no gate ran on it, only main moved since: no second review, the gate audits it
+            head = branch_head(pr_info(pr))
+            verdict, vp, src, carried, covered = "PASS", None, f"earlier review PASS of {rold[:8]} stands", True, False
+        else:
+            verdict, vp, head = review(pr, rnd, "review", a.review_model, not a.no_post,
+                                       extra=(class_note + "\n\n" + extra).strip(), fix_too=True)
+            src = f"{a.review_model} review"
+            fixed_in = WORK / "prs" / str(pr) / f"r{rnd}-review"  # the reviewer fixed its own FAIL there (review-fix)
+            covered = False  # a full review ran: its PASS gets the normal audit
+        log(f"#{pr} round {rnd} {src}: {verdict} at {head[:8] if head else '?'}")
+        if DRY:
+            log("[dry] stopping after the review launch line; no fixer, audit or land in a dry run")
+            release(pr)
+            return "DRY"
+        set_state(pr, round=rnd, head=head, last_verdict=verdict)
+        if verdict == "BEHIND":  # main moved between the fold and the review: no reviewer ran, so fold again
+            drifts += 1
+            ledger(pr=pr, stage="drift", where=f"review {rnd}", head=head)
+            if drifts > DRIFT_TRIES:
+                return die(pr, "MAIN-MOVING", f"main moved {drifts} times before a review could start; rerun the chain")
+            rnd -= 1
+            continue
+        if verdict is None:
+            return die(pr, "NO-VERDICT", "reviewer wrote no PASS/FAIL line; see " + str(WORK / "prs" / str(pr)))
+        if verdict == "PASS":
+            file_followups(pr, vp)
+            # Haiku says ready. Only now does the Opus audit run (once per ready claim, at most --max-audits per PR).
+            if not a.no_gate and not covered:  # covered: the addendum (or its fallback audit) already judged this head
+                if audits >= a.max_audits:
+                    return die(pr, "RESTING", f"the audit failed {audits} times")
+                audits += 1
+                g, gp, ghead = audit_current(pr, a, f"{rnd}a{audits}", first_head)
+                log(f"#{pr} audit {audits} ({a.gate_model}): {g}")
+                ledger(pr=pr, stage="audit", n=audits, verdict=g, head=ghead, model=a.gate_model)
+                if g == "PASS":
+                    head = ghead
+                elif g == "FAIL":
+                    vp, verdict, head, fixed_in = gp, "FAIL", ghead, None  # the audit's findings go to the next fixer
+                elif g == "CONFLICT":  # main moved and now conflicts: no audit ran; the loop top hands it to the fixer
+                    audits -= 1
+                    continue
+                elif g == "BEHIND":
+                    return die(pr, "MAIN-MOVING", f"main moved {DRIFT_TRIES} times before the audit could start; rerun the chain")
+                else:
+                    return die(pr, "NO-VERDICT", f"audit wrote no PASS/FAIL line; see {gp}")
+            if verdict == "PASS":
+                if not need_ui:
+                    ready = True
+                    break
+                # UI PR: a vision model runs ui-slop-review on screenshots and assumes the UI is wrong
+                uv, uvp, uhead = ui_review(pr, rnd, head, a)
+                log(f"#{pr} UI review ({a.ui_model}): {uv} at {uhead[:8] if uhead else '?'}")
+                ledger(pr=pr, stage="ui-review", n=rnd, verdict=uv, head=uhead, model=a.ui_model)
+                # A UI FAIL loops inside this step: fixer takes the UI findings, the UI review runs again on the new
+                # head. The code review and audit do not rerun per lap; one audit covers the final head after UI PASS.
+                audited = head
+                while uv == "FAIL":
+                    ui_fails += 1
+                    if ui_fails > a.max_ui:
+                        return die(pr, "RESTING", f"the UI review failed {ui_fails} times; see {uvp}")
+                    if STOPFILE.exists():
+                        return die(pr, "STOPPED", "STOP file")
+                    tag = f"{rnd}u{ui_fails}"  # no same-files stop here: UI laps often name one file; --max-ui caps them
+                    new_head, note = fix(pr, tag, a.fix_model, uvp, uhead or head, None)
+                    log(f"#{pr} UI fix {ui_fails}: {new_head or 'none'} ({note})")
+                    ledger(pr=pr, stage="ui-fix", n=ui_fails, head=new_head, note=note[:160])
+                    if new_head is None or new_head == "DISPUTE":
+                        return die(pr, "RESTING", "UI fixer " + ("disputed the UI findings; see " + str(uvp)
+                                                                     if new_head else "produced nothing usable: " + note))
+                    head = new_head
+                    set_state(pr, head=head, last_verdict="UI-FIXED")
+                    uv, uvp, uhead = ui_review(pr, tag, head, a)
+                    log(f"#{pr} UI review after fix {ui_fails} ({a.ui_model}): {uv} at {uhead[:8] if uhead else '?'}")
+                    ledger(pr=pr, stage="ui-review", n=tag, verdict=uv, head=uhead, model=a.ui_model)
+                if uv != "PASS":
+                    # No NOT-SHOWN here since 11-16: a reviewer that cannot get THE shot FAILs with a fix agents can
+                    # make (a proof or a tmux spec that shows it), and a NOT-SHOWN file parses as no verdict (retried).
+                    return die(pr, "UI-NO-VERDICT" if uv != "STACK-DOWN" else "BUILD-FAILED",
+                               f"UI review gave {uv}; see {uvp}")
+                file_followups(pr, uvp)
+                head, ui_vp = uhead or head, uvp
+                if head == audited or a.no_gate:
+                    need_ui, ready = False, True
+                    break
+                # the UI fixes moved the head past the audited one: one audit of the final head
+                # (not counted against --max-audits: it follows a UI PASS; --max-rounds and --max-ui bound it)
+                g, gp, ghead = audit_current(pr, a, f"{rnd}a{audits}u{ui_fails}", first_head)
+                log(f"#{pr} audit after the UI fixes ({a.gate_model}): {g}")
+                ledger(pr=pr, stage="audit", n=f"{audits}u{ui_fails}", verdict=g, head=ghead, model=a.gate_model, after="ui-fix")
+                if g == "PASS":
+                    need_ui = ghead != head  # main was folded in under the audit: the landing step reshoots that head
+                    head, ready = ghead, True
+                    break
+                if g != "FAIL":
+                    return die(pr, "MAIN-MOVING" if g in ("BEHIND", "CONFLICT") else "NO-VERDICT",
+                               f"audit after the UI fixes gave {g}; see {gp}")
+                vp, verdict, head = gp, "FAIL", ghead  # a UI fix broke code: findings go to the fixer, then a full lap
+        key = finding_key(vp.read_text())
+        if key == prev_key:
+            return die(pr, "RESTING", "the same findings came back two rounds in a row")
+        prev_key = key
+        if fixed_in:
+            new_head, note = fix(pr, rnd, a.fix_model, vp, head, None, done_in=fixed_in)
+            if new_head is None and not (note or "").startswith("fixer said BLOCKED"):
+                log(f"#{pr} round {rnd} review-fix gave nothing usable ({note}); the plain fixer takes it")
+                new_head, note = fix(pr, rnd, a.fix_model, vp, head, None)
+        else:
+            new_head, note = fix(pr, rnd, a.fix_model, vp, head, None)
+        log(f"#{pr} round {rnd} fix: {new_head or 'none'} ({note})")
+        if new_head == "DISPUTE":
+            extra = "A previous fixer disputed the earlier findings with this evidence; judge it on the merits:\n" + note
+            continue
+        extra = ""
+        if new_head is None and src == "review replaced by red CI" and "BLOCKED" in (note or "") and ci_rerun(pr, head, red_bad):
+            prev_key, extra, rnd = None, "", rnd - 1  # a flaky red test: one rerun of the failed jobs per head, not a round
+            continue
+        if new_head is None and (note or "").startswith("fixer said BLOCKED POLICY"):
+            return die(pr, "POLICY-HOLD", note)  # the only fix breaks a project rule, or the PR declares its own hold
+        if new_head is None and (note or "").startswith("fixer said BLOCKED") and not src.startswith("review replaced"):
+            # The fixer says a model's finding cannot be fixed here (#1012: an OS limit main shares). The next reviewer weighs
+            # that evidence under review.md rule 5; the same findings again end it below as NEEDS-HUMAN.
+            rep = (fixed_in or WORK / "prs" / str(pr) / f"r{rnd}-fix") / "fix-report.md"  # review-fix reports in its review dir
+            extra = ("A previous fixer could not fix the earlier findings at this same head and gave the evidence below. "
+                     "Weigh it with rule 5's Follow-up test; a finding that still fits FAIL stays FAIL:\n"
+                     + (rep.read_text()[-3000:] if rep.exists() else note))
+            continue
+        if new_head is None:
+            return die(pr, "RESTING", f"fixer produced nothing usable: {note}")
+    # Ready (Haiku PASS + Opus audit PASS + UI PASS at this head, unless skipped by flags). Then, as often as main moves
+    # (up to DRIFT_TRIES): fold main in, cover the moved head (merge-only addendum, or the full audit), CI, land.
+    if from_gate and not a.no_gate and not approved:  # `land`: no audit ran in this process yet
+        if fold(pr, pr_info(pr)) is None:
+            return die(pr, "RESTING", "conflict with main")
+        g, gp, head = audit_current(pr, a, "land", first_head)
+        ledger(pr=pr, stage="audit", n="land", verdict=g, head=head, model=a.gate_model)
+        if g != "PASS":
+            return die(pr, "RESTING" if g == "FAIL" else "MAIN-MOVING" if g in ("BEHIND", "CONFLICT") else "NO-VERDICT",
+                       f"audit verdict {g}; see {gp}")
+    reviewer = f"{a.review_model} review, {a.gate_model} audit" + (f", {a.ui_model} UI review" if ui_vp else "")
+    tries = 0
+    while True:
+        tries += 1
+        if STOPFILE.exists():
+            return die(pr, "STOPPED", "STOP file")
+        if not DRY:
+            if fold(pr, pr_info(pr)) is None:
+                return die(pr, "RESTING", "conflict with main after the " + ("human approval" if approved else "audit"))
+            cur = branch_head(pr_info(pr))
+            if cur != head:  # the head moved after the audit (main folded in, or a push): the audit does not cover it
+                g, gp, covered, how = cover_moved_head(pr, a, head, f"land{tries}", first_head)
+                if g in ("BEHIND", "CONFLICT") and tries < DRIFT_TRIES:
+                    continue  # main moved again before the reviewer could start: fold again; `head` stays the audited one
+                if g == "PASS":
+                    shot_head, head = head, covered
+                elif g == "FAIL" and approved:
+                    # The approved path has no review loop to hand the audit's findings to a fixer, so it rested and
+                    # replayed the same FAIL at the same head forever (#1214; #1055 rested 3x on a stale count).
+                    st = json.loads(state_path(pr).read_text())
+                    nfix = (st.get("land_fixes") or {}).get(cur, 0)
+                    if nfix >= LAND_FIX_CAP:  # a whack-a-mole audit at one head rests instead of burning fixers
+                        set_state(pr, head=cur)
+                        return die(pr, "RESTING", f"{how} of the moved head failed after {nfix} landing fixes at {cur[:8]}; see {gp}")
+                    set_state(pr, land_fixes={cur: nfix + 1}, head=cur)
+                    new_head, note = fix(pr, f"land{tries}", a.fix_model, gp, cur, None)
+                    log(f"#{pr} landing fix {nfix + 1} of {LAND_FIX_CAP}: {new_head or 'none'} ({note})")
+                    ledger(pr=pr, stage="land-fix", n=nfix + 1, head=new_head, note=(note or "")[:160])
+                    if new_head is None or new_head == "DISPUTE":
+                        return die(pr, "RESTING", f"{how} of the moved head: FAIL; the landing fixer "
+                                   + (f"disputed the findings; see {gp}" if new_head else f"produced nothing usable: {note}"))
+                    if new_head != cur and not main_only_move(cur, new_head):  # code pushed: the approval stands for no head but its own; STATE.head stays at the
+                        # audited head, so `pick` sees the pushed head as new and free and the next run reviews it from the top
+                        if not DRY:  # the push is a fresh attempt on a PR that had converged: earlier rests must not start the redesign before it is reviewed
+                            set_state(pr, rest_total=0, rests={})
+                        return die(pr, "RESTING", f"the landing fixer pushed code ({cur[:8]} -> {new_head[:8]}): "
+                                   "the approval does not stand for the new head; the next run reviews it from the top")
+                    if new_head != cur:  # #1101 11-16 20:46: the head was behind main when the fixer started, so its push was only a merge of main: not code, the approval stands
+                        log(f"#{pr} the landing fixer's push only merged main ({cur[:8]} -> {new_head[:8]}): the approval stands")
+                    retire_head_verdicts(pr, cur)  # a text-only fix: the FAIL just fixed must not be replayed at this head
+                    continue  # the approval keeps standing: cover the same head again, the audit runs anew
+                else:
+                    if not DRY:  # rest and retry counters key on the head the PR has now: with the run's start head `pick` saw a "new head" every lap (#1055, 11-16: six rests in ten minutes)
+                        set_state(pr, head=cur)
+                    return die(pr, "RESTING" if g == "FAIL" else "MAIN-MOVING" if g in ("BEHIND", "CONFLICT") else "NO-VERDICT",
+                               f"{how} of the moved head: {g}; see {gp}")
+                if how == "addendum" and "addendum" not in reviewer:
+                    reviewer += f", {a.gate_model} merge-only addendum"
+                if ui and ui_vp and not approved and not a.vision_ok:
+                    # The screenshots belong to an older head. They still hold when the head moved only by merging main and
+                    # main brought in no UI file (#1057, 11-14: UI PASS, then a reshoot of the same screen at a main-only
+                    # merge gave FAIL). Anything else, or a diff git cannot compute: shoot the new head.
+                    dm = sh("git", "-C", str(CHECKOUT), "diff", "--name-only", shot_head, head)
+                    need_ui = how != "addendum" or dm.returncode != 0 or any(UI_RE.search(f) for f in dm.stdout.split())
+                    if not need_ui:
+                        log(f"#{pr} UI verdict of {shot_head[:8]} carries to {head[:8]}: main brought in no UI file")
+                        ledger(pr=pr, stage="ui-carried", old=shot_head, head=head)
+            if need_ui:  # `land` path, or the head moved: UI review at the final head
+                uv, uvp, uhead = ui_review(pr, "final", head, a)
+                ledger(pr=pr, stage="ui-review", n="final", verdict=uv, head=uhead, model=a.ui_model)
+                if uv != "PASS":
+                    if uv == "FAIL":  # the next run's fixer takes these UI findings before any review (#1012, 11-13)
+                        set_state(pr, ui_seed=str(uvp), head=uhead or head)
+                    return die(pr, "RESTING" if uv == "FAIL" else "UI-NO-VERDICT", f"UI review {uv}; see {uvp}")
+                file_followups(pr, uvp)
+                head, ui_vp, need_ui = uhead or head, uvp, False
+        set_state(pr, status="READY", head=head, why="")
+        if ui and not a.vision_ok and not approved and not a.no_human:
+            return human_gate(pr, head, ui_vp, a)  # screenshots on the PR; a person approves or comments
+        if not a.land:
+            return die(pr, "READY", f"review PASS + audit PASS at {head[:8]}; rerun with --land to approve and merge")
+        if not DRY and ci_pending(pr, head):  # watching CI is no work for a slot: resume lands it once CI finishes
+            set_state(pr, gate_head=head, reviewer=reviewer)
+            return die(pr, "WAITING-CI", f"required checks still running at {head[:8]}; the slot is free, resume lands it after CI")
+        ci = wait_ci(pr, head)
+        log(f"#{pr} CI: {ci}")
+        if ci.startswith("RED") and (bad := ci_red(pr, head)) and main_flake_rerun(pr, head, bad):
+            ci = wait_ci(pr, head)  # a test main also fails, rerun once and green now
+            log(f"#{pr} CI after the rerun: {ci}")
+        if ci == "HEAD-MOVED" and tries < DRIFT_TRIES:
+            ledger(pr=pr, stage="drift", where="ci", head=head)
+            continue
+        if ci != "GREEN":
+            return die(pr, "CI-" + ci.split()[0], f"required checks: {ci}")
+        r = land(pr, head, reviewer)
+        if r.startswith("LAND-FAILED") and re.search(r"is (BEHIND|DIRTY)|not up to date with the base branch", r) and tries < DRIFT_TRIES:
+            log(f"#{pr} main moved while CI ran (try {tries} of {DRIFT_TRIES}): folding main in again")
+            ledger(pr=pr, stage="drift", where="land", head=head)
+            continue
+        if r.startswith("LAND-FAILED") and "not green" in r and "FAILURE" in r:  # a red check: the fixer's job, not a person's
+            return die(pr, "CI-RED", r[:200])
+        return die(pr, "MERGED" if r == "MERGED" else "LAND-STOPPED", r)
+
+
+# ---------------------------------------------------------------- intake: issue -> PR, scout -> issues
+def issue_dir(n):
+    d = WORK / "issues" / str(n)
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def issue_set(n, **kw):
+    p = issue_dir(n) / "STATE.json"
+    cur = json.loads(p.read_text()) if p.exists() else {}
+    cur.update(kw, updated=now())
+    p.write_text(json.dumps(cur, indent=1))
+
+
+def issue_end(n, status, why, **kw):
+    log(f"issue #{n} {status}: {why}")
+    issue_set(n, status=status, why=why, **kw)
+    ledger(issue=n, stage="issue-end", status=status, why=why)
+    release(f"i{n}")
+    return status
+
+
+def excluded_issues():
+    out = {}
+    if EXCLUDE_ISSUES.exists():
+        for line in EXCLUDE_ISSUES.read_text().splitlines():
+            m = re.match(r"\s*(\d+)\s*(.*)", line)
+            if m:
+                out[int(m.group(1))] = m.group(2) or "excluded"
+    return out
+
+
+def issue_owner_reason(i, taken, ps_text):
+    n = i["number"]
+    names = {lb["name"] for lb in i["labels"]}
+    if n in excluded_issues():
+        return "excluded: " + excluded_issues()[n]
+    if names & BLOCK_LABELS:
+        return "label " + ",".join(sorted(names & BLOCK_LABELS))
+    if not names & {"bug", "status/ready-for-agent", "status/accepted"}:
+        return "not marked bug, accepted or ready-for-agent (new UX/features need a mockup first)"
+    if i.get("assignees"):
+        return "assigned to " + i["assignees"][0]["login"]
+    if n in taken:
+        return taken[n]
+    claim_dir = CLAIMS / f"i{n}"
+    if claim_dir.exists() and pid_alive((claim_dir / "pid").read_text().strip() if (claim_dir / "pid").exists() else ""):
+        return "claimed by a live chain"
+    sp = WORK / "issues" / str(n) / "STATE.json"
+    if sp.exists() and json.loads(sp.read_text()).get("status") in ("BUILD-FAILED", "BLOCKED", "PR-OPENED"):
+        return "chain already tried it: " + json.loads(sp.read_text()).get("why", "")[:60]
+    if re.search(rf"(lane|issue)-{n}\b", ps_text):
+        return "running agent process mentions it"
+    return None
+
+
+def pick_issue(a=None):
+    """The next open issue nobody is working on (no open PR, no branch, no agent), or None."""
+    issues = gh_json("issue", "list", "-R", REPO, "--state", "open", "--limit", "500", "--json",
+                     "number,title,labels,assignees")
+    prs = gh_json("pr", "list", "-R", REPO, "--state", "open", "--limit", "100", "--json",
+                  "number,title,body,headRefName,closingIssuesReferences")
+    taken = {}
+    for p in prs:
+        for n in linked_issues(p):
+            taken[n] = f"open PR #{p['number']} covers it"
+    heads = sh("git", "-C", str(CHECKOUT), "ls-remote", "--heads", "origin").stdout
+    for x in re.findall(r"refs/heads/\S*issue-(\d+)", heads):
+        taken.setdefault(int(x), "a remote branch named for it exists")
+    ps_text = sh("/bin/ps", "-axo", "command").stdout
+
+    def prio(i):
+        # Priority label first, so a p0 bug is built before a ready-for-agent p3; oldest first within a level.
+        names = [lb["name"] for lb in i["labels"]]
+        return (label_prio(names), 0 if "status/ready-for-agent" in names else 1, 0 if "bug" in names else 1, i["number"])
+    rows = []
+    for i in sorted(issues, key=prio):  # every open issue until a free one turns up: a fixed window of 60 hid 66 free issues on 11-16
+        rows.append((i, issue_owner_reason(i, taken, ps_text)))
+        if len(rows) >= 12 and any(not why for _, why in rows):
+            break
+    for i, why in rows[:12]:
+        print(f"issue {i['number']:>5} {i['title'][:60]:60} {why or 'FREE'}")
+    free = [i for i, why in rows if not why]
+    pick_issue.prio = label_prio(free[0]["labels"]) if free else 9
+    print(f"\nnext issue: #{free[0]['number']}" if free else "\nno free issue")
+    return free[0]["number"] if free else None
+
+
+DISK_FLOOR_GB = float(os.environ.get("PR_CHAIN_DISK_FLOOR_GB", "5"))  # start nothing new on this machine under 5 GB free
+
+
+def build_issue(n, a):
+    """One fresh builder turns an issue into commits in its own worktree; this script checks, pushes and opens the DRAFT PR."""
+    if STOPFILE.exists():
+        return "STOPPED"
+    if NO_BUILD.exists():
+        return f"BLOCKED: issue building is off (remove {NO_BUILD.name}; toggle on the board /config page)"
+    free = shutil.disk_usage(WORK).free / 1e9
+    if free < DISK_FLOOR_GB:  # "skipped" makes the loop back off like any empty auto run
+        return f"skipped: only {free:.1f} GB free on this Mac, under the {DISK_FLOOR_GB:g} GB floor; building waits"
+    # every PR is WAITING-CI when CI is jammed, so auto finds no free PR and builds: 23 new PRs vs 10 merges on 11-17
+    opened = sum(1 for p in gh_json("pr", "list", "-R", REPO, "--state", "open", "--limit", "500", "--json", "author")
+                 if (p.get("author") or {}).get("login") in OUR_AUTHORS)
+    if opened >= LIM["max_open_prs"]:
+        return f"skipped: {opened} chain PRs are open (cap {LIM['max_open_prs']:g}, flow.json max_open_prs); building waits"
+    if not claim(f"i{n}"):
+        return "CLAIMED"
+    d = issue_dir(n)
+    info = gh_json("issue", "view", str(n), "-R", REPO, "--json", "number,title,body,state")
+    if info["state"] != "OPEN":
+        return issue_end(n, "CLOSED", f"issue is {info['state']}")
+    sh("git", "-C", str(CHECKOUT), "fetch", "-q", "origin", "main", check=True)
+    main = sh("git", "-C", str(CHECKOUT), "rev-parse", "origin/main", check=True).stdout.strip()
+    slug = re.sub(r"[^a-z0-9]+", "-", info["title"].lower()).strip("-")[:40].strip("-") or "fix"
+    branch = f"fix/issue-{n}-{slug}"
+    wt = wt_for(d)
+    if DRY:
+        log(f"[dry] would build issue #{n} on {branch} from {main[:8]} with {a.build_model}")
+        run_agent("build", a.build_model, d / "brief.md", d, d, f"i{n}")
+        release(f"i{n}")
+        return "DRY"
+    if sh("git", "-C", str(CHECKOUT), "ls-remote", "--heads", "origin", branch).stdout.strip():
+        return issue_end(n, "BUILD-FAILED", f"branch {branch} already exists on origin")
+    if wt.exists():
+        d_old = d.with_name(f"{d.name}.old{int(time.time())}")
+        drop_wt(wt)
+        if wt.exists():
+            return issue_end(n, "BUILD-FAILED", f"leftover worktree {wt}; `pr-chain clean` it")
+        d.rename(d_old)
+        d = issue_dir(n)
+        wt = wt_for(d)
+    sh("git", "-C", str(CHECKOUT), "branch", "-D", branch)  # a stale local branch from an earlier try, never pushed
+    make_wt(wt, main, branch=branch)
+    issue_set(n, status="building", branch=branch, base=main)
+    (d / "issue.md").write_text(f"# #{n}: {info['title']}\n\n{info['body'] or ''}\n")
+    brief = d / "brief.md"
+    brief.write_text(render("build.md", ISSUE=n, DIR=d, WT=wt, BRANCH=branch, MAIN=main, SCRATCH_HOME=SCRATCH_HOME, PY=PY,
+                            SRC=src_path(wt), CALLS=CAPS["build"], CALLS_SOFT=CAPS["build"] - 10))
+    res = run_agent("build", a.build_model, brief, wt, d, f"i{n}")
+    rep = d / "build-report.md"
+    text = rep.read_text().strip() if rep.exists() else ""
+    status = text.splitlines()[-1].strip() if text else "NO-REPORT"
+    try:
+        if status != "BUILT":
+            return issue_end(n, "BUILD-FAILED", f"builder said: {status[:100]}")
+        head = sh("git", "-C", str(wt), "rev-parse", "HEAD").stdout.strip()
+        if sh("git", "-C", str(wt), "status", "--porcelain", "--untracked-files=no").stdout.strip():
+            return issue_end(n, "BUILD-FAILED", "builder left uncommitted changes")
+        commits = sh("git", "-C", str(wt), "rev-list", "--reverse", f"{main}..{head}").stdout.split()
+        if not commits:
+            return issue_end(n, "BUILD-FAILED", "builder made no commit")
+        changed = sh("git", "-C", str(wt), "diff", "--name-only", f"{main}..{head}").stdout.split()
+        if any(c in CFG.changelog_forbidden for c in changed):
+            return issue_end(n, "BUILD-FAILED", "builder edited a CHANGELOG file")
+        frag = [c for c in changed if re.fullmatch(rf"{re.escape(CFG.fragment_dir)}/{n}\.[\w-]+\.md", c)]
+        if not any(re.search(rf"^- .*\(#{n}\)\.?\s*$", (wt / c).read_text(), re.M) for c in frag):
+            return issue_end(n, "BUILD-FAILED", f"no changes/{n}.<section>.md fragment with a '- ... (#{n})' bullet")
+        if not any("test" in c for c in changed):
+            return issue_end(n, "BUILD-FAILED", "no test file in the change (red-first needs a regression test)")
+        flagged = redfirst_flags(wt, main, head)
+        bad = ruff_added(wt, main, head, changed)
+        if bad:
+            return issue_end(n, "BUILD-FAILED", "ruff failed on lines the build added: " + "; ".join(bad)[:160])
+        p = sh("git", "-C", str(wt), "push", "origin", f"HEAD:refs/heads/{branch}", timeout=300)
+        if p.returncode:
+            return issue_end(n, "BUILD-FAILED", "push refused: " + p.stderr[-160:])
+        title = sh("git", "-C", str(wt), "log", "-1", "--format=%s", head).stdout.strip()
+        body = d / "pr-body.md"
+        body.write_text(f"Fixes #{n}\n\n{scrub(text)}\n")
+        c = sh("gh", "pr", "create", "-R", REPO, "--draft", "--base", "main", "--head", branch, "--title", title, "--body-file", str(body))
+        m = re.search(r"/pull/(\d+)", c.stdout)
+        if c.returncode or not m:
+            return issue_end(n, "BUILD-FAILED", "gh pr create failed: " + (c.stderr or c.stdout)[-160:])
+        pr = int(m.group(1))
+        ledger(issue=n, stage="build", pr=pr, head=head, commits=len(commits), redfirst_flags=flagged, **res)
+        issue_end(n, "PR-OPENED", f"draft PR #{pr} at {head[:8]}", pr=pr)
+    finally:
+        drop_wt(wt)
+    log(f"issue #{n} -> PR #{pr}; starting the chain on it")
+    try:
+        return f"PR #{pr}: " + run_chain(pr, a)
+    except RuntimeError as e:
+        return f"PR #{pr}: " + die(pr, "ERROR", str(e)[:200])
+
+
+def scout(a):
+    """Nothing free: one fresh scout reads the code and opens a few well-evidenced issues. Returns a status string."""
+    if NO_BUILD.exists():
+        return f"BLOCKED: issue building is off (remove {NO_BUILD.name}; toggle on the board /config page)"
+    d = WORK / "scout" / time.strftime("%Y%m%d-%H%M%S")
+    sh("git", "-C", str(CHECKOUT), "fetch", "-q", "origin", "main", check=True)
+    main = sh("git", "-C", str(CHECKOUT), "rev-parse", "origin/main", check=True).stdout.strip()
+    if DRY:
+        log(f"[dry] would scout origin/main {main[:8]} with {a.scout_model}, at most {a.scout_max} issues")
+        return "DRY"
+    d.mkdir(parents=True)
+    wt = wt_for(d)
+    make_wt(wt, main)
+    allissues = gh_json("issue", "list", "-R", REPO, "--state", "all", "--limit", "400", "--json", "number,title,state")
+    (d / "existing-titles.txt").write_text("\n".join(f"#{i['number']} [{i['state']}] {i['title']}" for i in allissues) + "\n")
+    brief = d / "brief.md"
+    brief.write_text(render("scout.md", MAXISSUES=a.scout_max, MAIN=main, WT=wt, DIR=d, CALLS=CAPS["scout"],
+                            CALLS_SOFT=CAPS["scout"] - 8, SCRATCH_HOME=SCRATCH_HOME, PY=PY, SRC=src_path(wt)))
+    try:
+        run_agent("scout", a.scout_model, brief, wt, d, "scout")
+    finally:
+        drop_wt(wt)
+    try:
+        found = json.loads((d / "issues.json").read_text())
+        assert isinstance(found, list)
+    except Exception as e:
+        ledger(stage="scout", status="NO-OUTPUT", why=str(e)[:100], dir=str(d))
+        return "SCOUT-NO-OUTPUT"
+    norm = lambda s: re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()  # noqa: E731
+    seen = {norm(i["title"]) for i in allissues}
+    have = {x.split("\t")[0] for x in sh("gh", "label", "list", "-R", REPO, "--limit", "200", "--json", "name", "--jq", ".[].name").stdout.split("\n")}
+    made = []
+    for it in found:
+        if len(made) >= a.scout_max:
+            break
+        if not isinstance(it, dict) or not isinstance(it.get("title"), str) or not isinstance(it.get("body"), str):
+            continue
+        if norm(it["title"]) in seen or not it["title"].strip() or not it["body"].strip():
+            continue
+        labels = ["status/ready-for-agent"] + [lb for lb in it.get("labels", []) if lb in have and lb not in BLOCK_LABELS
+                                                and lb != "status/ready-for-agent"]
+        if "bug" not in labels:
+            labels.append("bug")
+        c = sh("gh", "issue", "create", "-R", REPO, "--title", it["title"].strip()[:120], "--body", scrub(it["body"]),
+               "--label", ",".join(labels))
+        m = re.search(r"/issues/(\d+)", c.stdout)
+        ledger(stage="scout-issue", ok=bool(m), url=c.stdout.strip()[-80:], tail=(c.stderr or "")[-100:])
+        if m:
+            made.append(int(m.group(1)))
+            seen.add(norm(it["title"]))
+    return f"ISSUES-CREATED {made}" if made else "SCOUT-FOUND-NOTHING"
+
+
+# ---------------------------------------------------------------- UI review, human gate
+def gh_events(path):
+    p = sh("gh", "api", "--paginate", path, check=True)
+    txt = p.stdout.strip()
+    if not txt:
+        return []
+    if txt.startswith("["):  # --paginate prints one JSON array per page
+        out = []
+        dec = json.JSONDecoder()
+        i = 0
+        while i < len(txt):
+            obj, j = dec.raw_decode(txt, i)
+            out += obj
+            i = j
+            while i < len(txt) and txt[i].isspace():
+                i += 1
+        return out
+    return [json.loads(txt)]
+
+
+def ui_focus(pr, info, main, head, d):
+    """The part of the UI reviewer's brief that is about THIS PR: what it changes, how to see it, which proof to run,
+    and what earlier UI reviews of it claimed. Read from git and the PR text; never fails the review (errors give a short block)."""
+    R = ("git", "-C", str(CHECKOUT))
+    rows = [ln.split("\t") for ln in sh(*R, "diff", "--numstat", f"{main}...{head}").stdout.splitlines() if ln.count("\t") == 2]
+    ui = [(a_, d_, f) for a_, d_, f in rows if UI_RE.search(f)]
+    proofs = [f for _a, _d, f in rows if re.search(CFG.ui_proof_re, f)]
+    tsx = [f for _a, _d, f in ui if f.endswith(".tsx") and not re.search(r"(\.test\.|\.spec\.|/tests?/|__tests__)", f)]  # a test's JSX is not the PR's look
+    patch = sh(*R, "diff", "-U0", f"{main}...{head}", "--", *tsx).stdout if tsx else ""
+    look = [f for _a, _d, f in ui if f.endswith((".css", ".html"))]
+    if re.search(r"(?m)^[+-](?![+-]).*(className=|style=\{|</[A-Za-z]|/>)", patch):
+        look.append("markup lines in " + ", ".join(pathlib_name(f) for f in tsx[:4]))
+    m = re.search(r"(?ims)^#{1,6}\s*how to see it\s*$(.*?)(?=^#{1,6}\s|\Z)", info.get("body") or "")
+    see = m.group(1).strip()[:900] if m and m.group(1).strip() else ""
+    out = ["## This PR, specifically (the script wrote this block from the PR itself; the steps below are generic)",
+           f"- What it is: {info.get('title', '')}",
+           "- Web UI files it changes: " + (", ".join(f"{pathlib_name(f)} (+{a_}/-{d_})" for a_, d_, f in ui[:10]) or "none"),
+           "- Markup or style in the diff: " + ("yes: " + "; ".join(look) + ". Likely Kind A." if look else
+                                                "none found. Likely Kind B (behavior only). Confirm it from the diff."),
+           "- How to see it, from the PR text: " + (see if see else "the PR text has no `## How to see it` section; use the proof below or stage it yourself.")]
+    for f in proofs[:3]:
+        added = sh(*R, "diff", "-U0", f"{main}...{head}", "--", f).stdout
+        names = list(dict.fromkeys(re.findall(r'(?m)^\+.*?"([A-Z]\d?-[a-z0-9-]{4,})"', added)))[:5]
+        envs = list(dict.fromkeys(re.findall(r"process\.env\.([A-Z_]+)", sh(*R, "show", f"{head}:{f}").stdout)))
+        sw = next((e for e in envs if "SCENARIO" in e), "")
+        out.append(f"- Browser proof this PR adds or changes: `{f}`. Scenarios new in this PR: {', '.join(names) or 'not detected, read the diff'}. "
+                   f"Its switches: {', '.join(envs) or 'none'}.")
+        out.append("  Ready command, from the worktree's frontend folder (run `npm run build 2>&1 | tail -5` first when `dist/` is missing): "
+                   f"`{'PLAYWRIGHT_BROWSERS_PATH=' + str(CFG.playwright_browsers) + ' ' if CFG.playwright_browsers else ''}HOME={SCRATCH_HOME} {' '.join(f'{k}={v}' for k, v in CFG.agent_env.items())} "
+                   + (f"{sw}={','.join(names)} " if sw and names else "") + f"node tests/{pathlib_name(f)} {d}/proof 2>&1 | tail -30`")
+    seen, old = set(), []
+    for v in sorted((WORK / "prs" / str(pr)).glob("r*-ui*/ui-verdict.md"), key=lambda p: p.stat().st_mtime):
+        t = v.read_text()
+        if v.parent == d or not t.startswith("FAIL"):
+            continue
+        for ln in t.split("Findings:", 1)[-1].split("Follow-up:", 1)[0].splitlines():
+            if ln.startswith("- P") and ln not in seen:
+                seen.add(ln)
+                old.append(ln.strip()[:260])
+    if old:
+        out.append("- Earlier UI reviews of this PR raised the findings below. They may be right or wrong. Look for each one in your own shots and "
+                   "answer it in the verdict under `Earlier findings:` as `confirmed in <shot>` or `not seen in <shot>`. Never copy one into `Findings:` unseen.")
+        out += ["  " + ln for ln in old[-6:]]
+    out.append("- THE shot for this PR is the one a person could look at and say: yes, that is what the title above describes.")
+    return "\n".join(out)
+
+
+def pathlib_name(f):
+    return f.rsplit("/", 1)[-1]
+
+
+def term_cmd(wt, d, shots):
+    """The command a UI reviewer runs to shoot a tmux spec it wrote. Its HOME is a scratch one, so the browsers path is given."""
+    return (f"PLAYWRIGHT_BROWSERS_PATH={Path.home()}/Library/Caches/ms-playwright {UV} run -q --no-project --with "
+            f"playwright==1.62.0 python -I {TERM_SHOTS} --wt {wt} --out {shots} --work {d}/term --spec <your spec.json>")
+
+
+def term_shots(pr, d, wt, main, head, shots):
+    """Terminal screenshots of the tmux specs the PR adds or changes, taken before the UI agent starts. Returns the brief line."""
+    try:
+        r = sh(UV, "run", "-q", "--no-project", "--with", "playwright==1.62.0", "python", "-I", str(TERM_SHOTS), "--wt", str(wt),
+               "--main", main, "--head", head, "--out", str(shots), "--work", str(d / "term"), "--python", str(PY), timeout=1800)
+    except RuntimeError as e:
+        ledger(pr=pr, stage="term-shots", rc="timeout", tail=str(e)[-200:])
+        return f"the terminal screenshot tool timed out ({str(e)[-120:]}); run it yourself on one spec (step 2d)."
+    ledger(pr=pr, stage="term-shots", rc=r.returncode, tail=(r.stdout + r.stderr)[-200:])
+    pngs = sorted(p.name for p in shots.glob("term-*.png"))
+    said = " ".join(line for line in r.stdout.splitlines() if line.startswith("term_shots:"))[:400]
+    if r.returncode == 3:
+        return "none: this PR adds or changes no tmux spec."
+    if r.returncode in (0, 4):
+        return f"{len(pngs)} screenshots of this PR's own tmux specs are already in {shots} (term-*.png). {said}"
+    return f"the terminal screenshot tool failed (exit {r.returncode}): {(r.stdout + r.stderr)[-300:]}"
+
+
+def ui_review(pr, rnd, head, a):
+    """A vision-capable reviewer drives a scratch stack built from the head and assumes the UI is wrong. (verdict, path, head)."""
+    info = pr_info(pr)
+    main = fetch(info)
+    d = WORK / "prs" / str(pr) / f"r{rnd}-ui"
+    vp = d / "ui-verdict.md"
+    if vp.exists() and head in vp.read_text() and parse_verdict(vp):  # resume: this exact head was already judged
+        return parse_verdict(vp), vp, head
+    ui_files = [f["path"] for f in info["files"] if UI_RE.search(f["path"])]
+    if DRY:
+        log(f"[dry] would run the UI review ({a.ui_model}) on {len(ui_files)} UI files at {head[:8]}")
+        return "DRY", vp, head
+    if d.exists():
+        retire_wt(d)
+        d.rename(d.with_name(d.name + f".old{int(time.time())}"))
+    d.mkdir(parents=True)
+    wt, shots, stack = wt_for(d), d / "shots", d / "stack"
+    make_wt(wt, head)
+    try:
+        (d / "pr.md").write_text(f"# #{pr}: {info['title']}\n\nauthor: {info['author']['login']}\n\n{info['body'] or ''}\n")
+        (d / "issues.md").write_text(issues_text(info))
+        up = sh(sys.executable, str(UI_STACK), "up", "--wt", str(wt), "--dir", str(stack), "--python", str(PY), timeout=1200)
+        ledger(pr=pr, stage="ui-stack", rc=up.returncode, tail=(up.stdout + up.stderr)[-200:])
+        if up.returncode:
+            (d / "ui-verdict.md").write_text("STACK-DOWN\n" + (up.stdout + up.stderr)[-600:])
+            return "STACK-DOWN", vp, head
+        url = up.stdout.strip().splitlines()[-1]
+        term_note = term_shots(pr, d, wt, main, head, shots)
+        brief = d / "brief.md"
+        brief.write_text(render("ui-review.md", PR=pr, HEAD=head, MAIN=main, WT=wt, DIR=d, UI_FILES=", ".join(ui_files[:20]),
+                                STACK_URL=url, SHOTS=shots, TERM_SHOTS=term_note, TERM_SHOOT=term_cmd(wt, d, shots), UI_SHOOT=UI_SHOOT, CALLS=CAPS["ui"], CALLS_SOFT=CAPS["ui"] - 10,
+                                SCRATCH_HOME=SCRATCH_HOME, PY=PY, SRC=src_path(wt)))
+        try:  # the per-PR block replaces a plain marker line, so a chain still running older code is unaffected
+            focus = ui_focus(pr, info, main, head, d)
+        except Exception as e:
+            focus = f"## This PR, specifically\n- {info.get('title', '')} (the script could not build the details: {str(e)[:80]})"
+        brief.write_text(brief.read_text().replace("<!--PR_FOCUS-->", focus))
+        res = run_agent("ui", a.ui_model, brief, d, d, pr)
+    finally:
+        sh(sys.executable, str(UI_STACK), "down", "--dir", str(stack))
+        drop_wt(wt)
+        clean_stack(stack)
+    verdict = parse_verdict(vp)
+    if verdict is None and vp.exists() and vp.read_text().lstrip("`*# \n").upper().startswith("STACK-BROKEN"):
+        ledger(pr=pr, stage="ui-verdict", round=rnd, head=head, verdict="STACK-BROKEN", model=a.ui_model, **res)
+        return "STACK-DOWN", vp, head  # the chain's own stack is at fault: retry later, never a PR fixer, nothing posted
+    ledger(pr=pr, stage="ui-verdict", round=rnd, head=head, verdict=verdict, model=a.ui_model, **res)
+    if verdict and not a.no_post:
+        file_followups(pr, vp, area="area/webui")  # on any verdict: an unrelated problem is an issue whether the PR passes or not
+        sh("gh", "pr", "comment", str(pr), "-R", REPO, "--body",
+           f"{MARK}ui-verdict -->\nUI review, pinned head {head[:12]}: {verdict}\n\n{scrub(vp.read_text())}")
+    return verdict, vp, head
+
+
+def push_shots(pr, head, shots):
+    """Copy the screenshots to the orphan screenshots branch so PR comments can show them. Returns (commit, rel_dir)."""
+    rel = f"pr-{pr}/{head[:12]}"
+    R = ["git", "-C", str(SHOTS_REPO)]
+    if not (SHOTS_REPO / ".git").exists():
+        SHOTS_REPO.mkdir(parents=True, exist_ok=True)
+        url = sh("git", "-C", str(CHECKOUT), "remote", "get-url", "origin", check=True).stdout.strip()
+        sh("git", "init", "-q", str(SHOTS_REPO), check=True)
+        sh(*R, "remote", "add", "origin", url, check=True)
+    for attempt in range(2):
+        if sh(*R, "fetch", "-q", "origin", SHOTS_BRANCH).returncode == 0:
+            sh(*R, "checkout", "-q", "-f", "-B", SHOTS_BRANCH, "FETCH_HEAD", check=True)
+        else:
+            sh(*R, "symbolic-ref", "HEAD", f"refs/heads/{SHOTS_BRANCH}", check=True)
+        dst = SHOTS_REPO / rel
+        dst.mkdir(parents=True, exist_ok=True)
+        for f in list(shots.glob("*.png")) + list(shots.glob("overflow.json")):
+            shutil.copy2(f, dst / f.name)
+        sh(*R, "add", rel, check=True)
+        if sh(*R, "status", "--porcelain", rel).stdout.strip():
+            sh(*R, "commit", "-q", "-m", f"chore(shots): screenshots for #{pr} at {head[:12]}", "--", rel, check=True)
+        p = sh(*R, "push", "-q", "origin", f"HEAD:refs/heads/{SHOTS_BRANCH}")
+        if p.returncode == 0:
+            return sh(*R, "rev-parse", "HEAD", check=True).stdout.strip(), rel
+        if attempt == 0:  # someone pushed another PR's shots first: merge theirs in (no rebase), try once more
+            sh(*R, "fetch", "-q", "origin", SHOTS_BRANCH)
+            sh(*R, "merge", "-q", "--no-edit", "FETCH_HEAD")
+    raise RuntimeError("could not push the screenshots branch: " + p.stderr[-200:])
+
+
+def human_gate(pr, head, ui_vp, a):
+    """Post the screenshots on the PR and wait for a person: approve with the label, or comment (comments go to the fixer)."""
+    shots = ui_vp.parent / "shots"
+    pngs = sorted(shots.glob("*.png"))
+    if not pngs:
+        return die(pr, "RESTING", f"UI review passed but wrote no screenshots in {shots}")
+    if DRY:
+        log(f"[dry] would push {len(pngs)} screenshots and post the human-gate comment on #{pr}")
+        return "DRY"
+    commit, rel = push_shots(pr, head, shots)
+    base = f"https://github.com/{REPO}/blob/{commit}/{rel}"
+    imgs = "\n".join(f"<img src=\"{base}/{p.name}?raw=true\" width=\"320\" alt=\"{p.stem}\">" for p in pngs)
+    summary = ui_vp.read_text().split("Summary:", 1)[-1].strip()[:1200] if "Summary:" in ui_vp.read_text() else ""
+    term = " Terminal screens (term-*) come from the PR's own tmux specs." if any(p.name.startswith("term-") for p in pngs) else ""
+    lead = f"The UI review passed at {head[:12]}. Screenshots of the changed screens (desktop, 820 and 390 wide, dark and light):{term}"
+    body = (f"{MARK}human-gate head={head} -->\n{lead}\n\n{imgs}\n\n{scrub(summary)}\n\n"
+            f"To approve, add the `{HUMAN_LABEL}` label. To ask for changes, comment here; a fixer picks the comment up on the next "
+            f"`pr-chain resume`.")
+    if sh("gh", "label", "list", "-R", REPO, "--search", HUMAN_LABEL, "--json", "name", "--jq", ".[].name").stdout.split().count(HUMAN_LABEL) == 0:
+        sh("gh", "label", "create", HUMAN_LABEL, "-R", REPO, "--color", "0e8a16", "--description", "A person approved the screenshots; the chain may land it")
+    c = sh("gh", "pr", "comment", str(pr), "-R", REPO, "--body", body, check=True)
+    m = re.search(r"issuecomment-(\d+)", c.stdout)
+    if not m:
+        raise RuntimeError("could not read the human-gate comment id from: " + c.stdout[-120:])
+    cid = int(m.group(1))
+    at = sh("gh", "api", f"repos/{REPO}/issues/comments/{cid}", "--jq", ".created_at", check=True).stdout.strip()
+    set_state(pr, ui_vp=str(ui_vp), gate_comment=cid, gate_at=at, gate_head=head)
+    return die(pr, "AWAIT-HUMAN", f"screenshots posted at {head[:8]} (comment {cid}); add the {HUMAN_LABEL} label or comment")
+
+
+APPROVAL_NOTE = re.compile(r"^(?!.*\b(not|un)\s*approved\b).*\b(approved|lgtm|looks good)\b", re.I)  # read on a comment's first line
+
+
+def human_signal(pr, st):
+    """('approved'|'feedback'|None, payload) from what trusted people did on the PR after the gate comment."""
+    since = st["gate_at"]
+    labeled = [e["created_at"] for e in gh_events(f"repos/{REPO}/issues/{pr}/events")
+               if e.get("event") == "labeled" and e.get("label", {}).get("name") == HUMAN_LABEL
+               and (e.get("actor") or {}).get("login") in TRUSTED and e["created_at"] > since]
+    have = HUMAN_LABEL in {lb["name"] for lb in gh_json("pr", "view", str(pr), "-R", REPO, "--json", "labels")["labels"]}
+    approved_at = max(labeled) if labeled and have else None
+    notes = []
+    for c in gh_events(f"repos/{REPO}/issues/{pr}/comments"):
+        if c["user"]["login"] in TRUSTED and c["created_at"] > since and MARK not in c["body"]:
+            notes.append((c["created_at"], c["body"]))
+    for r in gh_events(f"repos/{REPO}/pulls/{pr}/reviews"):
+        if r["user"]["login"] in TRUSTED and (r.get("submitted_at") or "") > since and r.get("body") and MARK not in r["body"] \
+                and r.get("state") in ("COMMENTED", "CHANGES_REQUESTED"):
+            notes.append((r["submitted_at"], r["body"]))
+    for c in gh_events(f"repos/{REPO}/pulls/{pr}/comments"):  # inline review comments
+        if c["user"]["login"] in TRUSTED and c["created_at"] > since and MARK not in c["body"]:
+            notes.append((c["created_at"], f"{c.get('path', '')}:{c.get('line') or ''} {c['body']}"))
+    # A comment that itself says approved is no change request (#1057, 11-14: a hub agent posted "UI GATE ...: APPROVED."
+    # from a trusted account after the label, and the chain would have sent that to a fixer as feedback).
+    notes = [n for n in notes if not APPROVAL_NOTE.search(next((ln for ln in n[1].splitlines() if ln.strip()), ""))]
+    if approved_at and not [n for n in notes if n[0] > approved_at]:
+        return "approved", approved_at
+    if notes:
+        return "feedback", sorted(notes)
+    return None, None
+
+
+def pr_updated(pr):
+    """Epoch seconds of the PR's last change on GitHub (body edit, comment, label, push)."""
+    t = gh_json("pr", "view", str(pr), "-R", REPO, "--json", "updatedAt")["updatedAt"]
+    return calendar.timegm(time.strptime(t, "%Y-%m-%dT%H:%M:%SZ"))
+
+
+DOCTOR = WORK / "doctor.json"
+STRAY_LABEL_STATES = ("RESTING", "POLICY-HOLD")  # our PRs no longer waiting on an approval; any other state may still need it
+
+
+JANITOR = ROOT / "bin" / "worktree-janitor"
+
+
+def run_janitor():
+    """Once an hour, in the background: the worktrees of every other lane whose PR merged or closed (the chain cleans its own).
+    Only against the real work dir, so a test run of the doctor never touches real worktrees."""
+    stamp = WORK / "janitor.last"
+    if WORK.resolve() != (Path.home() / "backups" / "pr-chain").resolve() or not JANITOR.exists():
+        return
+    if stamp.exists() and time.time() - stamp.stat().st_mtime < 3600:
+        return
+    stamp.write_text(now())
+    log_dir = WORK / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    with open(log_dir / "janitor.log", "a") as fh:
+        fh.write(f"--- {now()}\n")
+        subprocess.Popen([sys.executable, "-B", str(JANITOR), "--apply"], stdout=fh, stderr=subprocess.STDOUT, start_new_session=True)
+
+
+def approval_is_current(pr):
+    """True when the label on this PR is a person's approval of its latest gate (put there after the gate comment).
+    11-16: the doctor stripped a maintainer's approval from #1101 because the PR rested on a conflict with main right after it;
+    standing_approval keeps an approval through every end state, so the label has to stay too. Unreadable: keep the label."""
+    try:
+        st = json.loads(state_path(pr).read_text())
+        return bool(st.get("gate_at")) and human_signal(pr, st)[0] == "approved"
+    except Exception:  # noqa: BLE001 - removing a real approval costs more than leaving a stale label
+        return True
+
+
+RESUME_OWNED = ("AWAIT-HUMAN", "WAITING-CI", "LAND-STOPPED", "READY")  # `resume` (every loop lap) takes these up again
+
+
+def status_before_run(n, started):
+    """The end state PR n was in when its last run started (that run's `started`), from the ledger's `end` rows."""
+    last = None
+    try:
+        with open(LEDGER) as fh:
+            for ln in fh:
+                if '"end"' in ln:
+                    r = json.loads(ln)
+                    if r.get("stage") == "end" and str(r.get("pr")) == str(n) and r.get("ts", "") < (started or ""):
+                        last = r.get("status")
+    except (OSError, ValueError):
+        pass
+    return last
+
+
+def doctor():
+    """Catch what one chain run cannot see (PLAN-review-fix.md section 4). Fixes stale state and stray approval labels
+    itself; pages the operator once ([notify] command) only when the loop is down (restarting it is their call). Writes doctor.json for the board."""
+    old = json.loads(DOCTOR.read_text()) if DOCTOR.exists() else {}
+    rows = []
+    try:
+        open_prs = {p["number"]: p for p in gh_json("pr", "list", "-R", REPO, "--state", "open", "--limit", "200",
+                                                     "--json", "number,labels,author")}
+    except Exception as e:  # noqa: BLE001 - GitHub down must not stop the lap
+        open_prs = None
+        rows.append(dict(kind="github-unreadable", what=str(e)[:120], action="none"))
+    states = {}
+    for sp in (WORK / "prs").glob("*/STATE.json"):
+        if not sp.parent.name.isdigit():
+            continue
+        n, st = int(sp.parent.name), json.loads(sp.read_text())
+        s, states[n] = st.get("status"), st.get("status")
+        if open_prs is not None and n not in open_prs and s not in ("MERGED", "CLOSED"):
+            set_state(n, status="CLOSED", why=f"doctor: GitHub no longer lists the PR as open (state was {s})")
+            states[n] = "CLOSED"
+            rows.append(dict(pr=n, kind="stale-state", what=f"{s} while GitHub says not open", action="set to CLOSED"))
+        elif s == "running" and not pid_alive((CLAIMS / str(n) / "pid").read_text().strip() if (CLAIMS / str(n) / "pid").exists() else ""):
+            # A landing that died (tripwire, kill, crash) goes back to where `resume` finds it, so a human approval is not
+            # lost (#1057, 11-14: approved, CI green, the landing's addendum passed, then a stop; STOPPED would have
+            # sent it through the UI review and the human gate again). Any other dead run is free for the next run.
+            back = status_before_run(n, st.get("started"))
+            back = back if back in RESUME_OWNED else None
+            set_state(n, status=back or "STOPPED", why=f"doctor: the chain process is gone; back to {back}, resume takes it up again"
+                      if back else "doctor: the chain process is gone (killed or stopped); free for the next run")
+            states[n] = back or "STOPPED"
+            rows.append(dict(pr=n, kind="dead-chain", what="state said running but no chain process holds it", action=f"set to {back or 'STOPPED'}"))
+        elif s == "running":
+            age = time.time() - max([f.stat().st_mtime for f in sp.parent.glob("r*")] or [sp.stat().st_mtime])
+            if age > 45 * 60:
+                rows.append(dict(pr=n, kind="quiet-stage", what=f"no stage change for {int(age // 60)} min", action="watching"))
+        elif s in ("POLICY-HOLD", "AWAIT-HUMAN"):
+            labeled = open_prs is not None and HUMAN_LABEL in [lb["name"] for lb in (open_prs.get(n) or {}).get("labels") or []]
+            what = (f"{s}: the {HUMAN_LABEL} label on it is older than these screenshots; remove it and add it again to approve them"
+                    if s == "AWAIT-HUMAN" and labeled else f"{s}: {(st.get('why') or '')[:140]}")
+            rows.append(dict(pr=n, kind="needs-you", what=what, action="none"))
+        elif s == "RESTING":
+            due = st.get("rest_until") or 0
+            back = f"back at {time.strftime('%H:%M', time.localtime(due))}" if due > time.time() else "due: next free slot"
+            rows.append(dict(pr=n, kind="resting", what=(st.get("why") or "")[:140], action=back))
+    for n, s in states.items():  # a finished chain keeps nothing on this machine (leftovers are what fills the disk)
+        if s == "running" or not pr_leftovers(n):
+            continue
+        try:
+            if s in ("MERGED", "CLOSED") and pr_state(n) in ("MERGED", "CLOSED"):  # GitHub confirms it: dirty worktrees and orphans go too
+                cleanup_pr(n, force=True)
+            elif s not in ("MERGED", "CLOSED"):  # an open PR between runs: stage worktrees from before this chain's end, clean ones only
+                cleanup_pr(n, quiet=True)
+        except Exception as e:  # noqa: BLE001 - one PR's cleanup must not stop the doctor
+            log(f"#{n} cleanup failed: {str(e)[:120]}")
+    run_janitor()
+    for n, p in (open_prs or {}).items():
+        ours = (p.get("author") or {}).get("login") in OUR_AUTHORS  # outside PRs are never touched
+        if ours and HUMAN_LABEL in [lb["name"] for lb in p.get("labels") or []] and states.get(n) in STRAY_LABEL_STATES:
+            if approval_is_current(n):  # the label IS a person's approval of this gate; a conflict or red CI after it does not withdraw it
+                continue
+            sh("gh", "pr", "edit", str(n), "-R", REPO, "--remove-label", HUMAN_LABEL)
+            rows.append(dict(pr=n, kind="stray-label", what=f"{HUMAN_LABEL} left on a {states[n]} PR", action="label removed"))
+    paged = old.get("paged_loop_down")
+    if not loop_alive():
+        rows.append(dict(kind="loop-down", what="pr-chain-loop is not running", action="operator paged" if not paged else "already paged"))
+        if not paged and CFG.notify_cmd:
+            sh(*shlex.split(CFG.notify_cmd), "pr-chain loop is not running; restart is your call")
+            paged = now()
+    else:
+        paged = None
+    DOCTOR.write_text(json.dumps(dict(ts=now(), rows=rows, paged_loop_down=paged), indent=1))
+    for r in rows:
+        ledger(stage="doctor", **r) if r["kind"] in ("stale-state", "stray-label", "loop-down") else None
+    return rows
+
+
+def resume_all(a):
+    """Look at every PR waiting on a person: approved -> finish it; commented -> the fixer takes the comments; else leave it.
+    A LAND-STOPPED PR (merge refused: DoD gate, missing issue link) is landed again once the PR changed on GitHub."""
+    results, later = [], []
+    for sp in sorted((WORK / "prs").glob("*/STATE.json")):
+        st = json.loads(sp.read_text())
+        if st.get("status") not in ("AWAIT-HUMAN", "LAND-STOPPED", "WAITING-CI", "READY"):
+            continue
+        pr = int(sp.parent.name)
+        if STOPFILE.exists():
+            break
+        try:
+            info = pr_info(pr)
+            if info["state"] != "OPEN":
+                results.append((pr, die(pr, "CLOSED", f"PR is {info['state']}")))
+                continue
+            if info["author"]["login"] not in OUR_AUTHORS:
+                results.append((pr, die(pr, "NOT-OURS", "outside contributor PR: the chain only works on PRs opened by our own accounts")))
+                continue
+            if st["status"] == "READY":  # passed review and audit but was run without --land (#1039, 11-14): land it now
+                log(f"#{pr} READY without a land step; landing (audit at the current head, CI, merge)")
+                results.append((pr, run_chain(pr, a, from_gate=True)))
+                continue
+            if st["status"] == "WAITING-CI":
+                cur = branch_head(info)
+                if st.get("ci_wait") == "review":  # parked before its review (flow.json ci_pending_wait): no gate to land on
+                    waited = time.time() - ((st.get("ci_wait_at") or {}).get(cur) or time.time())
+                    if st.get("ci_settled"):
+                        continue  # already handed to the loop's threads; pick runs it
+                    if not ci_pending(pr, cur):
+                        # 11-17: resume ran each settled PR inline, one at a time, while 51 PRs waited and 3 threads sat idle
+                        set_state(pr, ci_settled=True)
+                        log(f"#{pr} CI settled before the review; the next free chain thread runs it")
+                        results.append((pr, "CI settled: free for the next thread"))
+                    elif waited > LIM["ci_wait_max_minutes"] * 60 and not ci_runs_open(cur):
+                        # past the limit and GitHub has no queued or running workflow for this head: the checks never started,
+                        # which a fixer can find (a path filter, a workflow that does not trigger). A queued run is CI on its way.
+                        vp = sp.parent / f"ci-wait-{int(time.time())}.md"
+                        vp.write_text(f"FAIL\nhead {cur}\nFindings:\n- P1 ci:0 - required checks at this head have not finished after "
+                                      f"{int(waited // 60)} minutes - find why (a check that never started, a path filter, a stuck job) "
+                                      "and fix it in this PR, or end BLOCKED with the evidence\n")
+                        log(f"#{pr} required checks still pending after {int(waited // 60)} min; a fixer takes it")
+                        results.append((pr, run_chain(pr, a, seed=vp)))
+                    continue
+                if cur != st.get("gate_head"):
+                    fetch(info)
+                    if st.get("gate_head") and main_only_move(st["gate_head"], cur):  # the reviews (and any approval) stand
+                        log(f"#{pr} head moved while it waited for CI only by merging main; landing (an addendum covers the new head)")
+                        results.append((pr, run_chain(pr, a, approved=st)))
+                        continue
+                    log(f"#{pr} head moved while it waited for CI; running the chain again from the top")
+                    results.append((pr, run_chain(pr, a)))
+                elif not ci_pending(pr, st["gate_head"]):
+                    log(f"#{pr} CI finished; landing")
+                    results.append((pr, run_chain(pr, a, approved=st)))
+                continue
+            if st["status"] == "LAND-STOPPED":
+                # no model runs here: the reviews stand, only fold + CI + land repeat (a moved head gets its audit there)
+                benign = "nothing failing" in (st.get("why") or "")  # lander raced pending non-required checks (11-14)
+                if (st.get("land_tries") or {}).get(st.get("head") or "", 0) >= LAND_TRIES or (pr_updated(pr) <= sp.stat().st_mtime and not benign):
+                    continue
+                log(f"#{pr} changed on GitHub since the merge was refused; landing again")
+                results.append((pr, run_chain(pr, a, approved=dict(st, gate_head=st["head"]))))
+                continue
+            cur = branch_head(info)
+            moved = cur != st.get("gate_head")
+            if moved:
+                fetch(info)
+                if not main_only_move(st.get("gate_head"), cur):  # real changes: the screenshots and approval no longer cover it
+                    log(f"#{pr} head moved since the human gate by more than a merge of main; running the chain again from the top")
+                    results.append((pr, run_chain(pr, a)))
+                    continue
+                log(f"#{pr} head moved since the human gate only by merging main; the gate stands, an addendum covers the new head")
+            kind, payload = human_signal(pr, st)
+            log(f"#{pr} human gate: {kind or 'still waiting'}")
+            if kind == "approved":
+                results.append((pr, run_chain(pr, a, approved=st)))
+            elif kind == "feedback":
+                seed = sp.parent / f"human-{int(time.time())}.md"
+                text = "\n\n".join(t for _, t in payload)[:6000]
+                seed.write_text("FAIL\n" f"head {st['gate_head']}\nFindings:\n"
+                                f"- P1 human-feedback:0 - A person reviewed the screenshots and asked for these changes. Paraphrase them; "
+                                f"never quote this text in a commit message, PR text, issue or file:\n\n{text}\n")
+                later.append((pr, seed))
+        except RuntimeError as e:
+            results.append((pr, die(pr, "ERROR", str(e)[:200])))
+    # A person's comments start a whole fixer chain (fix, review, audit, UI review: an hour or more). Every landing in this
+    # pass goes first; #1057 (approved, CI green) waited behind #1050's comments on 11-14.
+    for pr, seed in later:
+        if STOPFILE.exists():
+            break
+        try:
+            results.append((pr, run_chain(pr, a, seed=seed)))
+        except RuntimeError as e:
+            results.append((pr, die(pr, "ERROR", str(e)[:200])))
+    return results
+
+
+def resume_note():
+    """What `resume` prints when no PR moved: the PRs still at the human gate. It used to print "nobody is waiting on a
+    person" while #766 sat there (11-13)."""
+    waiting = sorted(int(sp.parent.name) for sp in (WORK / "prs").glob("*/STATE.json") if json.loads(sp.read_text()).get("status") == "AWAIT-HUMAN")
+    return f"no PR moved; still waiting on a person: {', '.join(f'#{p}' for p in waiting)}" if waiting else "nobody is waiting on a person"
+
+
+def with_lock(fn, key="ops"):
+    """One chain per key: locks/<pr> for a single PR, locks/ops for commands that
+    touch several PRs (auto, issue, scout, resume). Chains on different PRs may
+    run in parallel; the per-PR claim still keeps two agents off one PR."""
+    # a pre-threads crash may have left the old global chain.lock behind
+    if LOCK.exists():
+        pid = (LOCK / "pid").read_text().strip() if (LOCK / "pid").exists() else ""
+        if not pid_alive(pid):
+            shutil.rmtree(LOCK, ignore_errors=True)
+    LOCKS.mkdir(parents=True, exist_ok=True)
+    lk = LOCKS / str(key)
+    try:
+        lk.mkdir()
+    except FileExistsError:
+        pid = (lk / "pid").read_text().strip() if (lk / "pid").exists() else ""
+        if pid_alive(pid):
+            scope = "another chain" if key != "ops" else "a multi-PR command"
+            raise SystemExit(f"{scope} holds the lock for '{key}' (pid {pid})")
+        shutil.rmtree(lk)
+        lk.mkdir()
+    (lk / "pid").write_text(str(os.getpid()))
+    try:
+        return fn()
+    finally:
+        shutil.rmtree(lk, ignore_errors=True)
+
+
+def backup_config():
+    if TRIPWIRE_CFG.exists():
+        dst = WORK / "backup"
+        dst.mkdir(exist_ok=True)
+        stamp = dst / f"config.json.{time.strftime('%Y%m%d')}"
+        if not stamp.exists():
+            shutil.copy2(TRIPWIRE_CFG, stamp)
+
+
+def cmd_status(_a):
+    for p in sorted((WORK / "prs").glob("*/STATE.json"), key=lambda x: int(x.parent.name)):
+        s = json.loads(p.read_text())
+        # status null = requeued by hand; `pick` treats it as free, so print it that way instead of crashing
+        print(f"#{p.parent.name:>4} {s.get('status') or 'free':14} round {s.get('round') or '-'} head {str(s.get('head') or '')[:8]} "
+              f"{s.get('last_verdict') or ''} {(s.get('why') or '')[:70]}")
+
+
+def cmd_clean(a):
+    """Everything this PR's stages left on this Mac. A merged or closed PR (GitHub says so now) also loses dirty worktrees."""
+    cleanup_pr(a.pr, force=pr_state(a.pr) in ("MERGED", "CLOSED"))
+
+
+def main():
+    global DRY
+    ap = argparse.ArgumentParser(prog="pr-chain", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    MD = model_defaults()
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("models", help="show the effective model per role and where it comes from")
+    pk = sub.add_parser("pick")
+    pk.add_argument("--all", action="store_true")
+    for name in ("run", "auto", "land", "issue", "scout", "resume"):
+        s = sub.add_parser(name)
+        if name in ("run", "land", "issue"):
+            s.add_argument("pr", type=int)
+        s.add_argument("--max-rounds", type=int, default=LIM["max_rounds"])
+        s.add_argument("--review-model", default=MD["review"][0])
+        s.add_argument("--fix-model", default=MD["fix"][0])
+        s.add_argument("--gate-model", default=MD["gate"][0])
+        s.add_argument("--max-audits", type=int, default=LIM["max_audits"])
+        s.add_argument("--no-gate", action="store_true")
+        s.add_argument("--land", action="store_true")
+        s.add_argument("--vision-ok", action="store_true", help="a person already did the UI review for this head: skip the vision review and the human gate")
+        s.add_argument("--no-human", action="store_true", help="skip the human screenshot gate (the vision review still runs)")
+        s.add_argument("--ui-model", default=MD["ui"][0], help="vision-capable model for the UI review (never gpt-6-astra)")
+        s.add_argument("--max-ui", type=int, default=LIM["max_ui"], help="UI review failures per PR before UI-FAILED")
+        s.add_argument("--build-model", default=MD["build"][0])
+        s.add_argument("--scout-model", default=MD["scout"][0])
+        s.add_argument("--scout-max", type=int, default=5, help="most issues one scout run may file")
+        s.add_argument("--no-post", action="store_true")
+        s.add_argument("--dry-run", action="store_true")
+        if name in ("auto", "resume"):
+            s.add_argument("--count", type=int, default=1, help="how many PRs to take, one after another")
+    sub.add_parser("status")
+    sub.add_parser("doctor", help="stale state, stray labels, loop down, who needs the maintainer; writes doctor.json")
+    sub.add_parser("stop")
+    cl = sub.add_parser("clean")
+    cl.add_argument("pr", type=int)
+    a = ap.parse_args()
+    DRY = getattr(a, "dry_run", False)
+    for role in MODEL_ROLES:  # cmd:<name> -> Cmd, failing here (before any work) on a missing or bad command
+        if getattr(a, f"{role}_model", None):
+            setattr(a, f"{role}_model", resolve_cmd(getattr(a, f"{role}_model")))
+    if a.cmd == "models":
+        for role, (m, src) in MD.items():
+            t = command_template(m)
+            print(f"{role:7} {m:24} ({src})" + (f"\n        runs: {t}" if t else ""))
+        print(f"config file: {MODELS_FILE}{'' if MODELS_FILE.exists() else ' (not created yet)'}")
+        return
+    if a.cmd == "pick":
+        cmd_pick(a)
+    elif a.cmd == "status":
+        cmd_status(a)
+    elif a.cmd == "stop":
+        STOPFILE.write_text(f"stop requested {now()}\n")
+        print("STOP file written; the chain stops after its current stage. Remove it with: rm", STOPFILE)
+    elif a.cmd == "clean":
+        cmd_clean(a)
+    elif a.cmd == "doctor":
+        for r in doctor():
+            print(f"{('#' + str(r['pr'])) if r.get('pr') else '-':>6}  {r['kind']:<17} {r['what'][:90]}  [{r['action']}]")
+    else:
+        backup_config()
+
+        def go():
+            try:
+                if a.cmd in ("run", "land"):
+                    return run_chain(a.pr, a, from_gate=(a.cmd == "land"))
+                if a.cmd == "issue":
+                    return build_issue(a.pr, a)
+                if a.cmd == "scout":
+                    return scout(a)
+                if a.cmd == "resume":
+                    a.land = True  # an approved PR goes on to CI and the merge
+                    doctor()  # every loop lap runs resume: the doctor rides along without a loop restart
+                    return resume_all(a) or resume_note()
+            except RuntimeError as e:
+                return die(getattr(a, "pr", 0), "ERROR", str(e)[:200])
+            results = []
+            for _ in range(a.count):  # auto: a free PR first, else a free issue, else scout for new issues
+                if STOPFILE.exists():
+                    break
+                pr = cmd_pick(argparse.Namespace(all=False))
+                try:
+                    if pr is not None and not NO_BUILD.exists() and cmd_pick.prio > 1:
+                        n = pick_issue(a)  # a free p0/p1 issue goes before a lower-priority PR (2026-11-15)
+                        if n is not None and issue_jumps_queue(cmd_pick.prio, pick_issue.prio):
+                            log(f"issue #{n} (p{pick_issue.prio}) goes before PR #{pr} ({'p' + str(cmd_pick.prio) if cmd_pick.prio < 9 else 'no priority'})")
+                            results.append((f"issue {n}", build_issue(n, a)))
+                            continue
+                    if pr is not None:
+                        results.append((pr, run_chain(pr, a)))
+                    else:
+                        if cmd_pick.focus:  # one at a time: while the focus PR waits on its CI, nothing else starts, no build
+                            results.append(("focus", "skipped: " + ", ".join(f"#{k}" for k in cmd_pick.focus) + " in flight"))
+                            break
+                        if NO_BUILD.exists():
+                            results.append(("issue building", "BLOCKED: issue building is off (NO-BUILD); toggle on the board /config page"))
+                            break
+                        n = pick_issue(a)
+                        if n is not None:
+                            results.append((f"issue {n}", build_issue(n, a)))
+                        else:
+                            last = WORK / "scout-last"  # at most one scout per 6 h: the loop calls auto every free lap
+                            if last.exists() and time.time() - last.stat().st_mtime < 6 * 3600:
+                                results.append(("scout", "skipped: scouted less than 6 h ago"))
+                            else:
+                                last.write_text(now())
+                                results.append(("scout", scout(a)))
+                            break  # new issues are filed; the next `auto` picks them up
+                except RuntimeError as e:  # one PR's trouble must not stop the batch
+                    results.append((pr, die(pr, "ERROR", str(e)[:200])))
+                if DRY:
+                    break
+            return results or "no free PR"
+        # one chain per PR; commands that touch several PRs share the ops lock
+        # resume lands approved PRs one by one under their own per-PR locks; it must not wait for an issue build (auto holds
+        # "ops" for its whole run: #813 could not land at 03:2x on 11-14)
+        # auto: one lock per build process (up to 3 builds run at once; each claims its issue as i<N>, so two never build the same one)
+        key = a.pr if a.cmd in ("run", "land") else "resume" if a.cmd == "resume" else f"auto-{os.getpid()}" if a.cmd == "auto" else "ops"
+        print("RESULT:", with_lock(go, key=key))
+
+
+if __name__ == "__main__":
+    main()

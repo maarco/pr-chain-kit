@@ -1,0 +1,52 @@
+# Test fixture: the kollab example config with neutral account names (owner, bot). Tests only.
+[repo]
+slug = "example-org/example-repo"
+default_branch = "main"
+checkout = "~/dev/example-repo"
+python = ""
+import_guard = "kollabor_ai"
+src_globs = ["packages/*/src"]
+rules_doc = "bundles/skills/kollab-development/SKILL.md"
+
+[accounts]
+authors = ["owner", "bot"]
+trusted = ["owner", "bot"]
+merger = "bot"
+approver_of = { "bot" = "owner", "owner" = "bot" }
+checks = ["ci/tests", "ci/standards-check", "ci/security-scan"]
+
+[paths]
+work = "~/backups/pr-chain"
+worktree_root = "~/wt/pr-chain"
+lane_root = "~/wt"
+
+[labels]
+human_approved = "human-approved"
+blocked = ["wontfix", "duplicate", "invalid", "question", "status/blocked", "status/needs-info",
+           "status/needs-repro", "status/ready-for-human"]
+
+[changelog]
+forbidden = ["CHANGELOG.md", "kollabor/updates/CHANGELOG.md"]
+fragment_dir = "changes"
+
+[ui]
+enabled = true
+paths_regex = '(packages/kollabor-webui/frontend/src/|\.tsx$|\.css$|\.html$|kollabor\.ai|/site/)'
+proof_regex = 'frontend/tests/.+\.mjs$'
+frontend_dir = "packages/kollabor-webui/frontend"
+stamp_file = "packages/kollabor-webui/frontend/package.json"
+stack_script = "examples/kollab/ui_stack.py"
+term_shots_script = "examples/kollab/term_shots.py"
+playwright_browsers_path = ""
+
+[agent]
+env = { KOLLAB_NO_KEYRING = "1" }
+
+[tripwire]
+settings_file = ""
+
+[project]
+field_guide = "examples/kollab/field-guide-project.md"
+
+[notify]
+command = "notify-stub"
