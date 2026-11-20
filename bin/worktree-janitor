@@ -27,6 +27,7 @@ from pathlib import Path
 
 HOME = Path.home()
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "chain"))
+import procs  # noqa: E402  process working folders (/proc or lsof)
 try:
     from config import CFG as _CONF  # defaults come from pr-chain.toml; CLI flags still win
     SLUG = _CONF.slug
@@ -66,10 +67,7 @@ def worktrees(repo):
 
 def busy_dirs():
     """cwd of every process of this user: a worktree some process stands in is in use."""
-    result = run("lsof", "-a", "-d", "cwd", "-Fn", "-u", str(os.getuid()), timeout=60)
-    if result.returncode:
-        raise RuntimeError("cannot reliably inspect process working directories")
-    return {line[1:] for line in result.stdout.splitlines() if line.startswith("n")}
+    return set(procs.proc_cwds(own_only=True).values())  # raises RuntimeError when they cannot be read: nothing is removed
 
 
 def pr_list():

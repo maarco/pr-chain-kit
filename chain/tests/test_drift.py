@@ -11,6 +11,8 @@ loader = importlib.machinery.SourceFileLoader("prchain", str(src))
 spec = importlib.util.spec_from_loader("prchain", loader)
 sys.dont_write_bytecode = True
 pc = importlib.util.module_from_spec(spec); loader.exec_module(pc)
+_sh0 = pc.sh
+pc.sh = lambda *c, **k: types.SimpleNamespace(returncode=0, stdout="", stderr="") if c[:1] == ("gh",) else _sh0(*c, **k)  # tests never reach GitHub: every gh call is a no-op success unless a check stubs sh itself
 assert str(pc.WORK).startswith(str(tmp)), pc.WORK
 fails = []
 def check(name, got, want):

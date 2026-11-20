@@ -157,8 +157,19 @@ def sweep(d):
     home = re.compile(r"(?:^|\s)HOME=" + re.escape(root) + r"home(?:\s|$)")
     me = {os.getpid(), os.getppid()}
     pids = []
-    for flags, hit in ((["-axww"], lambda s: root in s), (["-axww", "-E"], home.search)):
-        for ln in subprocess.run(["/bin/ps", *flags, "-o", "pid=,command="], capture_output=True, text=True).stdout.splitlines():
+    linux = Path("/proc/self/environ").exists()  # macOS `ps -E` prints the environment; Linux keeps it in /proc/<pid>/environ
+    for flags, hit in ((["-axww"], lambda s: root in s), (None if linux else ["-axww", "-E"], home.search)):
+        if flags is None:
+            for env in Path("/proc").glob("[0-9]*/environ"):
+                try:
+                    text = " " + env.read_bytes().replace(b"\0", b" ").decode(errors="replace")
+                except OSError:
+                    continue
+                pid = int(env.parent.name)
+                if pid not in me | set(pids) and hit(text):
+                    pids.append(pid)
+            continue
+        for ln in subprocess.run(["ps", *flags, "-o", "pid=,command="], capture_output=True, text=True).stdout.splitlines():
             head, _, rest = ln.strip().partition(" ")
             if head.isdigit() and int(head) not in me | set(pids) and hit(rest):
                 pids.append(int(head))

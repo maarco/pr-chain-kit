@@ -58,6 +58,7 @@ os.environ.setdefault("KIT_AGENT", "pr-chain")
 ROOT = Path(__file__).resolve().parents[1]          # the pr-chain-kit repo root
 sys.path.insert(0, str(ROOT / "chain"))
 import config  # noqa: E402
+import procs  # noqa: E402  process working folders (/proc or lsof)
 from config import CFG, kit_env_defaults  # noqa: E402  one pr-chain.toml holds every project value
 kit_env_defaults()                                 # KIT_* env defaults from the toml, before kit reads them
 os.environ.setdefault("KIT_WORK", str(CFG.work))
@@ -145,6 +146,8 @@ def sh(*cmd, cwd=None, check=False, env=None, timeout=300):
         p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, env=env, timeout=timeout)
     except subprocess.TimeoutExpired:  # a hung git/gh/fold call ends the chain through die(), not with STATE left at running
         raise RuntimeError(f"{' '.join(map(str, cmd[:5]))}: timed out after {timeout} s") from None
+    except FileNotFoundError:  # a missing tool (gh, git, uv) is a failed call, not a crash
+        p = subprocess.CompletedProcess(cmd, 127, "", f"{cmd[0]}: command not found")
     if check and p.returncode:
         raise RuntimeError(f"{' '.join(map(str, cmd[:5]))}: {(p.stderr or p.stdout)[-300:]}")
     return p
@@ -355,7 +358,7 @@ def owner_reason(p, ps_text):
         st = sh("git", "-C", str(wt), "status", "--porcelain").stdout.strip()
         if st:
             return f"lane worktree {wt.name} has uncommitted work"
-    for status in (Path.home() / "backups" / "pr-lanes").glob(f"*{n}*/STATUS.md"):
+    for status in (CFG.lane_status_dir.glob(f"*{n}*/STATUS.md") if CFG.lane_status_dir else ()):  # other writers' lane notes
         last = [ln for ln in status.read_text().splitlines() if ln.strip()][-1:] or [""]
         fresh = time.time() - status.stat().st_mtime < 3 * 3600
         if fresh and not re.search(r"LANE (DONE|BLOCKED)", last[0]):
@@ -763,13 +766,12 @@ def stop_procs_in(path):
     """Stop every process whose working folder is inside path (an agent can leave an app daemon running in its worktree;
     two such leftovers ran for 8 and 19 hours on 11-14). SIGTERM, then SIGKILL after 30 s for the ones still there."""
     root = str(Path(path).resolve())
-    out = subprocess.run(["/usr/sbin/lsof", "-a", "-d", "cwd", "-Fpn", "-c", ""], capture_output=True, text=True).stdout
-    pids, pid = [], None
-    for ln in out.splitlines():
-        if ln.startswith("p"):
-            pid = int(ln[1:])
-        elif ln.startswith("n") and pid and pid != os.getpid() and (ln[1:] == root or ln[1:].startswith(root + "/")):
-            pids.append(pid)
+    try:
+        cwds = procs.proc_cwds()
+    except RuntimeError as e:
+        log(f"cannot list processes in {root}: {e}")
+        return []
+    pids = [q for q, cwd in cwds.items() if q != os.getpid() and (cwd == root or cwd.startswith(root + "/"))]
     for sig in (signal.SIGTERM, signal.SIGKILL):
         live = []
         for q in pids:
@@ -2458,7 +2460,8 @@ def pathlib_name(f):
 
 def term_cmd(wt, d, shots):
     """The command a UI reviewer runs to shoot a tmux spec it wrote. Its HOME is a scratch one, so the browsers path is given."""
-    return (f"PLAYWRIGHT_BROWSERS_PATH={Path.home()}/Library/Caches/ms-playwright {UV} run -q --no-project --with "
+    pw = f"PLAYWRIGHT_BROWSERS_PATH={CFG.playwright_browsers} " if CFG.playwright_browsers else ""
+    return (f"{pw}{UV} run -q --no-project --with "
             f"playwright==1.62.0 python -I {TERM_SHOTS} --wt {wt} --out {shots} --work {d}/term --spec <your spec.json>")
 
 
@@ -2669,9 +2672,9 @@ JANITOR = ROOT / "bin" / "worktree-janitor"
 
 def run_janitor():
     """Once an hour, in the background: the worktrees of every other lane whose PR merged or closed (the chain cleans its own).
-    Only against the real work dir, so a test run of the doctor never touches real worktrees."""
+    Only against the configured work dir (not a KIT_WORK override), so a test run of the doctor never touches real worktrees."""
     stamp = WORK / "janitor.last"
-    if WORK.resolve() != (Path.home() / "backups" / "pr-chain").resolve() or not JANITOR.exists():
+    if WORK.resolve() != CFG.work_configured.resolve() or not JANITOR.exists():
         return
     if stamp.exists() and time.time() - stamp.stat().st_mtime < 3600:
         return

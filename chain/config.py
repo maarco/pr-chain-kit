@@ -72,10 +72,12 @@ class Cfg:
         self.approver_of = dict(acc.get("approver_of", {}))
         self.checks = tuple(c.strip() for c in (os.environ.get("KIT_CHECKS") or ",".join(acc.get("checks", []))).split(",") if c.strip())
 
-        self.work = Path(os.environ.get("KIT_WORK") or _p(paths.get("work") or str(STATE / "work")))
+        self.work_configured = _p(paths.get("work") or str(STATE / "work"))  # what the file says, before any KIT_WORK override
+        self.work = Path(os.environ.get("KIT_WORK") or self.work_configured)
         self.worktree_root = Path(os.environ.get("PR_CHAIN_WT_ROOT") or _p(paths.get("worktree_root") or str(STATE / "wt")))
         self.lane_root = _p(paths["lane_root"]) if paths.get("lane_root") else self.worktree_root.parent
         self.board_config = _p(paths["board_config"]) if paths.get("board_config") else ""
+        self.lane_status_dir = _p(paths["lane_status_dir"]) if paths.get("lane_status_dir") else None  # <dir>/*<pr>*/STATUS.md of other writers
         # models.json; commands.json and profiles.json are read from the same folder
         self.models_file = Path(os.environ.get("PR_CHAIN_MODELS_FILE") or (_p(paths["models_file"]) if paths.get("models_file") else CHAIN_DIR / "models.json"))
 

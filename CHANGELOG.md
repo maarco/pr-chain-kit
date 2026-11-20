@@ -15,3 +15,4 @@ change to `pr-chain.toml`, the `pr-chain` command or the work-folder layout bump
 - Read-only reviewer sandbox on macOS (`[agent] require_sandbox`).
 - `[limits]` overrides for `flow.json`; board prompt edits saved beside the config.
 - Read-only web board, starter pack of CI workflows for the target repo.
+- Runs on Linux and macOS: process working folders come from `/proc` on Linux and `lsof` on macOS; a missing tool is a failed call, not a crash.

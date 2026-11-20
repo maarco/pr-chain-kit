@@ -83,14 +83,14 @@ wj.git = status_error
 check("status failure stays", J("merged")[1], "cannot inspect git status")
 wj.git = real_git
 check("activity scan failure stays", wj.judge(rows["merged"], repo, "origin/main", prs, set(), [], now_idle=lambda p: (_ for _ in ()).throw(OSError("denied")))[1], "cannot inspect activity")
-real_run = wj.run
-wj.run = lambda *a, **k: subprocess.CompletedProcess(a, 1, "", "error")
+real_scan = wj.procs.proc_cwds
+wj.procs.proc_cwds = lambda **k: (_ for _ in ()).throw(RuntimeError("neither /proc nor lsof"))
 try:
     wj.busy_dirs()
     check("process scan failure aborts", False, True)
 except RuntimeError:
     check("process scan failure aborts", True, True)
-wj.run = real_run
+wj.procs.proc_cwds = real_scan
 
 def fetch_error(repo_arg, *args, **kwargs):
     if args and args[0] == "fetch": return subprocess.CompletedProcess(args, 1, "", "error")

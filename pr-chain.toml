@@ -25,6 +25,7 @@ checks = ["ci/tests"]          # required CI checks the chain waits for
 [paths]
 work = ""                            # ledger.jsonl, prs/<n>/, logs/, scratch-home/; empty = ~/.local/state/pr-chain/work
 worktree_root = ""                   # one worktree per stage; empty = ~/.local/state/pr-chain/wt
+lane_status_dir = ""                 # optional: <dir>/*<pr>*/STATUS.md notes from other writers; a fresh one without DONE/BLOCKED keeps the PR off-limits
 lane_root = ""                       # where sibling lane worktrees live (stale-lane detection); empty = worktree_root's parent
 models_file = ""                     # models.json (commands.json, profiles.json beside it); empty = chain/models.json
 

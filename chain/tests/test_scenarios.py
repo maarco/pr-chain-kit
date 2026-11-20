@@ -9,6 +9,9 @@ atexit.register(shutil.rmtree, tmp, True)
 os.environ["PR_CHAIN_CONFIG"] = str(pathlib.Path(__file__).resolve().parents[2] / "chain/tests/test-config.toml")
 os.environ["KIT_WORK"] = str(tmp / "work")
 os.environ["PR_CHAIN_WT_ROOT"] = str(tmp / "wt")
+# no test reaches GitHub: a gh that always fails sits first on PATH for every module this file loads
+(tmp / "nogh").mkdir(); (tmp / "nogh" / "gh").write_text("#!/bin/sh\necho 'gh is stubbed in tests' >&2\nexit 1\n"); (tmp / "nogh" / "gh").chmod(0o755)
+os.environ["PATH"] = str(tmp / "nogh") + os.pathsep + os.environ.get("PATH", "")
 src = pathlib.Path(__file__).resolve().parents[2] / "bin/pr-chain"
 loader = importlib.machinery.SourceFileLoader("prchain", str(src))
 sys.dont_write_bytecode = True
@@ -393,6 +396,8 @@ check("stack broken: the PR fixer never ran", left["fixes_left"], 1)
 # the real ui_review: a STACK-BROKEN first line becomes STACK-DOWN, posts nothing, and is judged again on the next run
 ucalls = []
 real = importlib.machinery.SourceFileLoader("pc2", str(pathlib.Path(__file__).resolve().parents[2] / "bin/pr-chain")).load_module()
+_real_sh0 = real.sh
+real.sh = lambda *c, **k: types.SimpleNamespace(returncode=0, stdout="", stderr="") if c[:1] == ("gh",) else _real_sh0(*c, **k)  # tests never reach GitHub: every gh call is a no-op success unless a check stubs sh itself
 real.pr_info = lambda pr: dict(title="t", body="", author={"login": "owner"}, files=[{"path": "packages/kollabor-webui/frontend/src/App.tsx"}])
 real.fetch = lambda i: "m"
 real.make_wt = lambda wt, head: wt.mkdir(parents=True, exist_ok=True)
