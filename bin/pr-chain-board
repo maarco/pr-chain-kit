@@ -39,12 +39,12 @@ vendor_cache = {}
 
 # --- /config page state: models.json, thread count, issue-building block, profiles ---
 PC = ROOT / "chain"
-MODELS_FILE = PC / "models.json"
+MODELS_FILE = CONF.models_file  # the same file the chain reads
 CFG_FILE = Path(os.environ.get("PR_CHAIN_BOARD_CONFIG") or (CONF.board_config or WORK / "board-config.json"))
 NO_BUILD = WORK / "NO-BUILD"
 CONFIG_PAGE = PC / "board" / "config.html"
-PROFILES_FILE = PC / "profiles.json"
-COMMANDS_FILE = PC / "commands.json"  # named full commands; a stage value cmd:<name> runs one
+PROFILES_FILE = MODELS_FILE.with_name("profiles.json")
+COMMANDS_FILE = MODELS_FILE.with_name("commands.json")  # named full commands; a stage value cmd:<name> runs one
 # keep in sync with MODEL_ROLES in bin/pr-chain
 BUILTIN_MODELS = {"review": "haiku", "fix": "haiku", "gate": "opus", "ui": "opus", "build": "haiku", "scout": "haiku"}
 MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")

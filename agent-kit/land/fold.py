@@ -35,6 +35,14 @@ def run(*cmd, check=True, **kw):
     return p
 
 
+def dev_run(*cmd, check=True, **kw):
+    """Run a check in the merged worktree's CI-equivalent environment: [repo] run_prefix ({wt} = the worktree),
+    else the configured python for `python ...` commands."""
+    if CFG.run_prefix:
+        return run(*[a.replace("{wt}", str(WT)) for a in CFG.run_prefix], *cmd, check=check, **kw)
+    return run(str(PY) if cmd[0] == "python" else cmd[0], *cmd[1:], check=check, **kw)
+
+
 COPIES = CFG.changelog_forbidden or ("CHANGELOG.md",)
 BASE = CFG.branch
 SECTIONS = ("added", "changed", "deprecated", "removed", "fixed", "security")
@@ -140,13 +148,13 @@ tests = [f for f in pys if pathlib.Path(f).name.startswith("test_") and "/tmux/"
 src = [str(p) for g in CFG.src_globs for p in sorted(WT.glob(g))]
 env = dict(os.environ, PYTHONPATH=os.pathsep.join(src + [str(WT)]), **CFG.agent_env)
 if CFG.import_guard:
-    where = run(str(PY), "-c", "import " + CFG.import_guard + "; print(" + CFG.import_guard + ".__file__)", env=env).stdout.strip()
+    where = dev_run("python", "-c", "import " + CFG.import_guard + "; print(" + CFG.import_guard + ".__file__)", env=env).stdout.strip()
     if not where.startswith(str(WT)):
         sys.exit(f"STOP: tests would import {where}, not the train worktree")
 bad = []
 if pys:
     # Same rule set as CI's standards-check (ci.yml): main itself carries style warnings, so a full ruff run stops on noise.
-    lint = run(str(PY), "-m", "ruff", "check", "--select", "E9,F63,F7,F82", *pys, check=False)
+    lint = dev_run("python", "-m", "ruff", "check", "--select", "E9,F63,F7,F82", *pys, check=False)
     if lint.returncode:
         bad.append("ruff: " + lint.stdout[-400:])
 # One pytest call per import root: two test folders can both be packages whose top name is `tests`,
@@ -158,7 +166,7 @@ for f in tests:
         d = d.parent
     groups.setdefault(str(d), []).append(f)
 for part in groups.values():
-    t = run(str(PY), "-m", "pytest", "-q", "-x", "-p", "no:cacheprovider", *part, check=False, env=env, timeout=900)
+    t = dev_run("python", "-m", "pytest", "-q", "-x", "-p", "no:cacheprovider", *part, check=False, env=env, timeout=900)
     print("pytest:", t.stdout.strip().splitlines()[-1] if t.stdout.strip() else t.stderr[-300:])
     if t.returncode:
         bad.append("pytest: " + t.stdout[-1500:])

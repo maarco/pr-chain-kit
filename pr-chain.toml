@@ -12,6 +12,7 @@ python = ""                    # interpreter with the repo's dev deps; empty = <
 import_guard = ""              # a module name; if set, tests in a worktree must import it FROM the worktree
 src_globs = ["src"]            # PYTHONPATH roots, globbed inside a worktree (e.g. ["packages/*/src", "src"])
 rules_doc = "CONTRIBUTING.md"  # the repo rules file every agent skims (repo-relative)
+run_prefix = []                # prefix for the merge-time lint/test commands, {wt} = the worktree (e.g. ["uv", "run", "--project", "{wt}", "--"]); empty = python
 
 [accounts]
 authors = ["you", "your-bot"]  # the chain only ever works on PRs these accounts opened
@@ -24,6 +25,7 @@ checks = ["ci/tests"]          # required CI checks the chain waits for
 work = "~/backups/pr-chain"          # ledger.jsonl, prs/<n>/, logs/, scratch-home/ (never the checkout)
 worktree_root = "~/wt/pr-chain"      # one worktree per stage lives here
 lane_root = "~/wt"                   # where sibling lane worktrees live (stale-lane detection); empty = worktree_root's parent
+models_file = ""                     # models.json (commands.json, profiles.json beside it); empty = chain/models.json
 
 [labels]
 human_approved = "human-approved"    # label that sends an AWAIT-HUMAN PR to CI + merge
@@ -50,6 +52,9 @@ playwright_browsers_path = ""        # browser cache for agents with a scratch H
 [agent]
 # Extra env every agent command runs with (the app's "don't touch my real config" switches).
 env = {}
+# Reviewers (review, gate, addendum, ui) run under macOS sandbox-exec with writes to the checkout denied.
+# Without sandbox-exec (Linux) they refuse to start unless this is false; then only the post-run clean-worktree check guards.
+require_sandbox = true
 
 [tripwire]
 # Settings file watched for damage while an agent runs: gone/unreadable, a setting removed, or a

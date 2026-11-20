@@ -31,8 +31,8 @@ Options for run/auto/land:
     ({"review": "codex:gpt-6-luna", "fix": "codex:gpt-6.1-terra", ...}) > built-in. See `pr-chain models`.
   --dry-run           print what would happen, launch nothing, write nothing remote
 
-Stages (each one a NEW agent): fold main in (no model) -> REVIEW (read-only) -> FAIL: FIX (new agent, red-first, commits
-locally, the script pushes with an ordinary push) -> REVIEW again (new agent) ... -> PASS: GATE (non-Haiku) -> CI wait -> LAND.
+Stages (each one a NEW agent): fold main in (no model) -> REVIEW-FIX (judge the exact head; after FAIL, fix in its worktree)
+-> a fresh REVIEW-FIX ... -> PASS: GATE (read-only, non-Haiku) -> CI wait -> LAND.
 Guards: one chain at a time, one claim per PR, STOP file, the settings-file damage tripwire after every agent (when
 [tripwire] settings_file is set), per-agent tool-call budgets and agent timeout from flow.json (-1 = no limit),
 no force push, never gpt-6-astra, repeated identical findings stop the loop (NEEDS-HUMAN).
@@ -475,7 +475,7 @@ def release(pr):
 
 # --- model defaults: CLI flag > env PR_CHAIN_<ROLE>_MODEL > chain/models.json > built-in ---
 MODEL_ROLES = {"review": "haiku", "fix": "haiku", "gate": "opus", "ui": "opus", "build": "haiku", "scout": "haiku"}
-MODELS_FILE = Path(os.environ.get("PR_CHAIN_MODELS_FILE", str(CHAIN / "models.json")))
+MODELS_FILE = CFG.models_file  # [paths] models_file or env PR_CHAIN_MODELS_FILE; commands.json sits beside it
 
 
 def model_defaults():
@@ -586,6 +586,66 @@ def agent_cmd(model, prompt="Read <brief.md> and follow it exactly.", brief=BRIE
     return ["zsh", "-lic", inner]
 
 
+READ_ONLY_AGENT_ROLES = frozenset(("review", "gate", "addendum", "ui"))
+READ_ONLY_PROOF_FILE = ".read-only-review.json"
+# macOS: sandbox-exec denies writes. Elsewhere, with [agent] require_sandbox = false, only the post-run clean-worktree check guards.
+READ_ONLY_POLICY = "macos-path-write-deny-v1" if shutil.which("sandbox-exec") else "post-run-clean-check-v1"
+
+
+def _sbpl_quote(path):
+    return '"' + str(path).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n") + '"'
+
+
+def _tracked_symlink_targets(repo):
+    """Return tracked symlink targets so an external link cannot bypass a protected repo path."""
+    p = subprocess.run(["git", "-C", str(repo), "ls-files", "-s", "-z"], capture_output=True,
+                       env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
+    if p.returncode:
+        detail = (p.stderr or p.stdout)[-200:].decode(errors="replace")
+        raise RuntimeError(f"cannot enumerate tracked links in {repo}: {detail}")
+    targets = set()
+    for entry in p.stdout.split(b"\0"):
+        header, sep, raw_path = entry.partition(b"\t")
+        if not sep or not header.startswith(b"120000 "):
+            continue
+        link = Path(repo) / os.fsdecode(raw_path)
+        if link.is_symlink():
+            targets.add(link.resolve(strict=False))
+    return targets
+
+
+def readonly_agent_command(role, cmd, outdir):
+    """Deny writes to the checkout and worktrees while leaving a reviewer's output folder writable."""
+    if role not in READ_ONLY_AGENT_ROLES:
+        return cmd
+    sandbox = shutil.which("sandbox-exec")
+    if not sandbox:
+        if not CFG.require_sandbox:
+            return cmd  # the post-run clean-worktree check still rejects any verdict from a reviewer that wrote
+        raise RuntimeError("sandbox-exec is unavailable; refusing to start a reviewer unsandboxed "
+                           "(set [agent] require_sandbox = false to rely on the post-run clean-worktree check)")
+
+    stage_wt = wt_for(outdir)
+    status = subprocess.run(["git", "-C", str(stage_wt), "status", "--porcelain", "--untracked-files=all"],
+                            capture_output=True, env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
+    if status.returncode or status.stdout.strip():
+        raise RuntimeError(f"review worktree is not clean at launch: {stage_wt}")
+    roots = {Path(CHECKOUT).resolve(), Path(WT_ROOT).resolve(), stage_wt.resolve()}
+    for repo in (Path(CHECKOUT).resolve(), stage_wt.resolve()):
+        roots.update(_tracked_symlink_targets(repo))
+    protected = []
+    for root in sorted(roots, key=lambda p: (len(p.parts), str(p))):
+        if not any(root == parent or parent in root.parents for parent in protected):
+            protected.append(root)
+
+    output = Path(outdir).resolve()
+    if any(output == root or output in root.parents or root in output.parents for root in protected):
+        raise RuntimeError(f"review output folder overlaps a protected source path: {output}")
+    rules = ["(version 1)", "(allow default)"]
+    rules.extend(f"(deny file-write* (subpath {_sbpl_quote(root)}))" for root in protected)
+    return [sandbox, "-p", "\n".join(rules), *cmd]
+
+
 def run_agent(role, model, brief, cwd, outdir, pr):
     """Run one fresh agent to completion, synchronously. Returns dict(rc, secs, turns, cost)."""
     kind, name = runner(model)
@@ -597,9 +657,17 @@ def run_agent(role, model, brief, cwd, outdir, pr):
     prompt = f"Read {brief} and follow it exactly."
     before = cfg_snapshot()
     cmd = agent_cmd(model, prompt, brief=brief)
+    read_only = role in READ_ONLY_AGENT_ROLES
+    if read_only:
+        try:
+            cmd = readonly_agent_command(role, cmd, outdir)
+        except Exception as e:
+            log(f"#{pr} {role} reviewer not started: {e}")
+            return dict(rc=125, secs=0, turns=None, cost=None, sandbox_error=str(e))
+        env["GIT_OPTIONAL_LOCKS"] = "0"
     t0 = time.time()
     via = f" via command {model.name}" if getattr(model, "name", None) else ""
-    log(f"#{pr} {role} agent start: {kind}:{name}{via} cwd={cwd}")
+    log(f"#{pr} {role} agent start: {kind}:{name}{via} cwd={cwd}" + (" sandbox=read-only" if read_only else ""))
     if DRY:
         log(f"[dry] would run: {' '.join(shlex.quote(c) for c in cmd[:6])} ...")
         return dict(rc=0, secs=0, turns=None, cost=None, dry=True)
@@ -626,7 +694,7 @@ def run_agent(role, model, brief, cwd, outdir, pr):
     if damage:
         ledger(stage="TRIPWIRE", pr=pr, role=role, why=f"{TRIPWIRE_CFG} damaged during an agent run", paths=damage[:12])
         STOPFILE.write_text("config.json damaged during an agent run (" + ", ".join(damage[:6])
-                            + "); check it against ~/backups/pr-chain/backup before anything else\n")
+                            + "); check it against the work folder's backup/ copy before anything else\n")
         raise SystemExit(f"TRIPWIRE: {TRIPWIRE_CFG} damaged (" + ", ".join(damage[:6]) + "); chain stopped, STOP file written")
     return res
 
@@ -1007,8 +1075,59 @@ def judged_by_current_rules(vp):
     return vp.stat().st_mtime >= max(f.stat().st_mtime for f in files)
 
 
+def public_pr_body(info):
+    """Return only the GitHub body; title and author are separate metadata fields."""
+    return info.get("body") or ""
+
+
+def pr_body_guidance(info, d):
+    """Keep local PR snapshots distinct from the body the chain may post publicly."""
+    return (
+        "\n\n## Public PR text snapshot\n"
+        f"GitHub title (a separate field, not part of the body): {info['title']}\n"
+        f"`{d / 'pr.md'}` contains only the exact current GitHub PR body.\n"
+        "Review wording against that body only. If you write `new-pr-body.md`, include only the complete corrected body; "
+        "the chain posts that file verbatim.\n"
+    )
+
+
+def readonly_proof_path(d):
+    return Path(d) / READ_ONLY_PROOF_FILE
+
+
+def has_readonly_proof(d, head):
+    try:
+        proof = json.loads(readonly_proof_path(d).read_text())
+        return proof.get("version") == 1 and proof.get("policy") == READ_ONLY_POLICY and proof.get("head") == head
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def write_readonly_proof(d, head):
+    readonly_proof_path(d).write_text(json.dumps({"version": 1, "policy": READ_ONLY_POLICY, "head": head}) + "\n")
+
+
+def invalidate_verdict(d, vp):
+    readonly_proof_path(d).unlink(missing_ok=True)
+    if not vp.exists():
+        return None
+    rejected = vp.with_name(f"{vp.stem}.rejected-{time.time_ns()}{vp.suffix}")
+    vp.rename(rejected)
+    return rejected
+
+
+def read_only_worktree_changed(wt, head):
+    """Fail closed if a reviewer lacks the exact pinned, clean Git worktree."""
+    if not wt.exists():
+        return True
+    current = sh("git", "-C", str(wt), "rev-parse", "HEAD")
+    status = sh("git", "-C", str(wt), "status", "--porcelain", "--untracked-files=all")
+    return (current.returncode != 0 or status.returncode != 0 or current.stdout.strip() != head
+            or bool(status.stdout.strip()))
+
+
 def review(pr, rnd, kind, model, post, old=None, extra="", fix_too=False):
-    """One fresh read-only reviewer at the PR's exact head. Returns (verdict, verdict_path, head)."""
+    """Run a fresh exact-head review; only review-fix mode may edit after writing a FAIL verdict."""
     info = pr_info(pr)
     main = fetch(info)
     head = branch_head(info)
@@ -1016,11 +1135,13 @@ def review(pr, rnd, kind, model, post, old=None, extra="", fix_too=False):
         return "BEHIND", None, head
     d = WORK / "prs" / str(pr) / f"r{rnd}-{kind}"
     vp = d / "verdict.md"
-    if vp.exists() and head in vp.read_text():  # resume: this exact head was already judged
+    read_only = not fix_too
+    if vp.exists() and head in vp.read_text():  # resume only a verdict with evidence for this stage mode
         v = parse_verdict(vp)
         # A FAIL written before the newest prompt or field-guide edit is judged again: the rules it was judged by have changed
         # (#1055, 11-16: a stale test count was a P2 FAIL, the guide made it P3, and the old FAIL was replayed six times).
-        if v != "FAIL" or DRY or judged_by_current_rules(vp):
+        proof_ok = not read_only or DRY or has_readonly_proof(d, head)
+        if v and proof_ok and (v != "FAIL" or DRY or judged_by_current_rules(vp)):
             return v, vp, head
     if d.exists() and not DRY:
         retire_wt(d)
@@ -1029,7 +1150,11 @@ def review(pr, rnd, kind, model, post, old=None, extra="", fix_too=False):
     wt = wt_for(d)
     if not DRY:
         make_wt(wt, head)
-        (d / "pr.md").write_text(f"# #{pr}: {info['title']}\n\nauthor: {info['author']['login']}\n\n{info['body'] or ''}\n")
+        if read_only and read_only_worktree_changed(wt, head):
+            ledger(pr=pr, stage="review-worktree-rejected", kind=kind, round=rnd, head=head,
+                   why="review worktree is missing, dirty, or not at the pinned head")
+            return None, vp, head
+        (d / "pr.md").write_text(public_pr_body(info))
         (d / "issues.md").write_text(issues_text(info))
     caps = CAPS[kind] + (CAPS["fix"] if fix_too else 0)
     kv = dict(PR=pr, KIND=kind, HEAD=head, MAIN=main, WT=wt, DIR=d, EXTRA=extra, CALLS=caps, CALLS_SOFT=caps - 8,
@@ -1039,17 +1164,28 @@ def review(pr, rnd, kind, model, post, old=None, extra="", fix_too=False):
     brief = d / "brief.md"
     if not DRY:
         brief.write_text(render("addendum.md" if kind == "addendum" else "review.md", **kv)
-                         + (render("review-fix.md", **kv) if fix_too else ""))
-    res = run_agent(kind, model, brief, wt if wt.exists() else d, d, pr)  # start in the pinned worktree; outputs go to DIR
-    verdict = parse_verdict(vp) if not DRY else "DRY"
+                         + (render("review-fix.md", **kv) if fix_too else "")
+                         + pr_body_guidance(info, d))
+    role = "review-fix" if fix_too else kind
+    res = run_agent(role, model, brief, wt if wt.exists() else d, d, pr)  # start in the pinned worktree; outputs go to DIR
+    readonly_violation = read_only and not DRY and read_only_worktree_changed(wt, head)
+    if readonly_violation:
+        rejected = invalidate_verdict(d, vp)
+        log(f"#{pr} {kind} reviewer changed its protected worktree; verdict rejected; worktree preserved ({rejected or 'no verdict file'})")
+        verdict = None
+    else:
+        verdict = parse_verdict(vp) if not DRY else "DRY"
+        if read_only and verdict in ("PASS", "FAIL") and not DRY:
+            write_readonly_proof(d, head)
     if fix_too and verdict == "PASS" and not DRY and self_changed(wt, head):  # never passes its own code: a fresh reviewer judges it
         vp.write_text("FAIL\nThis reviewer passed the PR but also changed it; a fresh reviewer judges those changes.\n"
                       + vp.read_text().split("\n", 1)[-1])
         verdict = "FAIL"
     if not DRY:
-        if not (fix_too and verdict == "FAIL"):  # a failed review-fix keeps its worktree: fix() checks and pushes from it
+        if not readonly_violation and not (fix_too and verdict == "FAIL"):  # keep failed review-fix and rejected reviewer work for inspection
             drop_wt(wt)
-        ledger(pr=pr, stage="verdict", kind=kind, round=rnd, head=head, verdict=verdict, model=model, **res)
+        ledger(pr=pr, stage="verdict", kind=kind, round=rnd, head=head, verdict=verdict, model=model,
+               readonly_violation=readonly_violation, **res)
         if verdict and post:
             post_verdict(pr, kind, head, main, vp)
             if kind != "addendum":
@@ -1061,8 +1197,10 @@ def self_changed(wt, head):
     """True when an agent committed or left edits in a worktree that started at head."""
     if not wt.exists():
         return False
-    moved = sh("git", "-C", str(wt), "rev-parse", "HEAD").stdout.strip() != head
-    return moved or bool(sh("git", "-C", str(wt), "status", "--porcelain", "--untracked-files=no").stdout.strip())
+    current = sh("git", "-C", str(wt), "rev-parse", "HEAD")
+    status = sh("git", "-C", str(wt), "status", "--porcelain", "--untracked-files=all")
+    return (current.returncode != 0 or status.returncode != 0 or current.stdout.strip() != head
+            or bool(status.stdout.strip()))
 
 
 def fix(pr, rnd, model, verdict_path, head, last_head, done_in=None, prompt="fix.md"):
@@ -1089,7 +1227,7 @@ def fix(pr, rnd, model, verdict_path, head, last_head, done_in=None, prompt="fix
             run_agent("fix", model, d / "brief.md", d, d, pr)
             return None, "dry run"
         make_wt(wt, head)
-        (d / "pr.md").write_text(f"# #{pr}: {info['title']}\n\n{info['body'] or ''}\n")
+        (d / "pr.md").write_text(public_pr_body(info))
         (d / "issues.md").write_text(issues_text(info))
         main = fetch(info)
         state = "main is already merged in; nothing to resolve."
@@ -1106,7 +1244,8 @@ def fix(pr, rnd, model, verdict_path, head, last_head, done_in=None, prompt="fix
                                              "none: the script wrote this verdict itself (red CI, the merge gate, a conflict or the finding history)"),
                                 MERGE_STATE=state,
                                 WT=wt, DIR=d, BRANCH=info["headRefName"], SCRATCH_HOME=SCRATCH_HOME, SRC=src_path(wt), PY=PY,
-                                CALLS=CAPS["redesign" if prompt == "redesign.md" else "fix"], CALLS_SOFT=CAPS["redesign" if prompt == "redesign.md" else "fix"] - 10))
+                                CALLS=CAPS["redesign" if prompt == "redesign.md" else "fix"], CALLS_SOFT=CAPS["redesign" if prompt == "redesign.md" else "fix"] - 10)
+                         + pr_body_guidance(info, d))
         res = run_agent("fix", model, brief, wt, d, pr)
     rep = d / "fix-report.md"
     status = (rep.read_text().strip().splitlines()[-1] if rep.exists() and rep.read_text().strip() else "NO-REPORT")
@@ -1172,7 +1311,14 @@ def ruff_added(wt, base, head, changed):
     added = {}
     for c in py:
         spans = []
-        for m in re.finditer(r"^@@ -\S+ \+(\d+)(?:,(\d+))? @@", sh("git", "-C", str(wt), "diff", "-U0", f"{base}..{head}", "--", c).stdout, re.M):
+        # Spans over the PR's own delta (merge-base(origin/main, head)..head), not base..head:
+        # a clean merge of main adds main's whole file set to base..head, and main's own lint
+        # debt (169 ruff errors CI never gates, --select only E9,F63,F7,F82) would be blamed
+        # on the fixer. Lines identical to main produce no hunk, so they cannot be flagged.
+        dl = sh("git", "-C", str(wt), "diff", "-U0", f"origin/main...{head}", "--", c)
+        if dl.returncode:  # no origin/main ref here: fall back to the raw range rather than skipping the guard
+            dl = sh("git", "-C", str(wt), "diff", "-U0", f"{base}..{head}", "--", c)
+        for m in re.finditer(r"^@@ -\S+ \+(\d+)(?:,(\d+))? @@", dl.stdout, re.M):
             start, n = int(m.group(1)), int(m.group(2) or 1)
             spans.append((start, start + n - 1))
         added[str((wt / c).resolve())] = spans
@@ -1210,7 +1356,7 @@ def ci_red(pr, head):
     if info["headRefOid"] != head:
         return []
     bad = [c for c in info["statusCheckRollup"] if (c.get("conclusion") or c.get("state")) in ("FAILURE", "ERROR", "TIMED_OUT")]
-    bad = [c for c in bad if not land_owned(c)]
+    bad = [c for c in bad if not later_owned(c)]
     if any((c.get("name") or c.get("context")) in kit.CHECKS for c in bad):
         return bad
     # the merge step wants every check green, so a failing check outside the required set still blocks it (#1047 import-smoke);
@@ -1302,6 +1448,10 @@ def ci_findings(pr, rnd, head, bad):
 
 
 GATE_LATER = ("threads_resolved", "base_current")  # the land step owns these: folds and review threads come later
+REVIEW_LATER = (
+    "regression_test: independent current-head approval required for finding id(s):",
+    "WARNING regression_test: red-first execution is not verified by this gate for finding id(s):",
+)
 
 
 def check_summary(url):
@@ -1332,14 +1482,15 @@ def codeql_alerts(pr):
     return [ln[:300] for ln in p.stdout.splitlines() if ln.strip()][:25]
 
 
-def land_owned(c):
-    """A red dod/ready-for-review check whose only failed items are GATE_LATER ones: the land step owns those (the rule
-    gate_findings applies to the local run), so no fixer is handed a finding it cannot fix (#1065). The merge step still
-    needs the check green. An unreadable summary counts as not land-owned, so the check stays red."""
+def later_owned(c):
+    """A red DoD check with only known land/reviewer-owned items is deferred to that stage; unknown items stay red."""
     if (c.get("name") or c.get("context")) != "dod/ready-for-review":
         return False
     items = [ln[2:] for ln in check_summary(c.get("detailsUrl")) if ln.startswith("- ")]
-    return bool(items) and all(i.startswith(GATE_LATER) for i in items)
+    allowed = GATE_LATER + REVIEW_LATER
+    land_wait = bool(items) and all(i.startswith(GATE_LATER) for i in items)
+    review_wait = bool(items) and any(i.startswith(REVIEW_LATER[0]) for i in items)
+    return bool(items) and all(i.startswith(allowed) for i in items) and (land_wait or review_wait)
 
 
 def gate_findings(pr):
@@ -1358,7 +1509,7 @@ def gate_findings(pr):
     for ln in p.stdout.splitlines():
         if ln.startswith("Audited"):
             break
-        if ln.startswith("- ") and not ln[2:].startswith(GATE_LATER):
+        if ln.startswith("- ") and not ln[2:].strip().startswith(GATE_LATER + REVIEW_LATER):
             items.append(ln[2:].strip())
     return items
 
@@ -2334,7 +2485,8 @@ def ui_review(pr, rnd, head, a):
     main = fetch(info)
     d = WORK / "prs" / str(pr) / f"r{rnd}-ui"
     vp = d / "ui-verdict.md"
-    if vp.exists() and head in vp.read_text() and parse_verdict(vp):  # resume: this exact head was already judged
+    if (vp.exists() and head in vp.read_text() and parse_verdict(vp)
+            and (DRY or has_readonly_proof(d, head))):  # reuse only a verdict with a clean, sandboxed review
         return parse_verdict(vp), vp, head
     ui_files = [f["path"] for f in info["files"] if UI_RE.search(f["path"])]
     if DRY:
@@ -2346,8 +2498,14 @@ def ui_review(pr, rnd, head, a):
     d.mkdir(parents=True)
     wt, shots, stack = wt_for(d), d / "shots", d / "stack"
     make_wt(wt, head)
+    git_wt = (wt / ".git").exists()
+    if git_wt and read_only_worktree_changed(wt, head):
+        ledger(pr=pr, stage="ui-worktree-rejected", round=rnd, head=head,
+               why="UI review worktree is dirty or not at the pinned head")
+        return None, vp, head
+    reviewer_ran, dirty_after_agent, readonly_violation = False, False, False
     try:
-        (d / "pr.md").write_text(f"# #{pr}: {info['title']}\n\nauthor: {info['author']['login']}\n\n{info['body'] or ''}\n")
+        (d / "pr.md").write_text(public_pr_body(info))
         (d / "issues.md").write_text(issues_text(info))
         up = sh(sys.executable, str(UI_STACK), "up", "--wt", str(wt), "--dir", str(stack), "--python", str(PY), timeout=1200)
         ledger(pr=pr, stage="ui-stack", rc=up.returncode, tail=(up.stdout + up.stderr)[-200:])
@@ -2359,21 +2517,42 @@ def ui_review(pr, rnd, head, a):
         brief = d / "brief.md"
         brief.write_text(render("ui-review.md", PR=pr, HEAD=head, MAIN=main, WT=wt, DIR=d, UI_FILES=", ".join(ui_files[:20]),
                                 STACK_URL=url, SHOTS=shots, TERM_SHOTS=term_note, TERM_SHOOT=term_cmd(wt, d, shots), UI_SHOOT=UI_SHOOT, CALLS=CAPS["ui"], CALLS_SOFT=CAPS["ui"] - 10,
-                                SCRATCH_HOME=SCRATCH_HOME, PY=PY, SRC=src_path(wt)))
+                                SCRATCH_HOME=SCRATCH_HOME, PY=PY, SRC=src_path(wt))
+                         + pr_body_guidance(info, d))
         try:  # the per-PR block replaces a plain marker line, so a chain still running older code is unaffected
             focus = ui_focus(pr, info, main, head, d)
         except Exception as e:
             focus = f"## This PR, specifically\n- {info.get('title', '')} (the script could not build the details: {str(e)[:80]})"
         brief.write_text(brief.read_text().replace("<!--PR_FOCUS-->", focus))
         res = run_agent("ui", a.ui_model, brief, d, d, pr)
+        reviewer_ran = True
     finally:
         sh(sys.executable, str(UI_STACK), "down", "--dir", str(stack))
-        drop_wt(wt)
+        if reviewer_ran:
+            dirty_after_agent = read_only_worktree_changed(wt, head)
+            if dirty_after_agent and parse_verdict(vp):
+                rejected = invalidate_verdict(d, vp)
+                readonly_violation = True
+                log(f"#{pr} UI reviewer changed its protected worktree; verdict rejected; worktree preserved ({rejected})")
+            if not dirty_after_agent:
+                drop_wt(wt)
+        else:
+            drop_wt(wt)
         clean_stack(stack)
+    if readonly_violation:
+        ledger(pr=pr, stage="ui-verdict", round=rnd, head=head, verdict=None, model=a.ui_model,
+               readonly_violation=True, **res)
+        return None, vp, head
     verdict = parse_verdict(vp)
     if verdict is None and vp.exists() and vp.read_text().lstrip("`*# \n").upper().startswith("STACK-BROKEN"):
         ledger(pr=pr, stage="ui-verdict", round=rnd, head=head, verdict="STACK-BROKEN", model=a.ui_model, **res)
         return "STACK-DOWN", vp, head  # the chain's own stack is at fault: retry later, never a PR fixer, nothing posted
+    if dirty_after_agent and verdict is None:
+        ledger(pr=pr, stage="ui-verdict", round=rnd, head=head, verdict=None, model=a.ui_model,
+               readonly_violation=True, **res)
+        return None, vp, head
+    if verdict in ("PASS", "FAIL"):
+        write_readonly_proof(d, head)
     ledger(pr=pr, stage="ui-verdict", round=rnd, head=head, verdict=verdict, model=a.ui_model, **res)
     if verdict and not a.no_post:
         file_followups(pr, vp, area="area/webui")  # on any verdict: an unrelated problem is an issue whether the PR passes or not

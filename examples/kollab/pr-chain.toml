@@ -8,6 +8,7 @@ checkout = "~/dev/kollab"
 python = "~/dev/kollab/.venv/bin/python"
 import_guard = "kollabor_ai"
 src_globs = ["packages/*/src"]
+run_prefix = ["uv", "run", "--project", "{wt}", "--locked", "--all-packages", "--extra", "dev", "--"]  # fold checks run in the locked uv workspace
 rules_doc = "bundles/skills/kollab-development/SKILL.md"
 
 [accounts]

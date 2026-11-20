@@ -49,6 +49,7 @@ class Cfg:
         self.import_guard = repo.get("import_guard", "")            # module whose import must resolve inside a worktree
         self.src_globs = tuple(repo.get("src_globs", ("packages/*/src", "src")))
         self.rules_doc = repo.get("rules_doc", "CONTRIBUTING.md")   # the repo rules every agent skims
+        self.run_prefix = list(repo.get("run_prefix", []))           # merge-check command prefix, {wt} = worktree; empty = python
         self.checkout = Path(os.environ.get("KIT_CHECKOUT") or _p(repo.get("checkout", "~/dev/repo")))
         self.python = Path(os.environ.get("KIT_PYTHON") or _p(repo.get("python") or str(self.checkout / ".venv/bin/python")))
 
@@ -62,6 +63,8 @@ class Cfg:
         self.worktree_root = Path(os.environ.get("PR_CHAIN_WT_ROOT") or _p(paths.get("worktree_root", "~/wt/pr-chain")))
         self.lane_root = _p(paths["lane_root"]) if paths.get("lane_root") else self.worktree_root.parent
         self.board_config = _p(paths["board_config"]) if paths.get("board_config") else ""
+        # models.json; commands.json and profiles.json are read from the same folder
+        self.models_file = Path(os.environ.get("PR_CHAIN_MODELS_FILE") or (_p(paths["models_file"]) if paths.get("models_file") else CHAIN_DIR / "models.json"))
 
         self.human_label = labels.get("human_approved", "human-approved")
         self.block_labels = frozenset(labels.get("blocked", []))
@@ -80,6 +83,7 @@ class Cfg:
         self.playwright_browsers = _p(ui["playwright_browsers_path"]) if ui.get("playwright_browsers_path") else None
 
         self.agent_env = dict(agent.get("env", {}))
+        self.require_sandbox = bool(agent.get("require_sandbox", True))  # reviewers refuse to start without sandbox-exec
 
         self.tripwire_file = _p(trip["settings_file"]) if trip.get("settings_file") else None
 
