@@ -13,7 +13,7 @@ Closed-PR commits must also be reachable from a local branch. Branches are never
   worktree-janitor             list what would go using the local main ref (dry run)
   worktree-janitor --apply     remove them (plain `git worktree remove`, never forced)
 
-Run by hand, and by `pr-chain doctor` at most once an hour (apply mode, log ~/backups/pr-chain/logs/janitor.log).
+Run by hand, and by `pr-chain doctor` at most once an hour (apply mode, log <work>/logs/janitor.log).
 """
 import argparse
 import fcntl

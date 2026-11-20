@@ -1,7 +1,8 @@
 # pr-chain.toml — every project-specific value the chain uses, in one file.
 # Env vars always win over this file (KIT_REPO, KIT_CHECKOUT, KIT_WORK, PR_CHAIN_WT_ROOT,
 # PR_CHAIN_MODELS_FILE, PR_CHAIN_FLOW, PR_CHAIN_CONFIG — the same names the scripts already read).
-# Relative paths resolve against this repo's root; ~ expands. Copy this file, fill it in, done.
+# `pr-chain init` writes a filled-in copy to ~/.config/pr-chain/pr-chain.toml. ~ expands; a relative path
+# resolves next to the config file when it exists there, else inside the kit (e.g. examples/kollab/ui_stack.py).
 # A worked example for a real repo: examples/kollab/pr-chain.toml.
 
 [repo]
@@ -22,9 +23,9 @@ approver_of = { "your-bot" = "you" }  # the non-author account named as approver
 checks = ["ci/tests"]          # required CI checks the chain waits for
 
 [paths]
-work = "~/backups/pr-chain"          # ledger.jsonl, prs/<n>/, logs/, scratch-home/ (never the checkout)
-worktree_root = "~/wt/pr-chain"      # one worktree per stage lives here
-lane_root = "~/wt"                   # where sibling lane worktrees live (stale-lane detection); empty = worktree_root's parent
+work = ""                            # ledger.jsonl, prs/<n>/, logs/, scratch-home/; empty = ~/.local/state/pr-chain/work
+worktree_root = ""                   # one worktree per stage; empty = ~/.local/state/pr-chain/wt
+lane_root = ""                       # where sibling lane worktrees live (stale-lane detection); empty = worktree_root's parent
 models_file = ""                     # models.json (commands.json, profiles.json beside it); empty = chain/models.json
 
 [labels]

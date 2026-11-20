@@ -20,24 +20,42 @@ Every stop has a named end state (`MERGED`, `AWAIT-HUMAN`, `RESTING`, `CI-RED`, 
 
 ![One pull request: chain state, linked issue, review conversation and every step it took](docs/images/pull-requests.png)
 
-## Quickstart
+## Install
 
-You need: Python 3.11+, `git`, the `gh` CLI logged in, and the `claude` or `codex` CLI.
+You need Python 3.11+, `git`, the `gh` CLI logged in, and the `claude` or `codex` CLI.
 
 ```bash
-git clone <this repo> && cd pr-chain-kit
-cp examples/kollab/pr-chain.toml pr-chain.local.toml   # gitignored; loaded automatically
-$EDITOR pr-chain.local.toml                            # repo, accounts, paths, checks
-python3 -B bin/pr-chain pick                           # read-only: which PR would run next
-python3 -B bin/pr-chain run <pr> --dry-run             # walk one PR without launching agents
-python3 -B bin/pr-chain run <pr> --land                # run it for real
-python3 -B bin/pr-chain-board 8790 &                   # the board at http://127.0.0.1:8790
-nohup python3 -B bin/pr-chain-loop &                   # run continuously
+uvx --from git+https://github.com/OWNER/pr-chain-kit pr-chain init   # once published to PyPI: uvx pr-chain init
 ```
 
-`pr-chain.toml` is the commented template with every setting. Put your real values in
-`pr-chain.local.toml`: it is gitignored and wins over `pr-chain.toml`. `PR_CHAIN_CONFIG=<file>` wins
-over both.
+Nothing is copied anywhere else: `uvx` keeps the package in its own cache. To keep a `pr-chain`
+command on your PATH, use `uv tool install git+https://github.com/OWNER/pr-chain-kit` (later `uv tool install pr-chain`).
+
+`pr-chain init` asks for the repo, its local checkout, your two accounts and the required checks,
+writes `~/.config/pr-chain/pr-chain.toml`, and checks that `gh`, `git` and an agent CLI are ready.
+
+| What | Where |
+|---|---|
+| Your config | `~/.config/pr-chain/pr-chain.toml` (`PR_CHAIN_CONFIG` overrides it) |
+| Model choice per stage | `~/.config/pr-chain/models.json`, `commands.json`, `profiles.json` |
+| Run history, per-PR state, agent logs | `~/.local/state/pr-chain/work` |
+| One checkout of your repo per stage | `~/.local/state/pr-chain/wt`, removed when a chain ends |
+| The kit's own files | `pr-chain path` prints it |
+
+## Use it
+
+```bash
+pr-chain pick                      # read-only: which PR would run next
+pr-chain run <pr> --dry-run        # walk one PR without launching agents
+pr-chain run <pr> --land           # run it for real
+pr-chain board &                   # the board at http://127.0.0.1:8790
+nohup pr-chain loop &              # run continuously
+```
+
+(With `uvx`, put `uvx pr-chain` where these say `pr-chain`.)
+
+Working from a clone instead: run `python3 -B bin/pr-chain ...` and put your config in
+`pr-chain.local.toml` at the repo root. It is gitignored and wins over `~/.config/pr-chain/`.
 
 ## What your repo needs
 
@@ -52,11 +70,11 @@ over both.
 | Setting | What it does |
 |---|---|
 | `[repo] run_prefix` | Prefix for the merge-time lint and test commands, e.g. `["uv", "run", "--project", "{wt}", "--"]`. Empty: the configured python. |
-| `[paths] models_file` | Which model runs each stage (`commands.json` and `profiles.json` sit beside it). The board edits the same file. |
+| `[paths] models_file` | Which model runs each stage (`commands.json` and `profiles.json` sit beside it). The board edits the same file. `init` points it at `~/.config/pr-chain/`. |
 | `[agent] require_sandbox` | Reviewers run under macOS `sandbox-exec` with writes to the checkout denied. On Linux set this to `false`: then a reviewer that changed the worktree has its verdict thrown out. |
 | `[ui] enabled` | `false` skips UI review, screenshots and the app stack. |
 | `[notify] command` | Pages you when the loop is down, called with one message argument. |
-| `chain/flow.json` | Every stage, limit and end state. `limits.prs_at_once` caps how many PRs run at once. |
+| `chain/flow.json` | Every stage, limit and end state. `limits.prs_at_once` caps how many PRs run at once. With `uvx` it lives inside the package: edits there are lost on upgrade. |
 
 Agents run unattended with permission prompts off (`--dangerously-skip-permissions` /
 `--dangerously-bypass-approvals-and-sandbox` in `chain/commands.json`). Run the chain on a machine
@@ -68,6 +86,7 @@ and accounts you are fine handing to an agent.
 
 ```
 pr-chain.toml        the commented config template
+pr_chain_kit/        the `pr-chain` command (init, board, loop, path; everything else goes to bin/pr-chain)
 bin/                 pr-chain, pr-chain-loop, pr-chain-board, worktree-janitor
 chain/               flow.json, prompts/, models.json, commands.json, board pages, tests/
 agent-kit/           helpers the chain imports: kit.py, land/ (fold, land_pr, changelog_merge)

@@ -16,16 +16,27 @@ ROOT = Path(__file__).resolve().parents[1]          # the repo root: bin/, chain
 CHAIN_DIR = ROOT / "chain"
 
 
+USER_CFG = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "pr-chain" / "pr-chain.toml"  # `pr-chain init` writes it
+STATE = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "pr-chain"  # default work + worktrees
+
+
 def _cfg_path() -> Path:
+    """PR_CHAIN_CONFIG, else <kit>/pr-chain.local.toml (a clone), else ~/.config/pr-chain/pr-chain.toml, else the template."""
     if os.environ.get("PR_CHAIN_CONFIG"):
         return Path(os.environ["PR_CHAIN_CONFIG"])
-    local = ROOT / "pr-chain.local.toml"  # the operator's private, gitignored config
-    return local if local.exists() else ROOT / "pr-chain.toml"
+    for c in (ROOT / "pr-chain.local.toml", USER_CFG):
+        if c.exists():
+            return c
+    return ROOT / "pr-chain.toml"
 
 
 def _p(v: str) -> Path:
+    """~ expands; a relative path resolves next to the config file when it exists there, else inside the kit."""
     p = Path(v).expanduser()
-    return p if p.is_absolute() else ROOT / p
+    if p.is_absolute():
+        return p
+    near = _cfg_path().parent / p
+    return near if near.exists() else ROOT / p
 
 
 class Cfg:
@@ -59,8 +70,8 @@ class Cfg:
         self.approver_of = dict(acc.get("approver_of", {}))
         self.checks = tuple(c.strip() for c in (os.environ.get("KIT_CHECKS") or ",".join(acc.get("checks", []))).split(",") if c.strip())
 
-        self.work = Path(os.environ.get("KIT_WORK") or _p(paths.get("work", "~/backups/pr-chain")))
-        self.worktree_root = Path(os.environ.get("PR_CHAIN_WT_ROOT") or _p(paths.get("worktree_root", "~/wt/pr-chain")))
+        self.work = Path(os.environ.get("KIT_WORK") or _p(paths.get("work") or str(STATE / "work")))
+        self.worktree_root = Path(os.environ.get("PR_CHAIN_WT_ROOT") or _p(paths.get("worktree_root") or str(STATE / "wt")))
         self.lane_root = _p(paths["lane_root"]) if paths.get("lane_root") else self.worktree_root.parent
         self.board_config = _p(paths["board_config"]) if paths.get("board_config") else ""
         # models.json; commands.json and profiles.json are read from the same folder
