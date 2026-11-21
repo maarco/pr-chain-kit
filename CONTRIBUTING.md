@@ -6,7 +6,7 @@ so the design can be agreed before you build it.
 ## Set up
 
 ```bash
-git clone https://github.com/OWNER/pr-chain-kit && cd pr-chain-kit
+git clone https://github.com/maarco/pr-chain-kit && cd pr-chain-kit
 for t in chain/tests/test_*.py; do python3 -B "$t"; done     # Python 3.11+, git; ruff optional
 ```
 
@@ -51,7 +51,7 @@ changelog, build, upload to PyPI, and a GitHub release with that changelog secti
 
 One-time setup, before the first release:
 
-- PyPI: Account settings > Publishing > add a pending publisher: project `pr-chain`, owner `OWNER`,
+- PyPI: Account settings > Publishing > add a pending publisher: project `pr-chain`, owner `maarco`,
   repository `pr-chain-kit`, workflow `release.yml`, environment `pypi`. No PyPI token is stored anywhere.
 - GitHub: Settings > Environments > new environment `pypi` (optionally require a reviewer, so every
   upload waits for a click).

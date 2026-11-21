@@ -5,7 +5,7 @@ re-review, audit, UI review, CI and merge. A fresh AI agent (Claude Code or Code
 stage, so nothing reviews or fixes its own work. Agents have no GitHub access: the script alone
 pushes, posts comments and merges.
 
-![The board: the loop, open pull requests, issues, what runs next and the last results](docs/images/board.png)
+![The board: the loop, open pull requests, issues, what runs next and the last results](https://raw.githubusercontent.com/maarco/pr-chain-kit/main/docs/images/board.png)
 
 ## How a PR moves
 
@@ -18,18 +18,18 @@ pushes, posts comments and merges.
 
 Every stop has a named end state (`MERGED`, `AWAIT-HUMAN`, `RESTING`, `CI-RED`, ...) and a one-line reason.
 
-![One pull request: chain state, linked issue, review conversation and every step it took](docs/images/pull-requests.png)
+![One pull request: chain state, linked issue, review conversation and every step it took](https://raw.githubusercontent.com/maarco/pr-chain-kit/main/docs/images/pull-requests.png)
 
 ## Install
 
 You need Python 3.11+, `git`, the `gh` CLI logged in, and the `claude` or `codex` CLI.
 
 ```bash
-uvx --from git+https://github.com/OWNER/pr-chain-kit pr-chain init   # once published to PyPI: uvx pr-chain init
+uvx --from git+https://github.com/maarco/pr-chain-kit pr-chain init   # once published to PyPI: uvx pr-chain init
 ```
 
 Nothing is copied anywhere else: `uvx` keeps the package in its own cache. To keep a `pr-chain`
-command on your PATH, use `uv tool install git+https://github.com/OWNER/pr-chain-kit` (later `uv tool install pr-chain`).
+command on your PATH, use `uv tool install git+https://github.com/maarco/pr-chain-kit` (later `uv tool install pr-chain`).
 
 `pr-chain init` asks for the repo, its local checkout, your two accounts and the required checks,
 writes `~/.config/pr-chain/pr-chain.toml`, and checks that `gh`, `git` and an agent CLI are ready.
@@ -83,7 +83,7 @@ Agents run unattended with permission prompts off (`--dangerously-skip-permissio
 `--dangerously-bypass-approvals-and-sandbox` in `chain/commands.json`). Run the chain on a machine
 and accounts you are fine handing to an agent.
 
-![The loop page: every stage, its model and its prompt, editable in place](docs/images/loop-wiki.png)
+![The loop page: every stage, its model and its prompt, editable in place](https://raw.githubusercontent.com/maarco/pr-chain-kit/main/docs/images/loop-wiki.png)
 
 ## Layout
 

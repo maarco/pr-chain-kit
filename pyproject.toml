@@ -20,9 +20,9 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/OWNER/pr-chain-kit"
-Issues = "https://github.com/OWNER/pr-chain-kit/issues"
-Changelog = "https://github.com/OWNER/pr-chain-kit/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/maarco/pr-chain-kit"
+Issues = "https://github.com/maarco/pr-chain-kit/issues"
+Changelog = "https://github.com/maarco/pr-chain-kit/blob/main/CHANGELOG.md"
 
 [project.scripts]
 pr-chain = "pr_chain_kit.cli:main"
