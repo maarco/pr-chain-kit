@@ -59,6 +59,7 @@ ROOT = Path(__file__).resolve().parents[1]          # the pr-chain-kit repo root
 sys.path.insert(0, str(ROOT / "chain"))
 import config  # noqa: E402
 import procs  # noqa: E402  process working folders (/proc or lsof)
+from atomic import write_json_atomic  # noqa: E402  state JSON is written whole or not at all
 from config import CFG, kit_env_defaults  # noqa: E402  one pr-chain.toml holds every project value
 config.configure_standalone()                      # the one place this script reads the file and KIT_*/PR_CHAIN_* variables
 kit_env_defaults()                                 # KIT_* env defaults from the toml, before kit reads them
@@ -193,7 +194,7 @@ def set_state(pr, **kw):
     p = state_path(pr)
     cur = json.loads(p.read_text()) if p.exists() else {}
     cur.update(kw, updated=now())
-    p.write_text(json.dumps(cur, indent=1))
+    write_json_atomic(p, cur, indent=1)
     return cur
 
 
@@ -456,7 +457,7 @@ def focus(rows):
         keep = []
     keep += [r["number"] for r in rows if not r["owner"] and r["number"] not in keep][:max(0, LIM["prs_at_once"] - len(keep))]
     if not DRY:
-        FOCUS.write_text(json.dumps(keep))
+        write_json_atomic(FOCUS, keep)
     for r in rows:
         if not r["owner"] and r["number"] not in keep:
             r["owner"] = "one at a time: " + ", ".join(f"#{k}" for k in keep) + " first"
@@ -1140,7 +1141,7 @@ def has_readonly_proof(d, head):
 
 
 def write_readonly_proof(d, head):
-    readonly_proof_path(d).write_text(json.dumps({"version": 1, "policy": READ_ONLY_POLICY, "head": head}) + "\n")
+    write_json_atomic(readonly_proof_path(d), {"version": 1, "policy": READ_ONLY_POLICY, "head": head}, newline=True)
 
 
 def invalidate_verdict(d, vp):
@@ -2193,7 +2194,7 @@ def issue_set(n, **kw):
     p = issue_dir(n) / "STATE.json"
     cur = json.loads(p.read_text()) if p.exists() else {}
     cur.update(kw, updated=now())
-    p.write_text(json.dumps(cur, indent=1))
+    write_json_atomic(p, cur, indent=1)
 
 
 def issue_end(n, status, why, **kw):
@@ -2822,7 +2823,7 @@ def doctor():
             paged = now()
     else:
         paged = None
-    DOCTOR.write_text(json.dumps(dict(ts=now(), rows=rows, paged_loop_down=paged), indent=1))
+    write_json_atomic(DOCTOR, dict(ts=now(), rows=rows, paged_loop_down=paged), indent=1)
     for r in rows:
         ledger(stage="doctor", **r) if r["kind"] in ("stale-state", "stray-label", "loop-down") else None
     return rows

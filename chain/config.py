@@ -19,6 +19,8 @@ import shutil
 import tomllib
 from pathlib import Path
 
+from atomic import write_json_atomic
+
 ROOT = Path(__file__).resolve().parents[1]          # the repo root: bin/, chain/, pr-chain.toml
 CHAIN_DIR = ROOT / "chain"
 UNSET = Path(os.devnull)                            # a folder nobody configured: a write there fails, it never lands somewhere real
@@ -183,14 +185,7 @@ def seed_prompts(dest: Path) -> None:
     for f in new:
         if not (dest / f.name).exists():
             shutil.copyfile(f, dest / f.name)
-    atomic_text(dest / SEEDED, json.dumps(sorted(done | {f.name for f in new})))
-
-
-def atomic_text(path: Path, text: str) -> None:
-    """Write text so a reader sees the old file or the new one, never half (chain/atomic.py does the same for JSON state)."""
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(text)
-    os.replace(tmp, path)
+    write_json_atomic(dest / SEEDED, sorted(done | {f.name for f in new}))
 
 
 def ensure_standalone() -> Cfg:
