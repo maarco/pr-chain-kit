@@ -66,6 +66,10 @@ check("a process in a subfolder counts too", J("merged", busy=[str(w_merged / "s
 check("touched an hour ago: stays", J("merged", idle=1.0)[0], "keep")
 check("a fold worktree (name ends -train): stays", J("agent-train")[1], "a fold worktree (agent-kit needs it to exist)")
 check("the main checkout: stays", wj.judge(rows["repo"], repo, "origin/main", prs, set(), [], now_idle=lambda p: 99.0), ("keep", "main checkout"))
+own = wj.chain_owned(wt)
+check("default skip: a chain stage folder (pr-<n>-...) stays", wj.judge(dict(rows["merged"], worktree=str(wt / "pr-12-r1-fix")), repo, "origin/main", prs, set(), own, now_idle=lambda p: 99.0)[1], "the pr-chain's own (it cleans these)")
+check("default skip: an issue build folder stays", wj.judge(dict(rows["merged"], worktree=str(wt / "issue-7")), repo, "origin/main", prs, set(), own, now_idle=lambda p: 99.0)[1], "the pr-chain's own (it cleans these)")
+check("default skip: a hand-made folder in the chain root is judged", wj.judge(rows["review-detached"], repo, "origin/main", prs, set(), own, now_idle=lambda p: 99.0)[0], "remove")
 check("a chain-owned prefix: stays", wj.judge(rows["merged"], repo, "origin/main", prs, set(), [str(wt) + os.sep], now_idle=lambda p: 99.0)[1], "the pr-chain's own (it cleans these)")
 
 # Ignored data is still user data, even when git worktree remove would discard it.

@@ -97,6 +97,12 @@ def idle_hours(path):
     return (time.time() - max(stamps)) / 3600
 
 
+def chain_owned(root):
+    """Path prefixes of the folders the chain makes and cleans itself (pr-<n>-*, issue-<n>). Anything else dropped in
+    its root is judged like every other worktree (11-23: 3.5 GB of hand-made review folders there were cleaned by nobody)."""
+    return [os.path.join(r, n) for r in sorted({str(root), os.path.realpath(root)}) for n in ("pr-", "issue-")]
+
+
 def judge(wt, repo, main_ref, prs, busy, skip_prefixes, now_idle=idle_hours):
     """('remove' | 'keep', why) for one worktree."""
     path = Path(wt["worktree"])
@@ -176,7 +182,7 @@ def main(argv=None):
     except OSError:  # 11-16: the hourly run and a hand run overlapped and both logged the same two worktrees as removed
         print("worktree-janitor: another run is active; nothing done")
         return 0
-    skip = a.skip_prefix if a.skip_prefix is not None else [str(_CONF.worktree_root if _CONF else HOME / "wt/pr-chain") + os.sep]
+    skip = a.skip_prefix if a.skip_prefix is not None else chain_owned(_CONF.worktree_root if _CONF else HOME / "wt/pr-chain")
     if a.apply and git(repo, "fetch", "-q", "origin", "main", timeout=120).returncode:
         raise SystemExit("worktree-janitor: fetch failed, nothing removed")
     if not a.apply:

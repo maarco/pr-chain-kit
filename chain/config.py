@@ -144,6 +144,8 @@ def kit_env_defaults():
     """os.environ.setdefault calls so the vendored agent-kit kit.py picks the toml up unchanged."""
     for k, v in (("KIT_REPO", CFG.slug), ("KIT_CHECKOUT", str(CFG.checkout)),
                  ("KIT_PYTHON", str(CFG.python)), ("KIT_MERGER", CFG.merger),
-                 ("KIT_CHECKS", ",".join(CFG.checks))):
+                 ("KIT_CHECKS", ",".join(CFG.checks)),
+                 # the fold worktree sits beside the stage worktrees, inside the same root (not agent-kit's ~/wt default)
+                 ("KIT_TRAIN", str(CFG.worktree_root.parent / f"{os.environ.get('KIT_AGENT', 'pr-chain')}-train"))):
         if v:
             os.environ.setdefault(k, v)
