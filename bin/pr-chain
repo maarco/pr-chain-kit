@@ -60,6 +60,7 @@ sys.path.insert(0, str(ROOT / "chain"))
 import config  # noqa: E402
 import procs  # noqa: E402  process working folders (/proc or lsof)
 from config import CFG, kit_env_defaults  # noqa: E402  one pr-chain.toml holds every project value
+config.configure_standalone()                      # the one place this script reads the file and KIT_*/PR_CHAIN_* variables
 kit_env_defaults()                                 # KIT_* env defaults from the toml, before kit reads them
 if "--repo" in sys.argv:  # the loop tags each chain with its repo (other repos' loops on this host skip it); it must match the config
     _i = sys.argv.index("--repo")
@@ -70,6 +71,7 @@ if "--repo" in sys.argv:  # the loop tags each chain with its repo (other repos'
 os.environ.setdefault("KIT_WORK", str(CFG.work))
 sys.path.insert(0, str(ROOT / "agent-kit"))
 import kit  # noqa: E402
+kit.configure(CFG)
 import chain_engine  # noqa: E402  the chain runs flow.json (chain/ENGINE.md)
 
 CHAIN = ROOT / "chain"                          # the engine folder: flow.json, prompts/, models.json, ...

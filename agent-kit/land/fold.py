@@ -21,7 +21,10 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / "chain"))
 import kit  # noqa: E402
+import config  # noqa: E402
 from config import CFG  # noqa: E402
+config.ensure_standalone()
+kit.configure(CFG)
 
 R = kit.REPO
 WT = kit.TRAIN

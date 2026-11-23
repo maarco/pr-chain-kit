@@ -1,5 +1,8 @@
 """Shared settings for agent-kit tools. Every value has an environment override and a default.
 
+A host that runs the chain in-process does not use the environment: it calls kit.configure(cfg) once with the chain's
+config.CFG, and every setting below is replaced from it. Without that call the values come from the variables, as before.
+
 Import it from a tool in a subfolder with:
 
     import sys
@@ -46,6 +49,16 @@ MERGER = _env("KIT_MERGER", "merger-account")
 CHECKS = tuple(c.strip() for c in _env("KIT_CHECKS", "ci/tests,ci/standards-check,ci/security-scan").split(",") if c.strip())
 HUB_ME = tuple(n.strip() for n in _env("KIT_HUB_ME", AGENT).split(",") if n.strip())
 COORDINATOR = _env("KIT_COORDINATOR", "koordinator")
+
+
+def configure(cfg) -> None:
+    """Replace every setting from a chain config.Cfg (its slug, checkout, work, train, python, merger, checks, agent)."""
+    global AGENT, REPO, OWNER, NAME, CHECKOUT, WORK, TRAIN, PYTHON, MERGER, CHECKS, HUB_ME
+    AGENT = cfg.agent
+    REPO, OWNER, NAME = cfg.slug, cfg.owner, cfg.name
+    CHECKOUT, WORK, TRAIN, PYTHON = cfg.checkout, cfg.work, cfg.train, cfg.python
+    MERGER, CHECKS = cfg.merger, tuple(cfg.checks)
+    HUB_ME = (AGENT,)
 
 
 def check_results(rollup):

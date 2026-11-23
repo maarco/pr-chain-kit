@@ -1,7 +1,11 @@
 """One config file for everything project-specific: pr-chain.toml at the repo root (or $PR_CHAIN_CONFIG).
 
-Load order: environment (KIT_*, PR_CHAIN_* — the variables the scripts already read) wins over the file, so a
-test or an operator can override one value without editing anything. Everything in the file is a default.
+Importing this module reads nothing: CFG starts unconfigured, with every folder pointing at os.devnull. One call fills it.
+  configure_standalone()      the bin/ scripts and `pr-chain init`: the file, then KIT_* / PR_CHAIN_* variables win over it
+                              (a test or an operator can override one value without editing anything).
+  configure(settings, data_dir)  a host (the kollab plugin): settings as a dict, every folder under data_dir; no
+                              environment variable and no file is read.
+Everything in the file is a default.
 
 Relative paths in the file resolve against the repo root; ~ expands. The neutral pr-chain.toml ships safe
 defaults; examples/kollab/pr-chain.toml reproduces the original hard-coded setup exactly.
@@ -15,35 +19,49 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]          # the repo root: bin/, chain/, pr-chain.toml
 CHAIN_DIR = ROOT / "chain"
+UNSET = Path(os.devnull)                            # a folder nobody configured: a write there fails, it never lands somewhere real
+AGENT = "pr-chain"                                  # the agent name this kit runs as (KIT_AGENT overrides it standalone)
 
 
-USER_CFG = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "pr-chain" / "pr-chain.toml"  # `pr-chain init` writes it
-STATE = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "pr-chain"  # default work + worktrees
+def user_config_path() -> Path:
+    """~/.config/pr-chain/pr-chain.toml, where `pr-chain init` writes it. Read at call time, not import."""
+    return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "pr-chain" / "pr-chain.toml"
+
+
+def state_home() -> Path:
+    """The default folder for work + worktrees. Read at call time, not import."""
+    return Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "pr-chain"
 
 
 def _cfg_path() -> Path:
     """PR_CHAIN_CONFIG, else <kit>/pr-chain.local.toml (a clone), else ~/.config/pr-chain/pr-chain.toml, else the template."""
     if os.environ.get("PR_CHAIN_CONFIG"):
         return Path(os.environ["PR_CHAIN_CONFIG"])
-    for c in (ROOT / "pr-chain.local.toml", USER_CFG):
+    for c in (ROOT / "pr-chain.local.toml", user_config_path()):
         if c.exists():
             return c
     return ROOT / "pr-chain.toml"
 
 
-def _p(v: str) -> Path:
-    """~ expands; a relative path resolves next to the config file when it exists there, else inside the kit."""
+def _p(v: str, near: Path, fallback: Path) -> Path:
+    """~ expands; a relative path resolves next to the config file when it exists there, else under the fallback."""
     p = Path(v).expanduser()
     if p.is_absolute():
         return p
-    near = _cfg_path().parent / p
-    return near if near.exists() else ROOT / p
+    return near / p if (near / p).exists() else fallback / p
 
 
 class Cfg:
-    """Flat view over pr-chain.toml. Every attribute is resolved (paths absolute, env applied)."""
+    """Flat view over the settings. Every attribute is resolved (paths absolute, env applied). load() fills this same
+    object in place, so a module that did `from config import CFG` holds the configured one after configure()."""
 
-    def __init__(self, data: dict):
+    def __init__(self):
+        self.load({}, env={}, near=UNSET, fallback=UNSET, folder=UNSET)
+
+    def load(self, data: dict, *, env: dict, near: Path, fallback: Path, folder=None) -> None:
+        """folder None = standalone (XDG state folders, env overrides). Otherwise every folder sits under folder and env
+        is whatever the caller passes (a host passes {}), so no variable can move anything."""
+        standalone = folder is None
         repo = data.get("repo", {})
         acc = data.get("accounts", {})
         paths = data.get("paths", {})
@@ -56,30 +74,37 @@ class Cfg:
         notify = data.get("notify", {})
         self.limits = dict(data.get("limits", {}))  # overrides flow.json limits.<name>.value, e.g. prs_at_once = 12
 
-        self.slug = os.environ.get("KIT_REPO") or repo.get("slug", "owner/name")
-        self.owner, self.name = self.slug.split("/", 1)
+        self.slug = env.get("KIT_REPO") or repo.get("slug") or ""
+        self.owner, _, self.name = self.slug.partition("/")
+        self.configured = bool(self.owner and self.name)
         self.branch = repo.get("default_branch", "main")
         self.import_guard = repo.get("import_guard", "")            # module whose import must resolve inside a worktree
         self.src_globs = tuple(repo.get("src_globs", ("packages/*/src", "src")))
         self.rules_doc = repo.get("rules_doc", "CONTRIBUTING.md")   # the repo rules every agent skims
         self.run_prefix = list(repo.get("run_prefix", []))           # merge-check command prefix, {wt} = worktree; empty = python
-        self.checkout = Path(os.environ.get("KIT_CHECKOUT") or _p(repo.get("checkout", "~/dev/repo")))
-        self.python = Path(os.environ.get("KIT_PYTHON") or _p(repo.get("python") or str(self.checkout / ".venv/bin/python")))
+        self.checkout = Path(env.get("KIT_CHECKOUT") or _p(repo.get("checkout") or ("~/dev/repo" if standalone else str(UNSET)), near, fallback))
+        self.python = Path(env.get("KIT_PYTHON") or _p(repo.get("python") or str(self.checkout / ".venv/bin/python"), near, fallback))
 
         self.authors = tuple(acc.get("authors", []))
         self.trusted = tuple(acc.get("trusted", []))
-        self.merger = os.environ.get("KIT_MERGER") or acc.get("merger", "")
+        self.merger = env.get("KIT_MERGER") or acc.get("merger", "")
         self.approver_of = dict(acc.get("approver_of", {}))
-        self.checks = tuple(c.strip() for c in (os.environ.get("KIT_CHECKS") or ",".join(acc.get("checks", []))).split(",") if c.strip())
+        self.checks = tuple(c.strip() for c in (env.get("KIT_CHECKS") or ",".join(acc.get("checks", []))).split(",") if c.strip())
 
-        self.work_configured = _p(paths.get("work") or str(STATE / "work"))  # what the file says, before any KIT_WORK override
-        self.work = Path(os.environ.get("KIT_WORK") or self.work_configured)
-        self.worktree_root = Path(os.environ.get("PR_CHAIN_WT_ROOT") or _p(paths.get("worktree_root") or str(STATE / "wt")))
-        self.lane_root = _p(paths["lane_root"]) if paths.get("lane_root") else self.worktree_root.parent
-        self.board_config = _p(paths["board_config"]) if paths.get("board_config") else ""
-        self.lane_status_dir = _p(paths["lane_status_dir"]) if paths.get("lane_status_dir") else None  # <dir>/*<pr>*/STATUS.md of other writers
+        if standalone:
+            self.work_configured = _p(paths.get("work") or str(state_home() / "work"), near, fallback)  # what the file says, before any KIT_WORK override
+            self.work = Path(env.get("KIT_WORK") or self.work_configured)
+            self.worktree_root = Path(env.get("PR_CHAIN_WT_ROOT") or _p(paths.get("worktree_root") or str(state_home() / "wt"), near, fallback))
+        else:
+            self.work_configured = self.work = folder / "work"
+            self.worktree_root = folder / "wt"
+        self.agent = env.get("KIT_AGENT") or AGENT
+        self.train = Path(env["KIT_TRAIN"]) if env.get("KIT_TRAIN") else self.worktree_root.parent / f"{self.agent}-train"  # beside the stage worktrees
+        self.lane_root = _p(paths["lane_root"], near, fallback) if paths.get("lane_root") else self.worktree_root.parent
+        self.board_config = _p(paths["board_config"], near, fallback) if paths.get("board_config") else ""
+        self.lane_status_dir = _p(paths["lane_status_dir"], near, fallback) if paths.get("lane_status_dir") else None  # <dir>/*<pr>*/STATUS.md of other writers
         # models.json; commands.json and profiles.json are read from the same folder
-        self.models_file = Path(os.environ.get("PR_CHAIN_MODELS_FILE") or (_p(paths["models_file"]) if paths.get("models_file") else CHAIN_DIR / "models.json"))
+        self.models_file = Path(env.get("PR_CHAIN_MODELS_FILE") or (_p(paths["models_file"], near, fallback) if paths.get("models_file") else CHAIN_DIR / "models.json"))
 
         self.human_label = labels.get("human_approved", "human-approved")
         self.block_labels = frozenset(labels.get("blocked", []))
@@ -92,17 +117,17 @@ class Cfg:
         self.ui_proof_re = ui.get("proof_regex", r"frontend/tests/.+\.mjs$")
         self.ui_frontend_dir = ui.get("frontend_dir", "")
         self.ui_stamp_file = ui.get("stamp_file", "")
-        self.ui_stack_script = _p(ui["stack_script"]) if ui.get("stack_script") else None
-        self.ui_shoot_script = _p(ui["shoot_script"]) if ui.get("shoot_script") else CHAIN_DIR / "ui_shoot.py"
-        self.term_shots_script = _p(ui["term_shots_script"]) if ui.get("term_shots_script") else None
-        self.playwright_browsers = _p(ui["playwright_browsers_path"]) if ui.get("playwright_browsers_path") else None
+        self.ui_stack_script = _p(ui["stack_script"], near, fallback) if ui.get("stack_script") else None
+        self.ui_shoot_script = _p(ui["shoot_script"], near, fallback) if ui.get("shoot_script") else CHAIN_DIR / "ui_shoot.py"
+        self.term_shots_script = _p(ui["term_shots_script"], near, fallback) if ui.get("term_shots_script") else None
+        self.playwright_browsers = _p(ui["playwright_browsers_path"], near, fallback) if ui.get("playwright_browsers_path") else None
 
         self.agent_env = dict(agent.get("env", {}))
         self.require_sandbox = bool(agent.get("require_sandbox", True))  # reviewers refuse to start without sandbox-exec
 
-        self.tripwire_file = _p(trip["settings_file"]) if trip.get("settings_file") else None
+        self.tripwire_file = _p(trip["settings_file"], near, fallback) if trip.get("settings_file") else None
 
-        self.field_guide = _p(proj["field_guide"]) if proj.get("field_guide") else None
+        self.field_guide = _p(proj["field_guide"], near, fallback) if proj.get("field_guide") else None
 
         # [[merge_checks]] the fold runs on the PR merged with main: name, match (globs on changed paths), cmd (list;
         # "{files}" = the matched files; the check runs once when any changed file matches), timeout (seconds).
@@ -112,17 +137,47 @@ class Cfg:
         self.notify_cmd = notify.get("command", "")  # pages the operator when the loop is down; empty = no page
 
 
-CFG_PATH = _cfg_path()
-if os.environ.get("PR_CHAIN_CONFIG") and not CFG_PATH.exists():
-    raise SystemExit(f"PR_CHAIN_CONFIG points at {CFG_PATH}, which does not exist")
-CFG = Cfg(tomllib.loads(CFG_PATH.read_text()) if CFG_PATH.exists() else {})
-
-
-FLOW_FILE = Path(os.environ.get("PR_CHAIN_FLOW") or CHAIN_DIR / "flow.json")  # PR_CHAIN_FLOW: try a variant
+CFG = Cfg()                       # unconfigured: nothing is read until configure() or configure_standalone() runs
+CONFIGURED = False                # set by either configure call
+CFG_PATH = None                   # the file configure_standalone() read; None for a host
+FLOW_FILE = CHAIN_DIR / "flow.json"
 PROMPTS_BASE = CHAIN_DIR / "prompts"
-# Prompt edits (board Save Prompt) go beside the config, so an installed kit keeps them across upgrades and a prompt
-# nobody edited still updates with the kit. From a clone (config inside the kit) edits go to chain/prompts itself.
-PROMPTS_USER = PROMPTS_BASE if ROOT in CFG_PATH.resolve().parents else CFG_PATH.resolve().parent / "prompts"
+PROMPTS_USER = UNSET / "prompts"  # where a user's prompt edits live; set by either configure call
+
+
+def configure_standalone() -> Cfg:
+    """The bin/ scripts' entry: pr-chain.toml, with KIT_* and PR_CHAIN_* variables winning. Call once, before reading CFG."""
+    global CFG_PATH, FLOW_FILE, PROMPTS_USER, CONFIGURED
+    CONFIGURED = True
+    CFG_PATH = _cfg_path()
+    if os.environ.get("PR_CHAIN_CONFIG") and not CFG_PATH.exists():
+        raise SystemExit(f"PR_CHAIN_CONFIG points at {CFG_PATH}, which does not exist")
+    data = tomllib.loads(CFG_PATH.read_text()) if CFG_PATH.exists() else {}
+    CFG.load(data, env=dict(os.environ), near=CFG_PATH.parent, fallback=ROOT)
+    FLOW_FILE = Path(os.environ.get("PR_CHAIN_FLOW") or CHAIN_DIR / "flow.json")  # PR_CHAIN_FLOW: try a variant
+    # Prompt edits (board Save Prompt) go beside the config, so an installed kit keeps them across upgrades and a prompt
+    # nobody edited still updates with the kit. From a clone (config inside the kit) edits go to chain/prompts itself.
+    PROMPTS_USER = PROMPTS_BASE if ROOT in CFG_PATH.resolve().parents else CFG_PATH.resolve().parent / "prompts"
+    return CFG
+
+
+def ensure_standalone() -> Cfg:
+    """For a script run on its own (a land script, the janitor): configure from the file and environment unless a host
+    or an earlier call already did."""
+    return CFG if CONFIGURED else configure_standalone()
+
+
+def configure(settings: dict, data_dir) -> Cfg:
+    """The host's entry (the kollab plugin): settings as a dict, every folder under data_dir. Reads no environment
+    variable and no file, so two installs on one host never share settings or folders."""
+    global CFG_PATH, FLOW_FILE, PROMPTS_USER, CONFIGURED
+    CONFIGURED = True
+    data = Path(data_dir)
+    CFG.load(dict(settings or {}), env={}, near=data, fallback=data, folder=data)
+    CFG_PATH = None
+    FLOW_FILE = CHAIN_DIR / "flow.json"
+    PROMPTS_USER = data / "prompts"
+    return CFG
 
 
 def prompt_file(name: str) -> Path:
@@ -151,6 +206,6 @@ def kit_env_defaults():
                  ("KIT_PYTHON", str(CFG.python)), ("KIT_MERGER", CFG.merger),
                  ("KIT_CHECKS", ",".join(CFG.checks)),
                  # the fold worktree sits beside the stage worktrees, inside the same root (not agent-kit's ~/wt default)
-                 ("KIT_TRAIN", str(CFG.worktree_root.parent / f"{os.environ.get('KIT_AGENT', 'pr-chain')}-train"))):
+                 ("KIT_TRAIN", str(CFG.train))):
         if v:
             os.environ.setdefault(k, v)

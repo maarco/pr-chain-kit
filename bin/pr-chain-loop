@@ -30,7 +30,9 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "chain"))
+import config  # noqa: E402
 from config import CFG as CONF  # noqa: E402  pr-chain.toml: paths.work etc.
+config.ensure_standalone()
 
 WORK = CONF.work
 CHAIN = str(Path(__file__).resolve().with_name("pr-chain"))

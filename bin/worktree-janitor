@@ -29,7 +29,9 @@ HOME = Path.home()
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "chain"))
 import procs  # noqa: E402  process working folders (/proc or lsof)
 try:
+    import config
     from config import CFG as _CONF  # defaults come from pr-chain.toml; CLI flags still win
+    config.ensure_standalone()
     SLUG = _CONF.slug
 except Exception:
     _CONF = None
