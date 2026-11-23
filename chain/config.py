@@ -23,6 +23,7 @@ from atomic import write_json_atomic
 
 ROOT = Path(__file__).resolve().parents[1]          # the repo root: bin/, chain/, pr-chain.toml
 CHAIN_DIR = ROOT / "chain"
+ENV_PREFIXES = ("KIT_", "PR_CHAIN_", "KOLLAB_", "GH_", "GITHUB_")  # variables a child process never inherits
 UNSET = Path(os.devnull)                            # a folder nobody configured: a write there fails, it never lands somewhere real
 TEMPLATE_SLUG = "owner/name"                        # the placeholder repo in the shipped pr-chain.toml: it names no real repo
 SLUG_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -237,3 +238,11 @@ def kit_env_defaults():
                  ("KIT_TRAIN", str(CFG.train))):
         if v:
             os.environ.setdefault(k, v)
+
+
+def child_env(environ=None) -> dict:
+    """The environment for a child process (a stage agent, a ruff run): the parent's variables minus every KIT_,
+    PR_CHAIN_, KOLLAB_, GH_ and GITHUB_ one, so no GitHub token or host setting reaches it. HOME and PATH stay, so the
+    agent CLIs keep their logins."""
+    src = os.environ if environ is None else environ
+    return {k: v for k, v in src.items() if not k.startswith(ENV_PREFIXES)}
