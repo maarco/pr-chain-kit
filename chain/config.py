@@ -14,12 +14,15 @@ from __future__ import annotations
 
 import os
 import json
+import re
 import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]          # the repo root: bin/, chain/, pr-chain.toml
 CHAIN_DIR = ROOT / "chain"
 UNSET = Path(os.devnull)                            # a folder nobody configured: a write there fails, it never lands somewhere real
+TEMPLATE_SLUG = "owner/name"                        # the placeholder repo in the shipped pr-chain.toml: it names no real repo
+SLUG_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 AGENT = "pr-chain"                                  # the agent name this kit runs as (KIT_AGENT overrides it standalone)
 
 
@@ -76,7 +79,8 @@ class Cfg:
 
         self.slug = env.get("KIT_REPO") or repo.get("slug") or ""
         self.owner, _, self.name = self.slug.partition("/")
-        self.configured = bool(self.owner and self.name)
+        # unset, malformed or the template placeholder: not configured. Nothing crashes; callers check this flag.
+        self.configured = bool(SLUG_RE.match(self.slug)) and self.slug != TEMPLATE_SLUG
         self.branch = repo.get("default_branch", "main")
         self.import_guard = repo.get("import_guard", "")            # module whose import must resolve inside a worktree
         self.src_globs = tuple(repo.get("src_globs", ("packages/*/src", "src")))
