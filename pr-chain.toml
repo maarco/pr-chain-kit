@@ -60,9 +60,19 @@ shoot_script = ""                    # screenshot helper (default: chain/ui_shoo
 term_shots_script = ""               # terminal-screenshot helper for PRs that add tmux specs (see examples/kollab/term_shots.py)
 playwright_browsers_path = ""        # browser cache for agents with a scratch HOME; empty = let playwright find it
 
+[tools]
+# The gh binary. Unset = the first gh on PATH, then /opt/homebrew/bin/gh, then /usr/local/bin/gh.
+# gh = "/usr/local/bin/gh"
+
 [agent]
 # Extra env every agent command runs with (the app's "don't touch my real config" switches).
 env = {}
+# Opt-in: when set, a stage agent sees ONLY these parent variables plus [agent] env (GH_/GITHUB_/KIT_/PR_CHAIN_/KOLLAB_ are
+# still stripped), and any value starting ghp_, github_pat_, gho_, ghs_ or ghu_ is dropped whatever its name. Unset = off.
+# env_allowlist = ["PATH", "LANG", "TERM", "TMPDIR", "USER", "SHELL"]
+# "per-stage": every stage agent gets a fresh empty HOME under the work folder, removed when it finishes (it will not see
+# the parent's CLI logins). Unset = the parent's HOME.
+# home = "per-stage"
 # Reviewers (review, gate, addendum, ui) run under macOS sandbox-exec with writes to the checkout denied.
 # Without sandbox-exec (Linux) they refuse to start unless this is false; then only the post-run clean-worktree check guards.
 require_sandbox = true

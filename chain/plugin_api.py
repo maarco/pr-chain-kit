@@ -3,7 +3,7 @@
 Plain functions that return JSON-ready dicts and lists. No web framework is imported here: the host wraps each one in
 whatever routes it serves. The data comes from bin/pr-chain-board's readers, loaded on first use, after the host has
 called config.configure(). Until a repo is configured every function answers with the setup message and makes no gh call.
-Reads change no repo or host setting, but a read may refresh the board's caches (the gh cache and the rate table)
+Reads change no repo or host setting (save_config is the one write: it applies a config change like the board's POST /api/config), but a read may refresh the board's caches (the gh cache and the rate table)
 inside the install's work folder, each replaced whole. A failed read answers {"error": "..."} rather than raising,
 like the board's own routes.
 """
@@ -89,6 +89,57 @@ def spend() -> dict:
 def config() -> dict:
     """The model and command choice per stage, as the board's config page shows it (read only)."""
     return _read("config_state") if _configured() else _unset()
+
+
+def pr_diff(number: int, fresh: bool = False) -> dict:
+    """One pull request's diff, split per file (read-only `gh pr diff`, cached 60 s)."""
+    if not _configured():
+        return _unset()
+    try:
+        number = int(number)
+    except (TypeError, ValueError):
+        return {"error": "number must be an integer"}
+    return _gate("pr_diff", number, fresh)
+
+
+def runs(kind: str, number: int) -> dict:
+    """The agent runs of one PR (kind "pr") or issue (kind "issue"): groups and a timeline."""
+    if not _configured():
+        return _unset()
+    try:
+        number = int(number)
+    except (TypeError, ValueError):
+        return {"error": "number must be an integer"}
+    if kind not in ("pr", "issue"):
+        return {"error": 'kind must be "pr" or "issue"'}
+    return _read("runs_view", kind, number)
+
+
+def run(run_id: str) -> dict:
+    """One agent run (its brief, result, output and how it differs from the run before): run_id as listed by runs()."""
+    if not _configured():
+        return _unset()
+    if not isinstance(run_id, str):
+        return {"error": "bad run id"}
+    return _read("run_detail", run_id)
+
+
+def save_config(changes: dict) -> dict:
+    """Apply a config change the way the board's POST /api/config does (same validation, same body: save_prompt,
+    save_command, a profile operation, a stage's model). Returns the new config, with "saved" naming what changed, or
+    {"error": reason} and nothing is written."""
+    if not _configured():
+        return {"error": SETUP}
+    if not isinstance(changes, dict):
+        return {"error": "changes must be an object"}
+    try:
+        ok, msg = _readers().apply_config(changes)
+        if not ok:
+            return {"error": str(msg)[:300]}
+        out = _readers().config_state()
+        return {**out, "saved": msg} if isinstance(out, dict) else out
+    except Exception as e:  # the same rule as every read: the host's route must not go down
+        return {"error": str(e)[:300]}
 
 
 def badge() -> dict:

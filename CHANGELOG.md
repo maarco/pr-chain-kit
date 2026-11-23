@@ -7,6 +7,11 @@ change to `pr-chain.toml`, the `pr-chain` command or the work-folder layout bump
 ## [Unreleased]
 
 ### Added
+- `[tools] gh` names the gh binary; unset, the first gh on PATH is used, then the old fixed paths. One resolver
+  (`config.gh_bin()`) serves the board, `pr-chain`, the agent-kit and the janitor.
+- `[agent] env_allowlist` (opt-in) limits a stage agent's environment to the listed names plus `[agent] env`, and drops any
+  value that starts like a GitHub token. `[agent] home = "per-stage"` gives each stage agent a fresh HOME that the kit removes.
+- `plugin_api.pr_diff`, `runs`, `run` and `save_config` for hosts, so they no longer reach into `plugin_api._readers()`.
 - The kit can be driven as a library by a host (the kollab plugin). `chain/config.py` reads nothing on import; a host calls
   `configure(settings, data_dir)` and every folder (work, worktrees, claims, prompts, fold worktree) sits under `data_dir`,
   so two installs on one host never collide. Prompts are seeded into `data_dir/prompts` once and never overwritten.
