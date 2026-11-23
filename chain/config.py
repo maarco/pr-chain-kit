@@ -230,7 +230,10 @@ def load_flow() -> dict:
 
 
 def kit_env_defaults():
-    """os.environ.setdefault calls so the vendored agent-kit kit.py picks the toml up unchanged."""
+    """os.environ.setdefault calls so the vendored agent-kit kit.py picks the toml up unchanged. Does nothing under a host
+    (configure() was called): a host's settings never go into the process environment."""
+    if CONFIGURED and CFG_PATH is None:
+        return
     for k, v in (("KIT_REPO", CFG.slug), ("KIT_CHECKOUT", str(CFG.checkout)),
                  ("KIT_PYTHON", str(CFG.python)), ("KIT_MERGER", CFG.merger),
                  ("KIT_CHECKS", ",".join(CFG.checks)),

@@ -54,22 +54,25 @@ import sys
 import time
 from pathlib import Path
 
-os.environ.setdefault("KIT_AGENT", "pr-chain")
 ROOT = Path(__file__).resolve().parents[1]          # the pr-chain-kit repo root
 sys.path.insert(0, str(ROOT / "chain"))
 import config  # noqa: E402
 import procs  # noqa: E402  process working folders (/proc or lsof)
 from atomic import write_json_atomic  # noqa: E402  state JSON is written whole or not at all
 from config import CFG, kit_env_defaults  # noqa: E402  one pr-chain.toml holds every project value
-config.configure_standalone()                      # the one place this script reads the file and KIT_*/PR_CHAIN_* variables
-kit_env_defaults()                                 # KIT_* env defaults from the toml, before kit reads them
+_hosted = config.CONFIGURED                        # a host (the kollab plugin) configured CFG before loading this file
+config.ensure_standalone()                         # run on its own: read the file and KIT_*/PR_CHAIN_* variables; under a host, change nothing
+if not _hosted:
+    os.environ.setdefault("KIT_AGENT", "pr-chain")
+    kit_env_defaults()                             # KIT_* env defaults from the toml, before kit reads them
 if "--repo" in sys.argv:  # the loop tags each chain with its repo (other repos' loops on this host skip it); it must match the config
     _i = sys.argv.index("--repo")
     _tag = sys.argv[_i + 1] if _i + 1 < len(sys.argv) else ""
     del sys.argv[_i:_i + 2]
     if _tag != CFG.slug:
         raise SystemExit(f"pr-chain: --repo {_tag} does not match the config's repo {CFG.slug} ({config.CFG_PATH})")
-os.environ.setdefault("KIT_WORK", str(CFG.work))
+if not _hosted:
+    os.environ.setdefault("KIT_WORK", str(CFG.work))
 sys.path.insert(0, str(ROOT / "agent-kit"))
 import kit  # noqa: E402
 kit.configure(CFG)
