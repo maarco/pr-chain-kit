@@ -82,11 +82,12 @@ try:
     pc.cfg_snapshot = lambda: {}
     pc.cfg_damage = lambda before, after: ([], [])
     pc.ledger = lambda **row: None
-    # Linux has no sandbox-exec; PR_CHAIN_TEST_NO_SANDBOX=1 runs that path on macOS too.
+    # macOS sandboxes with sandbox-exec, Linux with bwrap; PR_CHAIN_TEST_NO_SANDBOX=1 runs the no-sandbox path anywhere.
     if os.environ.get("PR_CHAIN_TEST_NO_SANDBOX"):
         _which = shutil.which
-        shutil.which = lambda name, *a, **k: None if name == "sandbox-exec" else _which(name, *a, **k)
-    if shutil.which("sandbox-exec"):
+        shutil.which = lambda name, *a, **k: None if name in ("sandbox-exec", "bwrap") else _which(name, *a, **k)
+    if shutil.which("sandbox-exec") or shutil.which("bwrap"):
+        print("sandbox:", "sandbox-exec" if shutil.which("sandbox-exec") else "bwrap")
         result = pc.run_agent("gate", "test-model", output / "brief.md", stage_wt, output, 1)
         check("review runner completes its bounded probe", result["rc"], 0)
         check("reviewer cannot write to the main checkout", protected_paths[0].exists(), False)

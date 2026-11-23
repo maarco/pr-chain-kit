@@ -594,8 +594,10 @@ def agent_cmd(model, prompt="Read <brief.md> and follow it exactly.", brief=BRIE
 
 READ_ONLY_AGENT_ROLES = frozenset(("review", "gate", "addendum", "ui"))
 READ_ONLY_PROOF_FILE = ".read-only-review.json"
-# macOS: sandbox-exec denies writes. Elsewhere, with [agent] require_sandbox = false, only the post-run clean-worktree check guards.
-READ_ONLY_POLICY = "macos-path-write-deny-v1" if shutil.which("sandbox-exec") else "post-run-clean-check-v1"
+# macOS: sandbox-exec denies writes. Linux: bubblewrap remounts the same paths read-only. Neither, with
+# [agent] require_sandbox = false: only the post-run clean-worktree check guards.
+READ_ONLY_POLICY = ("macos-path-write-deny-v1" if shutil.which("sandbox-exec") else
+                    "linux-bwrap-ro-bind-v1" if shutil.which("bwrap") else "post-run-clean-check-v1")
 
 
 def _sbpl_quote(path):
@@ -625,10 +627,11 @@ def readonly_agent_command(role, cmd, outdir):
     if role not in READ_ONLY_AGENT_ROLES:
         return cmd
     sandbox = shutil.which("sandbox-exec")
-    if not sandbox:
+    bwrap = None if sandbox else shutil.which("bwrap")
+    if not sandbox and not bwrap:
         if not CFG.require_sandbox:
             return cmd  # the post-run clean-worktree check still rejects any verdict from a reviewer that wrote
-        raise RuntimeError("sandbox-exec is unavailable; refusing to start a reviewer unsandboxed "
+        raise RuntimeError("neither sandbox-exec nor bwrap is available; refusing to start a reviewer unsandboxed "
                            "(set [agent] require_sandbox = false to rely on the post-run clean-worktree check)")
 
     stage_wt = wt_for(outdir)
@@ -647,6 +650,9 @@ def readonly_agent_command(role, cmd, outdir):
     output = Path(outdir).resolve()
     if any(output == root or output in root.parents or root in output.parents for root in protected):
         raise RuntimeError(f"review output folder overlaps a protected source path: {output}")
+    if bwrap:  # the whole filesystem as it is, then each protected root again read-only (later binds win)
+        ro = [a for root in protected if root.exists() for a in ("--ro-bind", str(root), str(root))]
+        return [bwrap, "--dev-bind", "/", "/", *ro, "--", *cmd]
     rules = ["(version 1)", "(allow default)"]
     rules.extend(f"(deny file-write* (subpath {_sbpl_quote(root)}))" for root in protected)
     return [sandbox, "-p", "\n".join(rules), *cmd]
