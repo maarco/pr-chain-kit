@@ -112,7 +112,7 @@ LOCKS = WORK / "locks"             # per-key locks: locks/<pr> per chain, locks/
 NO_BUILD = WORK / "NO-BUILD"       # present: issue building and scouting are blocked (toggle on the board /config page)
 CLAIMS = WORK / "claims"
 OUR_AUTHORS = CFG.authors  # the chain only ever works on PRs these accounts opened; outside contributors' PRs are never touched
-EXCLUDE = WORK / "exclude.txt"          # lines: "<pr> <reason>"  (held by the maintainer or owned by someone else)
+EXCLUDE = WORK / "exclude.txt"          # lines: "<pr> <reason>" or "branch:<prefix> <reason>" (held by the maintainer or owned by someone else)
 SCRATCH_HOME = WORK / "scratch-home"    # HOME for every python/node command an agent runs
 SCRATCH_HOME.mkdir(parents=True, exist_ok=True)
 REPO, CHECKOUT, PY = kit.REPO, kit.CHECKOUT, kit.PYTHON
@@ -303,6 +303,17 @@ def excluded():
     return out
 
 
+def excluded_branches():
+    """{branch prefix: reason} from "branch:<prefix> <reason>" lines: every PR whose head branch starts with it is skipped."""
+    out = {}
+    if EXCLUDE.exists():
+        for line in EXCLUDE.read_text().splitlines():
+            m = re.match(r"\s*branch:(\S+)\s*(.*)", line)
+            if m:
+                out[m.group(1)] = m.group(2) or "excluded"
+    return out
+
+
 def pid_alive(pid):
     try:
         os.kill(int(pid), 0)
@@ -327,6 +338,9 @@ def owner_reason(p, ps_text):
         return "not ours: outside contributor PR, the chain never touches it"
     if n in excluded():
         return "excluded: " + excluded()[n]
+    for prefix, why in excluded_branches().items():
+        if p.get("headRefName", "").startswith(prefix):
+            return f"excluded: branch {prefix}*: {why}"
     claim = CLAIMS / str(n)
     if claim.exists():
         pid = (claim / "pid").read_text().strip() if (claim / "pid").exists() else ""

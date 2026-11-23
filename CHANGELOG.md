@@ -14,6 +14,7 @@ change to `pr-chain.toml`, the `pr-chain` command or the work-folder layout bump
 - Several repos on one host: each loop tags the chains it starts with `--repo <slug>` and counts only its own
   repo's chains against its threads; the picker ignores other repos' chains. Untagged chains (started by hand) still
   count for every repo. A `--repo` that does not match the config is refused.
+- `exclude.txt` takes `branch:<prefix> <reason>` lines: every PR whose head branch starts with the prefix is skipped.
 - The PR picker parks a PR stacked on a branch other than the default branch instead of picking it every lap.
 
 ### Fixed

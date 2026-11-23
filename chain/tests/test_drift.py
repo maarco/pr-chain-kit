@@ -273,6 +273,13 @@ scenario("N carried, main moves under the addendum -> fold and carry again", [("
          carried="hold", want="MERGED", want_kinds=["addendum:BEHIND", "addendum@h1<-hold"])
 scenario("P this head was already audited -> no review, no audit, no addendum", [], ["MERGED"], carried="h0", want="MERGED", want_kinds=[])
 scenario("O carried, no verdict from addendum or audit -> NO-VERDICT", [("addendum", None), ("gate", None)], [], carried="hold", want="NO-VERDICT")
+# ---- exclude.txt: "branch:<prefix> <reason>" skips every PR on such a branch (a person lands them by hand)
+pc.EXCLUDE.parent.mkdir(parents=True, exist_ok=True)
+pc.EXCLUDE.write_text("55 held\nbranch:feat/port- landed by hand\n")
+check("exclude: a numbered line still works", pc.owner_reason({"number": 55, "headRefName": "x", "author": {"login": "owner"}}, ""), "excluded: held")
+check("exclude: a branch prefix skips its PRs", pc.owner_reason({"number": 56, "headRefName": "feat/port-python", "author": {"login": "owner"}}, ""), "excluded: branch feat/port-*: landed by hand")
+check("exclude: a numbered line is not read as a branch", pc.excluded_branches(), {"feat/port-": "landed by hand"})
+pc.EXCLUDE.unlink()
 # ---- a chain of another repo on the same host does not own this repo's PR with the same number (11-23: one host, three repos)
 _gh = pc.gh_json
 pc.gh_json = lambda *a, **k: {"commit": {"committer": {"date": "2020-01-01T00:00:00Z"}}}
