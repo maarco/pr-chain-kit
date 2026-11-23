@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import json
 import re
+import shutil
 import tomllib
 from pathlib import Path
 
@@ -165,6 +166,33 @@ def configure_standalone() -> Cfg:
     return CFG
 
 
+SEEDED = ".seeded.json"  # beside the seeded prompts: the kit prompt names already copied, so a deleted one stays deleted
+
+
+def seed_prompts(dest: Path) -> None:
+    """Copy each kit prompt into dest the first time that name is seen. An edited prompt is never overwritten and a
+    prompt the user deleted is never copied again; a prompt a later kit version adds is copied once. Safe to call every run."""
+    try:
+        done = set(json.loads((dest / SEEDED).read_text()))
+    except (OSError, ValueError):
+        done = set()
+    new = [f for f in sorted(PROMPTS_BASE.glob("*.md")) if f.name not in done]
+    if not new:
+        return
+    dest.mkdir(parents=True, exist_ok=True)
+    for f in new:
+        if not (dest / f.name).exists():
+            shutil.copyfile(f, dest / f.name)
+    atomic_text(dest / SEEDED, json.dumps(sorted(done | {f.name for f in new})))
+
+
+def atomic_text(path: Path, text: str) -> None:
+    """Write text so a reader sees the old file or the new one, never half (chain/atomic.py does the same for JSON state)."""
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
 def ensure_standalone() -> Cfg:
     """For a script run on its own (a land script, the janitor): configure from the file and environment unless a host
     or an earlier call already did."""
@@ -181,6 +209,7 @@ def configure(settings: dict, data_dir) -> Cfg:
     CFG_PATH = None
     FLOW_FILE = CHAIN_DIR / "flow.json"
     PROMPTS_USER = data / "prompts"
+    seed_prompts(PROMPTS_USER)
     return CFG
 
 
