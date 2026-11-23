@@ -40,4 +40,12 @@ p.wait()
 got = loop.ended(5, p, log, pos)
 assert got.startswith("with no result line (exit 3;"), got
 
+# one host, several repos: a loop counts only its own repo's chains (and untagged hand runs, which may be its own)
+me = loop.CONF.slug
+assert loop.ours(f"python3 -B /k/bin/pr-chain run 5 --land --repo {me}")
+assert not loop.ours("python3 -B /k/bin/pr-chain run 5 --land --repo someone/else")
+assert loop.ours("python3 -B /k/bin/pr-chain run 5 --land")
+assert not loop.ours("python3 -B /k/bin/pr-chain pick --repo " + me)
+assert loop.TAG == ("--repo", me)
+
 print("all loop checks passed")

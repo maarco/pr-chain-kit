@@ -11,6 +11,9 @@ change to `pr-chain.toml`, the `pr-chain` command or the work-folder layout bump
   non-Python repo (Rust, TypeScript) can use the chain. None configured keeps the Python default (ruff + pytest).
 - Linux reviewers run under bubblewrap (`bwrap`): the checkout, the worktree root and tracked symlink targets are
   mounted read-only, the same paths macOS `sandbox-exec` denies. `require_sandbox = false` is no longer needed on Linux.
+- Several repos on one host: each loop tags the chains it starts with `--repo <slug>` and counts only its own
+  repo's chains against its threads; the picker ignores other repos' chains. Untagged chains (started by hand) still
+  count for every repo. A `--repo` that does not match the config is refused.
 - The PR picker parks a PR stacked on a branch other than the default branch instead of picking it every lap.
 
 ### Fixed

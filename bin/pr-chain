@@ -61,6 +61,12 @@ import config  # noqa: E402
 import procs  # noqa: E402  process working folders (/proc or lsof)
 from config import CFG, kit_env_defaults  # noqa: E402  one pr-chain.toml holds every project value
 kit_env_defaults()                                 # KIT_* env defaults from the toml, before kit reads them
+if "--repo" in sys.argv:  # the loop tags each chain with its repo (other repos' loops on this host skip it); it must match the config
+    _i = sys.argv.index("--repo")
+    _tag = sys.argv[_i + 1] if _i + 1 < len(sys.argv) else ""
+    del sys.argv[_i:_i + 2]
+    if _tag != CFG.slug:
+        raise SystemExit(f"pr-chain: --repo {_tag} does not match the config's repo {CFG.slug} ({config.CFG_PATH})")
 os.environ.setdefault("KIT_WORK", str(CFG.work))
 sys.path.insert(0, str(ROOT / "agent-kit"))
 import kit  # noqa: E402
@@ -351,6 +357,9 @@ def owner_reason(p, ps_text):
     pats = [rf"lane-{n}\b", rf"luna-{n}\w*", rf"{CFG.lane_root.name}-wt\S*\b{n}\b", rf"[Pp][Rr] ?#?{n}\b", rf"pr-chain \S+ {n}\b"]
     for line in ps_text.splitlines():
         if "pr-chain pick" in line or "pr-chain status" in line:
+            continue
+        tag = re.search(r"--repo (\S+)", line)
+        if tag and tag.group(1) != REPO:  # a chain of another repo on this host: its PR numbers are not ours
             continue
         if any(re.search(x, line) for x in pats):
             return "running agent process mentions it"

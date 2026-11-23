@@ -53,15 +53,24 @@ def threads():
         return 1
 
 
+TAG = ("--repo", CONF.slug)  # every chain this loop starts names its repo, so loops for other repos on this host do not count it
+CHAIN_RE = re.compile(r"bin/pr-chain (auto|run|land|resume|issue|scout)\b")
+
+
+def ours(cmdline):
+    """A chain process of this repo: tagged with this repo, or untagged (started by hand: it may be ours, so it counts)."""
+    m = re.search(r"--repo (\S+)", cmdline)
+    return bool(CHAIN_RE.search(cmdline)) and (m is None or m.group(1) == CONF.slug)
+
+
 def chains_out():
-    """Live pr-chain chain processes, this loop's or not (a chain an earlier loop started keeps running)."""
-    out = subprocess.run(["/usr/bin/pgrep", "-f", r"bin/pr-chain (auto|run|land|resume|issue|scout)"],
-                         capture_output=True, text=True).stdout
-    return len(out.split())
+    """Live chain processes of this repo, this loop's or not (a chain an earlier loop started keeps running)."""
+    out = subprocess.run(["/bin/ps", "-axo", "command"], capture_output=True, text=True).stdout
+    return sum(ours(line) for line in out.splitlines())
 
 
 def spawn(*args):
-    return subprocess.Popen([sys.executable, "-B", CHAIN, *args], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    return subprocess.Popen([sys.executable, "-B", CHAIN, *args, *TAG], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
 
 def follow(p, out):
@@ -78,7 +87,7 @@ def spawn_logged(log, *args):
     log.parent.mkdir(parents=True, exist_ok=True)
     pos = log.stat().st_size if log.exists() else 0
     with open(log, "a") as fh:
-        p = subprocess.Popen([sys.executable, "-B", CHAIN, *args], stdout=fh, stderr=subprocess.STDOUT)
+        p = subprocess.Popen([sys.executable, "-B", CHAIN, *args, *TAG], stdout=fh, stderr=subprocess.STDOUT)
     return p, pos
 
 
@@ -116,7 +125,7 @@ def ended(pr, p, log, pos):
 
 
 def pick_free():
-    table = subprocess.run([sys.executable, "-B", CHAIN, "pick"], capture_output=True, text=True).stdout
+    table = subprocess.run([sys.executable, "-B", CHAIN, "pick", *TAG], capture_output=True, text=True).stdout
     now = time.time()
     free = []
     for line in table.splitlines():

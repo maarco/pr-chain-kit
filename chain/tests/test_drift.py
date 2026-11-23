@@ -273,5 +273,17 @@ scenario("N carried, main moves under the addendum -> fold and carry again", [("
          carried="hold", want="MERGED", want_kinds=["addendum:BEHIND", "addendum@h1<-hold"])
 scenario("P this head was already audited -> no review, no audit, no addendum", [], ["MERGED"], carried="h0", want="MERGED", want_kinds=[])
 scenario("O carried, no verdict from addendum or audit -> NO-VERDICT", [("addendum", None), ("gate", None)], [], carried="hold", want="NO-VERDICT")
+# ---- a chain of another repo on the same host does not own this repo's PR with the same number (11-23: one host, three repos)
+_gh = pc.gh_json
+pc.gh_json = lambda *a, **k: {"commit": {"committer": {"date": "2020-01-01T00:00:00Z"}}}
+pr901 = {"number": 901, "headRefOid": "H901", "author": {"login": "owner"}}
+other = "python3 -B /x/bin/pr-chain run 901 --land --repo someone/else"
+mine = f"python3 -B /x/bin/pr-chain run 901 --land --repo {pc.REPO}"
+check("owner_reason: another repo's chain for #901 does not own ours", pc.owner_reason(pr901, other) == "running agent process mentions it", False)
+check("owner_reason: our repo's tagged chain for #901 owns it", pc.owner_reason(pr901, mine), "running agent process mentions it")
+check("owner_reason: an untagged hand run for #901 still owns it", pc.owner_reason(pr901, "python3 -B /x/bin/pr-chain run 901"), "running agent process mentions it")
+pc.gh_json = _gh
+r = subprocess.run([sys.executable, "-B", str(src), "status", "--repo", "someone/else"], capture_output=True, text=True, env=os.environ)
+check("--repo that does not match the config: refused", (r.returncode != 0, "does not match the config" in r.stderr), (True, True))
 print("\nFAILED: " + ", ".join(fails) if fails else "\nall drift checks passed")
 sys.exit(1 if fails else 0)
