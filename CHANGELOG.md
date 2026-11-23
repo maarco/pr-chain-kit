@@ -13,6 +13,10 @@ change to `pr-chain.toml`, the `pr-chain` command or the work-folder layout bump
   mounted read-only, the same paths macOS `sandbox-exec` denies. `require_sandbox = false` is no longer needed on Linux.
 - The PR picker parks a PR stacked on a branch other than the default branch instead of picking it every lap.
 
+### Fixed
+- `[ui] enabled = false` turns UI review off; it was read and then ignored, so every .tsx change still went to UI review.
+- UI review with no `[ui] stack_script` ends STACK-DOWN with a clear reason, so the PR is held, never merged unreviewed.
+
 ### Changed
 - The fold worktree defaults to `<worktree_root>/../pr-chain-train`, inside the same root as the stage worktrees
   (was agent-kit's `~/wt/<agent>-train`).

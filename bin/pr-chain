@@ -111,7 +111,7 @@ SCRATCH_HOME = WORK / "scratch-home"    # HOME for every python/node command an 
 SCRATCH_HOME.mkdir(parents=True, exist_ok=True)
 REPO, CHECKOUT, PY = kit.REPO, kit.CHECKOUT, kit.PYTHON
 TRIPWIRE_CFG = CFG.tripwire_file or WORK / "absent-tripwire"  # damage tripwire; off when [tripwire] is unset
-UI_RE = re.compile(CFG.ui_paths_re)
+UI_RE = re.compile(CFG.ui_paths_re if CFG.ui_enabled else r"(?!)")  # [ui] enabled = false: no path is a UI path, no UI review
 DRY = False
 MARK = "<!-- pr-chain:"                     # every comment the chain posts starts with this, so it is never read as human feedback
 SHOTS_BRANCH = "pr-chain-shots"             # orphan branch that only holds screenshots for human-gate comments
@@ -2519,6 +2519,9 @@ def ui_review(pr, rnd, head, a):
     try:
         (d / "pr.md").write_text(public_pr_body(info))
         (d / "issues.md").write_text(issues_text(info))
+        if not UI_STACK:  # UI review is on but nothing can start the app: hold the PR, never merge it unreviewed
+            (d / "ui-verdict.md").write_text("STACK-DOWN\nno [ui] stack_script is configured, so the app cannot start for screenshots\n")
+            return "STACK-DOWN", vp, head
         up = sh(sys.executable, str(UI_STACK), "up", "--wt", str(wt), "--dir", str(stack), "--python", str(PY), timeout=1200)
         ledger(pr=pr, stage="ui-stack", rc=up.returncode, tail=(up.stdout + up.stderr)[-200:])
         if up.returncode:
@@ -2539,7 +2542,8 @@ def ui_review(pr, rnd, head, a):
         res = run_agent("ui", a.ui_model, brief, d, d, pr)
         reviewer_ran = True
     finally:
-        sh(sys.executable, str(UI_STACK), "down", "--dir", str(stack))
+        if UI_STACK:
+            sh(sys.executable, str(UI_STACK), "down", "--dir", str(stack))
         if reviewer_ran:
             dirty_after_agent = read_only_worktree_changed(wt, head)
             if dirty_after_agent and parse_verdict(vp):

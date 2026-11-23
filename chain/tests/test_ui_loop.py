@@ -72,5 +72,14 @@ scenario("F UI review gives no verdict after a fix", R, ["FAIL", None], ["OK"], 
 ns = tmp / "ns.md"; ns.write_text("NOT-SHOWN\nhead h0\n")
 st = scenario("G UI NOT-SHOWN is no verdict: no human gate", R, [pc.parse_verdict(ns)], [], "UI-NO-VERDICT", ["review@h0", "gate@h0", "ui@h0"])
 check("G no human gate", st.get("gate"), None)
+# [ui] enabled = false really turns UI review off (it was read and then ignored, 11-23)
+import subprocess
+off = tmp / "ui-off.toml"
+off.write_text(pathlib.Path(os.environ["PR_CHAIN_CONFIG"]).read_text().replace("[ui]\nenabled = true", "[ui]\nenabled = false"))
+probe = (f"import importlib.machinery as m, importlib.util as u; l = m.SourceFileLoader('p', {str(src)!r}); "
+         "p = u.module_from_spec(u.spec_from_loader('p', l)); l.exec_module(p); "
+         "print(bool(p.UI_RE.search('packages/kollabor-webui/frontend/src/App.tsx')))")
+r = subprocess.run([sys.executable, "-B", "-c", probe], env={**os.environ, "PR_CHAIN_CONFIG": str(off)}, capture_output=True, text=True)
+check("[ui] enabled = false: a .tsx change is not a UI change", r.stdout.strip(), "False")
 print("\nFAILED: " + ", ".join(fails) if fails else "\nall UI loop checks passed")
 sys.exit(1 if fails else 0)
