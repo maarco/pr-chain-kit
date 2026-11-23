@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """plugin_api public wrappers for what a host used to reach through plugin_api._readers(): pr_diff, runs, run, save_config.
 Each returns data or {"error": ...} and never raises. Child interpreter, scratch folders, a gh shim; no network."""
-import json, os, pathlib, shutil, stat, subprocess, sys, tempfile
+import json, os, pathlib, subprocess, sys, tempfile
 
 root = pathlib.Path(__file__).resolve().parents[2]
 d = pathlib.Path(tempfile.mkdtemp(prefix="plugin-wrap--prc")).resolve()

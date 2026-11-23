@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """One gh resolver: config [tools] gh, else the first gh on PATH, else the old fixed paths. The board, bin/pr-chain's
 sh(), the agent-kit and the janitor all use it, so a gh shim first on PATH is the gh that runs. Scratch dirs only."""
-import json, os, pathlib, stat, subprocess, sys, tempfile
+import os, pathlib, stat, subprocess, sys, tempfile
 
 root = pathlib.Path(__file__).resolve().parents[2]
 d = pathlib.Path(tempfile.mkdtemp(prefix="gh-bin--prc")).resolve()

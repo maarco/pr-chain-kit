@@ -3,7 +3,7 @@
 [agent] env_allowlist = [...]: the child gets only those names plus [agent] env, the GH_/GITHUB_ strip still applies, and
 any value that looks like a GitHub token (ghp_, github_pat_, gho_, ghs_, ghu_) is dropped whatever the name.
 [agent] home = "per-stage": every stage agent gets a fresh HOME under the work folder, created and removed by the kit."""
-import atexit, importlib.machinery, importlib.util, os, pathlib, shutil, subprocess, sys, tempfile
+import atexit, importlib.machinery, importlib.util, os, pathlib, shutil, sys, tempfile
 
 sys.dont_write_bytecode = True
 root = pathlib.Path(__file__).resolve().parents[2]
