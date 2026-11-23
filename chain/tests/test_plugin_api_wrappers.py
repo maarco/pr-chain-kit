@@ -31,11 +31,15 @@ out["u_diff"], out["u_runs"], out["u_run"], out["u_save"] = call("pr_diff", 7), 
 config.configure(dict(repo=dict(slug="octo/widgets", checkout={str(d / 'checkout')!r})), {str(d / 'data')!r})
 out["diff"] = call("pr_diff", 7)
 out["diff_bad_number"] = call("pr_diff", "abc")
+out["diff_overflow"] = call("pr_diff", json.loads("1e999"))
 out["diff_gh_fails"] = call("pr_diff", 8, True)
 out["runs"] = call("runs", "pr", 7)
 out["runs_issue"] = call("runs", "issue", 3)
 out["runs_bad_kind"] = call("runs", "bogus", 1)
 out["runs_bad_number"] = call("runs", "pr", "x")
+out["runs_overflow"] = call("runs", "pr", json.loads("1e999"))
+out["pr_overflow"] = call("pr", json.loads("1e999"))
+out["issue_overflow"] = call("issue", json.loads("1e999"))
 out["run_bad"] = call("run", "../../etc/passwd")
 out["run_missing"] = call("run", "7/nothing")
 out["save_notdict"] = call("save_config", "nope")
@@ -57,6 +61,8 @@ assert "x.txt" in json.dumps(o["diff"]) and "error" not in o["diff"], o["diff"]
 for k in ("diff_bad_number", "diff_gh_fails", "runs_bad_kind", "runs_bad_number", "run_bad", "run_missing", "save_notdict",
           "save_unknown", "save_empty"):
     assert isinstance(o[k], dict) and o[k].get("error"), (k, o[k])
+for k in ("pr_overflow", "issue_overflow", "diff_overflow", "runs_overflow"):
+    assert o[k] == {"error": "number must be an integer"}, (k, o[k])
 assert "groups" in o["runs"], o["runs"]
 assert isinstance(o["runs_issue"], dict) and ("groups" in o["runs_issue"] or o["runs_issue"].get("error")), o["runs_issue"]  # the shim fails the issue lookup
 assert "error" not in o["save_ok"] and o["saved_file"], o["save_ok"]
