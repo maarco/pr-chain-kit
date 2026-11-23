@@ -33,6 +33,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "chain"))
 import config  # noqa: E402
 from config import CFG as CONF  # noqa: E402  pr-chain.toml: paths.work etc.
 config.ensure_standalone()
+if not CONF.configured:  # no repo set (or only the template's owner/name): nothing to loop over, and no gh call may happen
+    print("pr-chain-loop: no repo is configured, so there is nothing to run. Set [repo] slug in pr-chain.toml "
+          "(`pr-chain init` writes it), or KIT_REPO=owner/name.", flush=True)
+    sys.exit(0)
 
 WORK = CONF.work
 CHAIN = str(Path(__file__).resolve().with_name("pr-chain"))
