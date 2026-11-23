@@ -539,13 +539,19 @@ def refresh_pick():
 
     def work():
         try:
-            out = subprocess.run([sys.executable, "-B", CHAIN, "pick", "--all"], capture_output=True, text=True, timeout=120).stdout
-            rows = []
-            for ln in out.splitlines():
-                m = re.match(r"^\s*(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(.*)$", ln)
-                if m:
-                    rows.append(dict(pr=int(m.group(1)), size=int(m.group(2)), state=m.group(3), ui=m.group(4) == "UI",
-                                     author=m.group(5), owner=m.group(6).strip()))
+            if config.CFG_PATH is None and config.CONFIGURED:
+                # a host configured CFG: a child process would read the template/user file instead, so rank in-process
+                ch = _chain_mod()
+                rows = [dict(pr=int(r["number"]), size=int(r["size"]), state=r["mergeStateStatus"], ui=bool(r["ui"]),
+                             author=r["author"]["login"], owner=r["owner"] or "FREE") for r in ch.rank(ch.list_prs())]
+            else:
+                out = subprocess.run([sys.executable, "-B", CHAIN, "pick", "--all"], capture_output=True, text=True, timeout=120).stdout
+                rows = []
+                for ln in out.splitlines():
+                    m = re.match(r"^\s*(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(.*)$", ln)
+                    if m:
+                        rows.append(dict(pr=int(m.group(1)), size=int(m.group(2)), state=m.group(3), ui=m.group(4) == "UI",
+                                         author=m.group(5), owner=m.group(6).strip()))
             pick_cache["rows"] = rows
         except Exception:
             pass
