@@ -218,6 +218,48 @@ def test_new_kit_files_carry_no_home_paths_or_personal_names():
             assert marker not in text, (name, marker)
 
 
+SHIM = "#!/bin/sh\necho \"$@\" >> \"$GH_SHIM_LOG\"\necho '[]'\n"
+
+
+def gh_shim(root):
+    """A gh on PATH that logs its arguments and answers an empty list. Returns (bin dir, log file)."""
+    bindir = pathlib.Path(root, "shim")
+    bindir.mkdir(parents=True, exist_ok=True)
+    gh = bindir / "gh"
+    gh.write_text(SHIM)
+    gh.chmod(0o755)
+    return bindir, pathlib.Path(root, "gh.log")
+
+
+def shim_env(root):
+    bindir, log = gh_shim(root)
+    return {"PATH": f"{bindir}{os.pathsep}{os.environ['PATH']}", "GH_SHIM_LOG": str(log)}, log
+
+
+def test_every_read_function_leaves_the_host_configuration_alone():
+    code = (HOST + "import os, plugin_api as p\n"
+            "def snap():\n"
+            "    return dict(slug=c.CFG.slug, configured=c.CFG.configured, work=str(c.CFG.work), wt=str(c.CFG.worktree_root),\n"
+            "                checkout=str(c.CFG.checkout), flow=str(c.FLOW_FILE), prompts=str(c.PROMPTS_USER), cfg_path=str(c.CFG_PATH),\n"
+            "                env=dict(os.environ))\n"
+            "before = snap()\n"
+            "for fn in (lambda: p.config(), lambda: p.state(), lambda: p.prs(), lambda: p.pr(1), lambda: p.issues(),\n"
+            "           lambda: p.issue(1), lambda: p.spend(), lambda: p.badge()):\n"
+            "    fn()\n"
+            "after = snap()\n"
+            "print(json.dumps(dict(same=before == after, before=before, after=after)))\n")
+    with tempfile.TemporaryDirectory(prefix="prc-host-") as root:
+        data = pathlib.Path(root, "data")
+        checkout = pathlib.Path(root, "checkout")
+        checkout.mkdir()
+        settings = pathlib.Path(root, "settings.json")
+        settings.write_text(json.dumps({"repo": {"slug": "acme/widgets", "checkout": str(checkout)}}))
+        extra, _ = shim_env(root)
+        got = child(code, data, args=[settings, data], extra=extra)
+    assert got["same"], (got["before"]["slug"], got["after"]["slug"], got["before"]["configured"], got["after"]["configured"],
+                         {k: v for k, v in got["after"]["env"].items() if k.startswith(PREFIXES)})
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = []
