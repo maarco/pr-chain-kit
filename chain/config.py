@@ -14,8 +14,10 @@ from __future__ import annotations
 
 import os
 import json
+import logging
 import re
 import shutil
+import stat
 import tempfile
 import tomllib
 from pathlib import Path
@@ -296,5 +298,28 @@ def make_stage_home():
 
 
 def remove_stage_home(path) -> None:
-    if path is not None:
-        shutil.rmtree(path, ignore_errors=True)
+    if path is None or not os.path.lexists(path):
+        return
+    try:
+        shutil.rmtree(path)
+        return
+    except OSError:
+        pass
+
+    def make_owner_writable(directory):
+        try:
+            mode = directory.lstat().st_mode
+            if stat.S_ISDIR(mode):
+                directory.chmod(stat.S_IMODE(mode) | stat.S_IRWXU)
+        except OSError:
+            pass
+
+    target = Path(path)
+    make_owner_writable(target)
+    for root, dirs, _ in os.walk(target, topdown=True, onerror=lambda _: None):
+        for name in dirs:
+            make_owner_writable(Path(root) / name)
+    try:
+        shutil.rmtree(target)
+    except OSError as exc:
+        logging.getLogger(__name__).error("Could not remove stage HOME %s after retry: %s", target, exc)
