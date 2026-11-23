@@ -11,6 +11,7 @@ and both changelog copies go back to main's text; anything but pure new entries 
 Exit 0 = pushed (or checks passed without --push), 2 = conflict, 3 = checks failed, 1 = anything else.
 Reads: KIT_REPO, KIT_TRAIN, KIT_PYTHON.
 """
+import fnmatch
 import json
 import os
 import pathlib
@@ -152,6 +153,25 @@ if CFG.import_guard:
     if not where.startswith(str(WT)):
         sys.exit(f"STOP: tests would import {where}, not the train worktree")
 bad = []
+
+
+def configured_checks():
+    """[[merge_checks]] from the config: each runs once in the merged worktree when a changed file matches."""
+    for c in CFG.merge_checks:
+        files = [f for f in changed if (WT / f).exists() and any(fnmatch.fnmatch(f, m) or fnmatch.fnmatch(pathlib.Path(f).name, m) for m in c["match"])]
+        if not files:
+            continue
+        cmd = [a for x in c["cmd"] for a in (files if x == "{files}" else [x.replace("{wt}", str(WT))])]
+        t = dev_run(*cmd, check=False, env=env, timeout=c["timeout"])
+        out = (t.stdout + t.stderr).strip()
+        print(f"{c['name']}:", out.splitlines()[-1] if out else f"exit {t.returncode}")
+        if t.returncode:
+            bad.append(f"{c['name']}: " + out[-1500:])
+
+
+if CFG.merge_checks:
+    configured_checks()
+    pys, tests = [], []  # the configured checks replace the Python default
 if pys:
     # Same rule set as CI's standards-check (ci.yml): main itself carries style warnings, so a full ruff run stops on noise.
     lint = dev_run("python", "-m", "ruff", "check", "--select", "E9,F63,F7,F82", *pys, check=False)
@@ -170,7 +190,8 @@ for part in groups.values():
     print("pytest:", t.stdout.strip().splitlines()[-1] if t.stdout.strip() else t.stderr[-300:])
     if t.returncode:
         bad.append("pytest: " + t.stdout[-1500:])
-print(f"#{pr} {branch}: {head[:8]} + main {main[:8]} -> {new[:8]}; {len(changed)} files, ruff on {len(pys)}, tests {len(tests)}")
+print(f"#{pr} {branch}: {head[:8]} + main {main[:8]} -> {new[:8]}; {len(changed)} files, "
+      + (f"checks {', '.join(c['name'] for c in CFG.merge_checks)}" if CFG.merge_checks else f"ruff on {len(pys)}, tests {len(tests)}"))
 if bad:
     print("\n".join(bad))
     sys.exit(3)

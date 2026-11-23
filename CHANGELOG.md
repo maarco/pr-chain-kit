@@ -6,6 +6,16 @@ change to `pr-chain.toml`, the `pr-chain` command or the work-folder layout bump
 
 ## [Unreleased]
 
+### Added
+- `[[merge_checks]]` in `pr-chain.toml`: the lint and test commands the fold runs on a PR merged with main, so a
+  non-Python repo (Rust, TypeScript) can use the chain. None configured keeps the Python default (ruff + pytest).
+
+### Changed
+- The fold worktree defaults to `<worktree_root>/../pr-chain-train`, inside the same root as the stage worktrees
+  (was agent-kit's `~/wt/<agent>-train`).
+- `worktree-janitor` skips only the chain's own `pr-*` and `issue-*` folders in the worktree root; anything else
+  there is judged like every other worktree (it was never cleaned before).
+
 ## [0.1.0] - 2026-11-20
 
 ### Added

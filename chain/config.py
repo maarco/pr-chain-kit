@@ -104,6 +104,11 @@ class Cfg:
 
         self.field_guide = _p(proj["field_guide"]) if proj.get("field_guide") else None
 
+        # [[merge_checks]] the fold runs on the PR merged with main: name, match (globs on changed paths), cmd (list;
+        # "{files}" = the matched files; the check runs once when any changed file matches), timeout (seconds).
+        # None configured = the Python default (ruff E9/F63/F7/F82 on changed .py, pytest on changed test_*.py).
+        self.merge_checks = [dict(name=c["name"], match=tuple(c.get("match", ["*"])), cmd=list(c["cmd"]),
+                                  timeout=int(c.get("timeout", 900))) for c in data.get("merge_checks", [])]
         self.notify_cmd = notify.get("command", "")  # pages the operator when the loop is down; empty = no page
 
 

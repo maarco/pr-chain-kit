@@ -29,6 +29,15 @@ lane_status_dir = ""                 # optional: <dir>/*<pr>*/STATUS.md notes fr
 lane_root = ""                       # where sibling lane worktrees live (stale-lane detection); empty = worktree_root's parent
 models_file = ""                     # models.json (commands.json, profiles.json beside it); empty = chain/models.json
 
+# Checks the fold runs on each PR merged with main, before it pushes. None = the Python default (ruff E9/F63/F7/F82
+# on changed .py files, pytest on changed test_*.py files). Each check runs once, in the merged worktree, when any
+# changed path matches one of its globs; "{files}" in cmd expands to the matching files. [repo] run_prefix wraps cmd.
+# [[merge_checks]]
+# name = "clippy"
+# match = ["*.rs", "Cargo.toml"]
+# cmd = ["cargo", "clippy", "--all-targets", "--", "-D", "warnings"]
+# timeout = 900
+
 [labels]
 human_approved = "human-approved"    # label that sends an AWAIT-HUMAN PR to CI + merge
 blocked = ["wontfix", "duplicate", "invalid", "question", "status/blocked", "status/needs-info",
