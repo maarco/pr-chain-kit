@@ -3,7 +3,9 @@
 Plain functions that return JSON-ready dicts and lists. No web framework is imported here: the host wraps each one in
 whatever routes it serves. The data comes from bin/pr-chain-board's readers, loaded on first use, after the host has
 called config.configure(). Until a repo is configured every function answers with the setup message and makes no gh call.
-A failed read answers {"error": "..."} rather than raising, like the board's own routes.
+Reads change no repo or host setting, but a read may refresh the board's caches (the gh cache and the rate table)
+inside the install's work folder, each replaced whole. A failed read answers {"error": "..."} rather than raising,
+like the board's own routes.
 """
 from __future__ import annotations
 
