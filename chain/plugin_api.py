@@ -40,6 +40,13 @@ def _read(fn_name: str, *args):
         return {"error": str(e)[:300]}
 
 
+def _gate(fn_name: str, *args):
+    """A read that needs the checkout (the PR and issue lists): a clear answer when repo.checkout is not set."""
+    if _config.CFG.checkout == _config.UNSET:
+        return {"configured": True, "error": "repo.checkout is not set"}
+    return _read(fn_name, *args)
+
+
 def _unset() -> dict:
     return {"configured": False, "setup": SETUP}
 
@@ -54,22 +61,22 @@ def state(pick_pr: int | None = None) -> dict:
 
 def prs(which: str = "open", fresh: bool = False):
     """The repo's pull requests with their chain state. which: open, closed, merged or all."""
-    return _read("pr_list", which, fresh) if _configured() else _unset()
+    return _gate("pr_list", which, fresh) if _configured() else _unset()
 
 
 def pr(number: int, fresh: bool = False) -> dict:
     """One pull request: chain state, linked issue, review conversation and every step it took."""
-    return _read("pr_detail", int(number), fresh) if _configured() else _unset()
+    return _gate("pr_detail", int(number), fresh) if _configured() else _unset()
 
 
 def issues(which: str = "open", fresh: bool = False):
     """The repo's issues with what the chain did about each."""
-    return _read("issue_list", which, fresh) if _configured() else _unset()
+    return _gate("issue_list", which, fresh) if _configured() else _unset()
 
 
 def issue(number: int, fresh: bool = False) -> dict:
     """One issue and the chain's work on it."""
-    return _read("issue_detail", int(number), fresh) if _configured() else _unset()
+    return _gate("issue_detail", int(number), fresh) if _configured() else _unset()
 
 
 def spend() -> dict:
