@@ -16,6 +16,7 @@ import os
 import json
 import re
 import shutil
+import tempfile
 import tomllib
 from pathlib import Path
 
@@ -133,6 +134,9 @@ class Cfg:
 
         self.gh = str(tools.get("gh") or "")  # [tools] gh: the gh binary; empty = the first gh on PATH
         self.agent_env = dict(agent.get("env", {}))
+        # [agent] env_allowlist: when set (even empty) a stage agent sees only these names plus [agent] env. None = off.
+        self.env_allowlist = tuple(agent["env_allowlist"]) if agent.get("env_allowlist") is not None else None
+        self.agent_home = str(agent.get("home") or "")  # "per-stage": a fresh HOME for every stage agent; "" = the parent's
         self.require_sandbox = bool(agent.get("require_sandbox", True))  # reviewers refuse to start without sandbox-exec
 
         self.tripwire_file = _p(trip["settings_file"], near, fallback) if trip.get("settings_file") else None
@@ -259,3 +263,38 @@ def child_env(environ=None) -> dict:
     agent CLIs keep their logins."""
     src = os.environ if environ is None else environ
     return {k: v for k, v in src.items() if not k.startswith(ENV_PREFIXES)}
+
+
+TOKEN_PREFIXES = ("ghp_", "github_pat_", "gho_", "ghs_", "ghu_")  # GitHub token formats: a value like this is never passed on
+
+
+def stage_env(extra=None, home=None, environ=None) -> dict:
+    """The environment for one stage agent. Default: child_env() plus extra plus [agent] env. With [agent] env_allowlist
+    set: only the listed names from the parent (still without KIT_/PR_CHAIN_/KOLLAB_/GH_/GITHUB_), then extra and
+    [agent] env, and every value that starts like a GitHub token is dropped whatever its name. home replaces HOME."""
+    src = os.environ if environ is None else environ
+    if CFG.env_allowlist is None:
+        env = child_env(src)
+    else:
+        env = child_env({k: v for k, v in src.items() if k in CFG.env_allowlist})
+    env.update(extra or {})
+    env.update(CFG.agent_env)
+    if CFG.env_allowlist is not None:
+        env = {k: v for k, v in env.items() if not str(v).startswith(TOKEN_PREFIXES)}
+    if home is not None:
+        env["HOME"] = str(home)
+    return env
+
+
+def make_stage_home():
+    """A fresh empty HOME under the work folder when [agent] home = "per-stage", else None. Pair with remove_stage_home."""
+    if CFG.agent_home != "per-stage":
+        return None
+    base = Path(CFG.work) / "stage-home"
+    base.mkdir(parents=True, exist_ok=True)
+    return Path(tempfile.mkdtemp(prefix="stage-", dir=base))
+
+
+def remove_stage_home(path) -> None:
+    if path is not None:
+        shutil.rmtree(path, ignore_errors=True)

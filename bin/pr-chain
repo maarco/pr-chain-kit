@@ -691,12 +691,20 @@ def readonly_agent_command(role, cmd, outdir):
 
 def run_agent(role, model, brief, cwd, outdir, pr):
     """Run one fresh agent to completion, synchronously. Returns dict(rc, secs, turns, cost)."""
+    home = config.make_stage_home()  # [agent] home = "per-stage": a fresh HOME, removed when the agent is done
+    try:
+        return _run_agent(role, model, brief, cwd, outdir, pr, home)
+    finally:
+        config.remove_stage_home(home)
+
+
+def _run_agent(role, model, brief, cwd, outdir, pr, home):
     kind, name = runner(model)
     outdir.mkdir(parents=True, exist_ok=True)
     nogh = outdir / "no-gh"
     nogh.mkdir(exist_ok=True)
-    env = config.child_env()  # no GH_/GITHUB_ token, no KIT_/PR_CHAIN_/KOLLAB_ setting
-    env.update(GH_CONFIG_DIR=str(nogh), GIT_TERMINAL_PROMPT="0", **CFG.agent_env)
+    # no GH_/GITHUB_ token, no KIT_/PR_CHAIN_/KOLLAB_ setting; [agent] env_allowlist and home narrow it further
+    env = config.stage_env(extra=dict(GH_CONFIG_DIR=str(nogh), GIT_TERMINAL_PROMPT="0"), home=home)
     prompt = f"Read {brief} and follow it exactly."
     before = cfg_snapshot()
     cmd = agent_cmd(model, prompt, brief=brief)
