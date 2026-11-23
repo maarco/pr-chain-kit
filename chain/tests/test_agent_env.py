@@ -3,7 +3,8 @@
 [agent] env_allowlist = [...]: the child gets only those names plus [agent] env, the GH_/GITHUB_ strip still applies, and
 any value that looks like a GitHub token (ghp_, github_pat_, gho_, ghs_, ghu_) is dropped whatever the name.
 [agent] home = "per-stage": every stage agent gets a fresh HOME under the work folder, created and removed by the kit."""
-import atexit, importlib.machinery, importlib.util, os, pathlib, shutil, sys, tempfile
+import atexit, importlib.machinery, importlib.util, logging, os, pathlib, shutil, sys, tempfile
+from unittest import mock
 
 sys.dont_write_bytecode = True
 root = pathlib.Path(__file__).resolve().parents[2]
@@ -50,7 +51,31 @@ assert a != b and a.is_dir() and b.is_dir()
 assert cfg.work in a.parents, (a, cfg.work)
 (a / "marker").write_text("x")
 assert config.stage_env(home=a, environ=PARENT)["HOME"] == str(a)
-config.remove_stage_home(a)
+restricted = a / "restricted"
+restricted.mkdir()
+(restricted / "marker").write_text("x")
+restricted.chmod(0o500)
+try:
+    config.remove_stage_home(a)
+    assert not a.exists(), "remove_stage_home leaves a stage HOME with a non-writable nested directory"
+finally:
+    if a.exists():
+        restricted.chmod(0o700)
+        shutil.rmtree(a)
+stuck = pathlib.Path(tempfile.mkdtemp(prefix="stage-home--", dir=tmp))
+errors = []
+logger = logging.getLogger(config.__name__)
+handler = logging.Handler()
+handler.emit = lambda record: errors.append(record.getMessage())
+logger.addHandler(handler)
+try:
+    with mock.patch.object(config.shutil, "rmtree", side_effect=PermissionError("persistent cleanup failure")):
+        config.remove_stage_home(stuck)
+finally:
+    logger.removeHandler(handler)
+assert stuck.exists(), "a failed retry must not raise or claim that the stage HOME was removed"
+assert any("persistent cleanup failure" in message for message in errors), errors
+shutil.rmtree(stuck)
 config.remove_stage_home(b)
 config.remove_stage_home(None)  # no-op
 assert not a.exists() and not b.exists()
