@@ -282,6 +282,19 @@ def test_state_asks_gh_only_about_the_configured_repo():
     assert all("-R acme/widgets" in c for c in calls), calls
 
 
+def test_a_repo_without_a_checkout_answers_with_a_clear_message():
+    code = (HOST + "import plugin_api as p\n"
+            "print(json.dumps({n: f() for n, f in (('prs', p.prs), ('pr', lambda: p.pr(1)), ('issues', p.issues), ('issue', lambda: p.issue(1)))}))\n")
+    with tempfile.TemporaryDirectory(prefix="prc-host-") as root:
+        data = pathlib.Path(root, "data")
+        settings = pathlib.Path(root, "settings.json")
+        settings.write_text(json.dumps({"repo": {"slug": "acme/widgets"}}))
+        extra, _ = shim_env(root)
+        got = child(code, data, args=[settings, data], extra=extra)
+    for name, out in got.items():
+        assert out == {"configured": True, "error": "repo.checkout is not set"}, (name, out)
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = []
