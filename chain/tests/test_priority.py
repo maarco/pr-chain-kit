@@ -57,6 +57,9 @@ prs = [pr(1, 5), pr(2, 500, body="Fixes #1154"), pr(3, 50, headRefName="fix/issu
        pr(4, 1, labels=L("priority/p1")), pr(5, 1, body="Fixes #1154", _owner="running")]
 order = [r["number"] for r in pc.rank(prs, prios={1154: 0, 77: 2})]
 check("rank: p0 big PR, then p1 label, then p2 link, then unlabelled, owned last", order, [2, 4, 3, 1, 5])
+stacked = pc.rank([pr(8, 1, baseRefName="feature-x"), pr(6, 1, baseRefName="main")], prios={})
+check("rank: a PR stacked on another branch is parked, not free", [(r["number"], r["owner"]) for r in stacked],
+      [(6, None), (8, "parked: stacked on feature-x, not main")])
 check("rank: unknown linked issue counts as no priority", pc.rank([pr(9, 1, body="Fixes #999")], prios={})[0]["prio"], 9)
 
 # ---- auto: only a p0/p1 issue jumps ahead of a lower-priority PR

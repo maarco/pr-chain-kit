@@ -375,7 +375,7 @@ def owner_reason(p, ps_text):
 
 def list_prs():
     fields = ("number,title,isDraft,headRefName,headRefOid,mergeStateStatus,author,isCrossRepository,additions,deletions,files,"
-              "body,labels,closingIssuesReferences")
+              "body,labels,closingIssuesReferences,baseRefName")
     return gh_json("pr", "list", "-R", REPO, "--state", "open", "--limit", "100", "--json", fields)
 
 
@@ -408,6 +408,8 @@ def rank(prs, prios=None):
     rows = []
     for p in prs:
         why = owner_reason(p, ps_text)
+        if why is None and p.get("baseRefName", CFG.branch) != CFG.branch:  # stacked PR: fold.py refuses it, so the loop re-picked it every lap (110 ERRORs on one PR)
+            why = f"parked: stacked on {p['baseRefName']}, not {CFG.branch}"
         ui = any(UI_RE.search(f["path"]) for f in p["files"])
         prio = min([label_prio(p.get("labels"))] + [prios.get(n, 9) for n in linked_issues(p)])
         rows.append(dict(p, owner=why, ui=ui, size=p["additions"] + p["deletions"], prio=prio))
