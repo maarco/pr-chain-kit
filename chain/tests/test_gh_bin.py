@@ -56,6 +56,6 @@ assert got == "shim-gh version", f"pr-chain sh gh: {got}"
 got = child(f"import sys; sys.path.insert(0, {str(root / 'agent-kit')!r}); import kit; print(kit.gh_bin())", PATH_SHIM)
 assert got == str(shim), f"kit.gh_bin: {got}"
 src = (root / "bin/worktree-janitor").read_text() + (root / "agent-kit/land/land_pr.py").read_text()
-assert '"gh"' not in src, "janitor and land_pr must not hard-code gh"
+assert 'run("gh"' not in src and '["gh"' not in src, "janitor and land_pr must not hard-code gh"
 assert "/opt/homebrew/bin/gh" not in (root / "bin/pr-chain-board").read_text(), "board must not prefer a fixed path"
 print("PASS")

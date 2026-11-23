@@ -79,6 +79,7 @@ class Cfg:
         trip = data.get("tripwire", {})
         proj = data.get("project", {})
         notify = data.get("notify", {})
+        tools = data.get("tools", {})
         self.limits = dict(data.get("limits", {}))  # overrides flow.json limits.<name>.value, e.g. prs_at_once = 12
 
         self.slug = env.get("KIT_REPO") or repo.get("slug") or ""
@@ -130,6 +131,7 @@ class Cfg:
         self.term_shots_script = _p(ui["term_shots_script"], near, fallback) if ui.get("term_shots_script") else None
         self.playwright_browsers = _p(ui["playwright_browsers_path"], near, fallback) if ui.get("playwright_browsers_path") else None
 
+        self.gh = str(tools.get("gh") or "")  # [tools] gh: the gh binary; empty = the first gh on PATH
         self.agent_env = dict(agent.get("env", {}))
         self.require_sandbox = bool(agent.get("require_sandbox", True))  # reviewers refuse to start without sandbox-exec
 
@@ -241,6 +243,14 @@ def kit_env_defaults():
                  ("KIT_TRAIN", str(CFG.train))):
         if v:
             os.environ.setdefault(k, v)
+
+
+GH_FALLBACKS = ("/opt/homebrew/bin/gh", "/usr/local/bin/gh")
+
+
+def gh_bin() -> str:
+    """The gh to run: [tools] gh when set, else the first gh on PATH, else a known install path, else plain "gh"."""
+    return CFG.gh or shutil.which("gh") or next((g for g in GH_FALLBACKS if os.path.exists(g)), "gh")
 
 
 def child_env(environ=None) -> dict:

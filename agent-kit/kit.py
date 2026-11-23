@@ -26,7 +26,9 @@ Variables (shell tools read the same names through kit.sh):
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 
@@ -73,8 +75,18 @@ def work(*parts: str) -> Path:
     return WORK.joinpath(*parts)
 
 
+def gh_bin() -> str:
+    """The gh to run: the chain's one resolver (config.gh_bin: [tools] gh, then PATH, then the old paths)."""
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "chain"))
+        import config
+        return config.gh_bin()
+    except ImportError:
+        return shutil.which("gh") or "gh"
+
+
 def gh_env(account: str) -> dict[str, str]:
     """os.environ plus GH_TOKEN for one logged-in gh account. Never prints the token; never runs `gh auth switch`."""
-    token = subprocess.run(["gh", "auth", "token", "--user", account], capture_output=True, text=True,
+    token = subprocess.run([gh_bin(), "auth", "token", "--user", account], capture_output=True, text=True,
                            check=True).stdout.strip()
     return dict(os.environ, GH_TOKEN=token)

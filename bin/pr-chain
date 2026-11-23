@@ -154,6 +154,8 @@ def log(msg):
 
 
 def sh(*cmd, cwd=None, check=False, env=None, timeout=300):
+    if cmd and cmd[0] == "gh":
+        cmd = (config.gh_bin(), *cmd[1:])  # one resolver: [tools] gh, then PATH, then the old paths
     try:
         p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, env=env, timeout=timeout)
     except subprocess.TimeoutExpired:  # a hung git/gh/fold call ends the chain through die(), not with STATE left at running

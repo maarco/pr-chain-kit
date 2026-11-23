@@ -29,7 +29,7 @@ if reviewed != head:
 
 
 def gh(user, *args):
-    proc = subprocess.run(["gh", *args], capture_output=True, text=True, env=kit.gh_env(user))
+    proc = subprocess.run([kit.gh_bin(), *args], capture_output=True, text=True, env=kit.gh_env(user))
     if proc.returncode:
         sys.exit(f"STOP: gh {' '.join(args[:2])} failed: {proc.stderr[:300]}")
     return proc.stdout
