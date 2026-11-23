@@ -68,7 +68,13 @@ def prs(which: str = "open", fresh: bool = False):
 
 def pr(number: int, fresh: bool = False) -> dict:
     """One pull request: chain state, linked issue, review conversation and every step it took."""
-    return _gate("pr_detail", int(number), fresh) if _configured() else _unset()
+    if not _configured():
+        return _unset()
+    try:
+        number = int(number)
+    except (TypeError, ValueError, OverflowError):
+        return {"error": "number must be an integer"}
+    return _gate("pr_detail", number, fresh)
 
 
 def issues(which: str = "open", fresh: bool = False):
@@ -78,7 +84,13 @@ def issues(which: str = "open", fresh: bool = False):
 
 def issue(number: int, fresh: bool = False) -> dict:
     """One issue and the chain's work on it."""
-    return _gate("issue_detail", int(number), fresh) if _configured() else _unset()
+    if not _configured():
+        return _unset()
+    try:
+        number = int(number)
+    except (TypeError, ValueError, OverflowError):
+        return {"error": "number must be an integer"}
+    return _gate("issue_detail", number, fresh)
 
 
 def spend() -> dict:
@@ -97,7 +109,7 @@ def pr_diff(number: int, fresh: bool = False) -> dict:
         return _unset()
     try:
         number = int(number)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return {"error": "number must be an integer"}
     return _gate("pr_diff", number, fresh)
 
@@ -108,7 +120,7 @@ def runs(kind: str, number: int) -> dict:
         return _unset()
     try:
         number = int(number)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return {"error": "number must be an integer"}
     if kind not in ("pr", "issue"):
         return {"error": 'kind must be "pr" or "issue"'}
