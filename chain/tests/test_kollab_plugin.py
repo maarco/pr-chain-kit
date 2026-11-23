@@ -260,6 +260,28 @@ def test_every_read_function_leaves_the_host_configuration_alone():
                          {k: v for k, v in got["after"]["env"].items() if k.startswith(PREFIXES)})
 
 
+def test_state_asks_gh_only_about_the_configured_repo():
+    code = (HOST + "import time, plugin_api as p\n"
+            "p.state()\n"
+            "b = p._readers()\n"
+            "end = time.time() + 60\n"
+            "while b.pick_cache['busy'] and time.time() < end:\n"
+            "    time.sleep(0.1)\n"
+            "print(json.dumps(dict(busy=b.pick_cache['busy'])))\n")
+    with tempfile.TemporaryDirectory(prefix="prc-host-") as root:
+        data = pathlib.Path(root, "data")
+        checkout = pathlib.Path(root, "checkout")
+        checkout.mkdir()
+        settings = pathlib.Path(root, "settings.json")
+        settings.write_text(json.dumps({"repo": {"slug": "acme/widgets", "checkout": str(checkout)}}))
+        extra, log = shim_env(root)
+        got = child(code, data, args=[settings, data], extra=extra)
+        calls = log.read_text().splitlines() if log.exists() else []
+    assert not got["busy"], "the pick refresh did not finish"
+    assert calls, "state() never reached gh, so the check proves nothing"
+    assert all("-R acme/widgets" in c for c in calls), calls
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = []
