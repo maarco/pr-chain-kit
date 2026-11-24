@@ -300,6 +300,13 @@ def make_stage_home():
 def remove_stage_home(path) -> None:
     if path is None or not os.path.lexists(path):
         return
+    if os.path.islink(path):
+        # Remove the link itself; never walk or chmod what it points to.
+        try:
+            os.unlink(path)
+        except OSError as exc:
+            logging.getLogger(__name__).error("Could not remove stage HOME link %s: %s", path, exc)
+        return
     try:
         shutil.rmtree(path)
         return
