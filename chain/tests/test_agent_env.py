@@ -3,7 +3,7 @@
 [agent] env_allowlist = [...]: the child gets only those names plus [agent] env, the GH_/GITHUB_ strip still applies, and
 any value that looks like a GitHub token (ghp_, github_pat_, gho_, ghs_, ghu_) is dropped whatever the name.
 [agent] home = "per-stage": every stage agent gets a fresh HOME under the work folder, created and removed by the kit."""
-import atexit, importlib.machinery, importlib.util, logging, os, pathlib, shutil, sys, tempfile
+import atexit, importlib.machinery, importlib.util, logging, os, pathlib, shutil, stat, sys, tempfile
 from unittest import mock
 
 sys.dont_write_bytecode = True
@@ -76,6 +76,17 @@ finally:
 assert stuck.exists(), "a failed retry must not raise or claim that the stage HOME was removed"
 assert any("persistent cleanup failure" in message for message in errors), errors
 shutil.rmtree(stuck)
+outside = pathlib.Path(tempfile.mkdtemp(prefix="outside--", dir=tmp))
+locked = outside / "locked"
+locked.mkdir()
+locked.chmod(0o500)
+link = pathlib.Path(tmp) / "stage-home-link"
+link.symlink_to(outside, target_is_directory=True)
+config.remove_stage_home(link)
+assert stat.S_IMODE(locked.stat().st_mode) == 0o500, "cleanup must not chmod outside a symlinked stage HOME"
+assert locked.exists() and not os.path.lexists(link), "remove the link itself, never what it points to"
+locked.chmod(0o700)
+shutil.rmtree(outside)
 config.remove_stage_home(b)
 config.remove_stage_home(None)  # no-op
 assert not a.exists() and not b.exists()
