@@ -313,19 +313,35 @@ def remove_stage_home(path) -> None:
     except OSError:
         pass
 
-    def make_owner_writable(directory):
+    # File-descriptor walk with O_NOFOLLOW: a root or child swapped for a symlink is never followed.
+    nofollow_dir = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+    def make_owner_writable(fd):
         try:
-            mode = directory.lstat().st_mode
-            if stat.S_ISDIR(mode):
-                directory.chmod(stat.S_IMODE(mode) | stat.S_IRWXU)
+            os.fchmod(fd, stat.S_IMODE(os.fstat(fd).st_mode) | stat.S_IRWXU)
         except OSError:
             pass
 
     target = Path(path)
-    make_owner_writable(target)
-    for root, dirs, _ in os.walk(target, topdown=True, onerror=lambda _: None):
-        for name in dirs:
-            make_owner_writable(Path(root) / name)
+    try:
+        top = os.open(target, nofollow_dir)
+    except OSError:
+        top = None
+    if top is not None:
+        try:
+            make_owner_writable(top)
+            for _, dirs, _, dir_fd in os.fwalk(".", dir_fd=top, follow_symlinks=False):
+                for name in dirs:
+                    try:
+                        fd = os.open(name, nofollow_dir, dir_fd=dir_fd)
+                    except OSError:
+                        continue
+                    try:
+                        make_owner_writable(fd)
+                    finally:
+                        os.close(fd)
+        finally:
+            os.close(top)
     try:
         shutil.rmtree(target)
     except OSError as exc:
