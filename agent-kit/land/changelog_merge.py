@@ -17,7 +17,9 @@ from pathlib import Path
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "chain"))
+import config  # noqa: E402
 from config import CFG  # noqa: E402
+config.ensure_standalone()
 FILES = CFG.changelog_forbidden or ("CHANGELOG.md",)
 wt = pathlib.Path(sys.argv[1])
 

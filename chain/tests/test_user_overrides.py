@@ -13,6 +13,7 @@ probe = f"""
 import sys, json, pathlib, importlib.machinery, importlib.util
 sys.path.insert(0, {str(root / 'chain')!r})
 import config
+config.configure_standalone()
 assert config.load_flow()["limits"]["prs_at_once"]["value"] == 7, "limits override"
 assert config.prompt_file("review.md").read_text().startswith("MINE"), "edited prompt wins"
 assert config.prompt_file("fix.md") == config.PROMPTS_BASE / "fix.md", "unedited prompt comes from the kit"
@@ -29,13 +30,13 @@ env = {"PATH": "/usr/bin:/bin", "HOME": str(d), "PR_CHAIN_CONFIG": str(d / "pr-c
 r = subprocess.run([sys.executable, "-B", "-c", probe], env=env, capture_output=True, text=True)
 print(r.stdout.strip() or r.stderr[-800:])
 (d / "pr-chain.toml").write_text(base + "\n[limits]\nnot_a_limit = 1\n")
-r2 = subprocess.run([sys.executable, "-B", "-c", f"import sys; sys.path.insert(0, {str(root / 'chain')!r}); import config; config.load_flow()"],
+r2 = subprocess.run([sys.executable, "-B", "-c", f"import sys; sys.path.insert(0, {str(root / 'chain')!r}); import config; config.configure_standalone(); config.load_flow()"],
                     env=env, capture_output=True, text=True)
 bad_ok = r2.returncode != 0 and "not a flow.json limit" in r2.stderr
 print("unknown limit is an error: " + ("ok" if bad_ok else "FAIL " + r2.stderr[-300:]))
 (d / "pr-chain.toml").write_text(base)
 r3 = subprocess.run([sys.executable, "-B", "-c", f"import os, sys; sys.path.insert(0, {str(root / 'chain')!r}); import config; "
-                     "config.kit_env_defaults(); print(os.environ['KIT_TRAIN'])"], env={**env, "PR_CHAIN_WT_ROOT": str(d / "root" / "wt")}, capture_output=True, text=True)
+                     "config.configure_standalone(); config.kit_env_defaults(); print(os.environ['KIT_TRAIN'])"], env={**env, "PR_CHAIN_WT_ROOT": str(d / "root" / "wt")}, capture_output=True, text=True)
 train_ok = r3.stdout.strip() == str(d / "root" / "pr-chain-train")
 print("fold worktree beside the stage worktrees: " + ("ok" if train_ok else "FAIL " + (r3.stdout + r3.stderr)[-300:]))
 sys.exit(0 if r.returncode == 0 and bad_ok and train_ok else 1)

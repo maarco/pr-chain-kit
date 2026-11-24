@@ -29,10 +29,14 @@ HOME = Path.home()
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "chain"))
 import procs  # noqa: E402  process working folders (/proc or lsof)
 try:
+    import config
     from config import CFG as _CONF  # defaults come from pr-chain.toml; CLI flags still win
+    config.ensure_standalone()
     SLUG = _CONF.slug
+    GH = config.gh_bin()  # [tools] gh, else gh on PATH, else the old fixed paths
 except Exception:
     _CONF = None
+    GH = shutil.which("gh") or "gh"
     SLUG = os.environ.get("KIT_REPO", "owner/name")
 MIN_IDLE_H = float(os.environ.get("WORKTREE_JANITOR_IDLE_H", "6"))
 
@@ -72,7 +76,7 @@ def busy_dirs():
 
 def pr_list():
     """Every PR (any state) with its head commit, from GitHub."""
-    p = run("gh", "pr", "list", "-R", SLUG, "--state", "all", "--limit", "3000", "--json", "number,state,headRefName,headRefOid", timeout=180)
+    p = run(GH, "pr", "list", "-R", SLUG, "--state", "all", "--limit", "3000", "--json", "number,state,headRefName,headRefOid", timeout=180)
     if p.returncode:
         raise SystemExit(f"worktree-janitor: GitHub did not answer, nothing removed ({p.stderr.strip()[:150]})")
     return json.loads(p.stdout)

@@ -7,6 +7,17 @@ change to `pr-chain.toml`, the `pr-chain` command or the work-folder layout bump
 ## [Unreleased]
 
 ### Added
+- `[tools] gh` names the gh binary; unset, the first gh on PATH is used, then the old fixed paths. One resolver
+  (`config.gh_bin()`) serves the board, `pr-chain`, the agent-kit and the janitor.
+- `[agent] env_allowlist` (opt-in) limits a stage agent's environment to the listed names plus `[agent] env`, and drops any
+  value that starts like a GitHub token. `[agent] home = "per-stage"` gives each stage agent a fresh HOME that the kit removes.
+- `plugin_api.pr_diff`, `runs`, `run` and `save_config` for hosts, so they no longer reach into `plugin_api._readers()`.
+- The kit can be driven as a library by a host (the kollab plugin). `chain/config.py` reads nothing on import; a host calls
+  `configure(settings, data_dir)` and every folder (work, worktrees, claims, prompts, fold worktree) sits under `data_dir`,
+  so two installs on one host never collide. Prompts are seeded into `data_dir/prompts` once and never overwritten.
+  `chain/plugin_api.py` has plain read functions (state, PRs, issues, spend, config, badge); `chain/atomic.py` writes state
+  JSON whole or not at all. Stage agents no longer inherit `GH_*`, `GITHUB_*`, `KIT_*`, `PR_CHAIN_*` or `KOLLAB_*` variables.
+  Standalone use is unchanged: the `bin/` scripts call `configure_standalone()`.
 - `[[merge_checks]]` in `pr-chain.toml`: the lint and test commands the fold runs on a PR merged with main, so a
   non-Python repo (Rust, TypeScript) can use the chain. None configured keeps the Python default (ruff + pytest).
 - Linux reviewers run under bubblewrap (`bwrap`): the checkout, the worktree root and tracked symlink targets are
@@ -18,6 +29,8 @@ change to `pr-chain.toml`, the `pr-chain` command or the work-folder layout bump
 - The PR picker parks a PR stacked on a branch other than the default branch instead of picking it every lap.
 
 ### Fixed
+- `pr-chain-loop` with no repo set (or only the template `owner/name`) exits 0 with a message naming the repo setting; it used
+  to treat the template as a real repo and keep calling `gh`.
 - `[ui] enabled = false` turns UI review off; it was read and then ignored, so every .tsx change still went to UI review.
 - UI review with no `[ui] stack_script` ends STACK-DOWN with a clear reason, so the PR is held, never merged unreviewed.
 

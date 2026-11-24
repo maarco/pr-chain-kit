@@ -28,7 +28,8 @@ def ask(label, default=""):
 
 def init(args):
     sys.path.insert(0, str(KIT / "chain"))
-    from config import USER_CFG  # noqa: E402
+    from config import user_config_path  # noqa: E402
+    USER_CFG = user_config_path()
     if USER_CFG.exists() and "--force" not in args:
         sys.exit(f"{USER_CFG} already exists; edit it, or rerun with --force to replace it")
     print("pr-chain needs two GitHub accounts: one opens PRs, the other approves and merges them.")

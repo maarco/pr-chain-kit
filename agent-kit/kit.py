@@ -1,5 +1,8 @@
 """Shared settings for agent-kit tools. Every value has an environment override and a default.
 
+A host that runs the chain in-process does not use the environment: it calls kit.configure(cfg) once with the chain's
+config.CFG, and every setting below is replaced from it. Without that call the values come from the variables, as before.
+
 Import it from a tool in a subfolder with:
 
     import sys
@@ -23,7 +26,9 @@ Variables (shell tools read the same names through kit.sh):
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 
@@ -48,6 +53,16 @@ HUB_ME = tuple(n.strip() for n in _env("KIT_HUB_ME", AGENT).split(",") if n.stri
 COORDINATOR = _env("KIT_COORDINATOR", "koordinator")
 
 
+def configure(cfg) -> None:
+    """Replace every setting from a chain config.Cfg (its slug, checkout, work, train, python, merger, checks, agent)."""
+    global AGENT, REPO, OWNER, NAME, CHECKOUT, WORK, TRAIN, PYTHON, MERGER, CHECKS, HUB_ME
+    AGENT = cfg.agent
+    REPO, OWNER, NAME = cfg.slug, cfg.owner, cfg.name
+    CHECKOUT, WORK, TRAIN, PYTHON = cfg.checkout, cfg.work, cfg.train, cfg.python
+    MERGER, CHECKS = cfg.merger, tuple(cfg.checks)
+    HUB_ME = (AGENT,)
+
+
 def check_results(rollup):
     """statusCheckRollup -> {check name: result of its NEWEST run}; a rerun lists several runs per name."""
     runs = sorted(rollup, key=lambda c: c.get("startedAt") or c.get("createdAt") or "")
@@ -60,8 +75,18 @@ def work(*parts: str) -> Path:
     return WORK.joinpath(*parts)
 
 
+def gh_bin() -> str:
+    """The gh to run: the chain's one resolver (config.gh_bin: [tools] gh, then PATH, then the old paths)."""
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "chain"))
+        import config
+        return config.gh_bin()
+    except ImportError:
+        return shutil.which("gh") or "gh"
+
+
 def gh_env(account: str) -> dict[str, str]:
     """os.environ plus GH_TOKEN for one logged-in gh account. Never prints the token; never runs `gh auth switch`."""
-    token = subprocess.run(["gh", "auth", "token", "--user", account], capture_output=True, text=True,
+    token = subprocess.run([gh_bin(), "auth", "token", "--user", account], capture_output=True, text=True,
                            check=True).stdout.strip()
     return dict(os.environ, GH_TOKEN=token)

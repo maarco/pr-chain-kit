@@ -21,7 +21,10 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / "chain"))
 import kit  # noqa: E402
+import config  # noqa: E402
 from config import CFG  # noqa: E402
+config.ensure_standalone()
+kit.configure(CFG)
 
 R = kit.REPO
 WT = kit.TRAIN
@@ -103,7 +106,7 @@ def move_changelog_entries(issue):
     print(f"#{pr}: moved {len(moved)} changelog lines to changes/{issue}.<section>.md ({', '.join(added)})")
 
 
-info = json.loads(subprocess.run(["gh", "pr", "view", pr, "-R", R, "--json",
+info = json.loads(subprocess.run([kit.gh_bin(), "pr", "view", pr, "-R", R, "--json",
                                   "headRefName,headRefOid,state,baseRefName,closingIssuesReferences"],
                                  capture_output=True, text=True, check=True).stdout)
 branch, head = info["headRefName"], info["headRefOid"]

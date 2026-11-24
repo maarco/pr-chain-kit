@@ -28,6 +28,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "chain"))
 import config  # noqa: E402
 from config import CFG as CONF  # noqa: E402  pr-chain.toml: paths.work etc.
+config.ensure_standalone()
 
 WORK = CONF.work
 CHAIN = str(ROOT / "bin" / "pr-chain")
@@ -538,13 +539,19 @@ def refresh_pick():
 
     def work():
         try:
-            out = subprocess.run([sys.executable, "-B", CHAIN, "pick", "--all"], capture_output=True, text=True, timeout=120).stdout
-            rows = []
-            for ln in out.splitlines():
-                m = re.match(r"^\s*(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(.*)$", ln)
-                if m:
-                    rows.append(dict(pr=int(m.group(1)), size=int(m.group(2)), state=m.group(3), ui=m.group(4) == "UI",
-                                     author=m.group(5), owner=m.group(6).strip()))
+            if config.CFG_PATH is None and config.CONFIGURED:
+                # a host configured CFG: a child process would read the template/user file instead, so rank in-process
+                ch = _chain_mod()
+                rows = [dict(pr=int(r["number"]), size=int(r["size"]), state=r["mergeStateStatus"], ui=bool(r["ui"]),
+                             author=r["author"]["login"], owner=r["owner"] or "FREE") for r in ch.rank(ch.list_prs())]
+            else:
+                out = subprocess.run([sys.executable, "-B", CHAIN, "pick", "--all"], capture_output=True, text=True, timeout=120).stdout
+                rows = []
+                for ln in out.splitlines():
+                    m = re.match(r"^\s*(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(.*)$", ln)
+                    if m:
+                        rows.append(dict(pr=int(m.group(1)), size=int(m.group(2)), state=m.group(3), ui=m.group(4) == "UI",
+                                         author=m.group(5), owner=m.group(6).strip()))
             pick_cache["rows"] = rows
         except Exception:
             pass
@@ -1239,7 +1246,7 @@ PRS_PAGE = PC / "board" / "prs.html"
 ISSUES_PAGE = PRS_PAGE.with_name("issues.html")
 ILIST_FIELDS = "number,title,author,labels,state,stateReason,assignees,updatedAt,createdAt,closedAt,closedByPullRequestsReferences"
 IVIEW_FIELDS = ILIST_FIELDS + ",body,comments,milestone,url"
-GH = next((g for g in ("/opt/homebrew/bin/gh", "/usr/local/bin/gh") if os.path.exists(g)), "gh")
+GH = config.gh_bin()  # [tools] gh, else gh on PATH, else the old fixed paths
 gh_cache = {}
 LIST_FIELDS = "number,title,author,headRefName,isDraft,state,mergeStateStatus,reviewDecision,labels,updatedAt,additions,deletions,changedFiles,statusCheckRollup,mergedAt,closedAt"
 VIEW_FIELDS = ("number,title,body,author,state,isDraft,headRefName,baseRefName,headRefOid,mergeable,mergeStateStatus,reviewDecision,labels,additions,"
