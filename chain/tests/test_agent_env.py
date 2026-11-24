@@ -85,6 +85,26 @@ link.symlink_to(outside, target_is_directory=True)
 config.remove_stage_home(link)
 assert stat.S_IMODE(locked.stat().st_mode) == 0o500, "cleanup must not chmod outside a symlinked stage HOME"
 assert locked.exists() and not os.path.lexists(link), "remove the link itself, never what it points to"
+# Race: the root is swapped for a symlink after the link check, while the first rmtree fails.
+race = pathlib.Path(tempfile.mkdtemp(prefix="stage-home-race--", dir=tmp))
+real_rmtree = shutil.rmtree
+calls = []
+
+
+def swap_root_then_fail(path, *args, **kwargs):
+    calls.append(path)
+    if len(calls) == 1:
+        race.rename(race.with_name(race.name + "-moved"))
+        race.symlink_to(outside, target_is_directory=True)
+        raise PermissionError("injected race")
+    return real_rmtree(path, *args, **kwargs)
+
+
+with mock.patch.object(config.shutil, "rmtree", side_effect=swap_root_then_fail):
+    config.remove_stage_home(race)
+assert stat.S_IMODE(locked.stat().st_mode) == 0o500, "a root swapped for a symlink mid-cleanup must not be followed"
+os.unlink(race)
+shutil.rmtree(race.with_name(race.name + "-moved"))
 locked.chmod(0o700)
 shutil.rmtree(outside)
 config.remove_stage_home(b)
