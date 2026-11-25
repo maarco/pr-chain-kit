@@ -178,4 +178,5 @@ async function post(body,msg,after){msg.className='msg';msg.textContent='Saving'
  if(!r.ok||j.error){msg.className='msg bad';msg.textContent=j.error||('error '+r.status);return}
  if(after)after();const keep=j.saved;await load();const m=$(msg.id);if(m){m.className='msg ok';m.textContent=keep}}catch(e){msg.className='msg bad';msg.textContent='Save failed: '+e}}
 load();
-</script></body></html>
+</script><script src="/repo.js" defer></script>
+</body></html>

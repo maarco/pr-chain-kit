@@ -216,4 +216,5 @@ $('prompts').oninput=e=>{const t=e.target;if(!t.dataset.p)return;promptDraft[t.d
 $('prompts').onclick=e=>{const a=e.target.closest('a[data-psave]');if(!a)return;e.preventDefault();if(a.getAttribute('aria-disabled')==='true')return;
  const n=a.dataset.psave;post({save_prompt:{name:n,text:promptDraft[n]}},$("prmsg"),()=>{delete promptDraft[n]})};
 load();setInterval(load,10000);
-</script></body></html>
+</script><script src="/repo.js" defer></script>
+</body></html>

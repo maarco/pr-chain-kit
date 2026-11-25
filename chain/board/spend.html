@@ -63,4 +63,5 @@ function paint(){if(!D)return;const f=P.win==='today'?'today':'tok',g=f==='today
 $('sw').onclick=e=>{const a=e.target.closest('a');if(!a)return;if(a.dataset.w)P.win=a.dataset.w;if(a.dataset.s)P.sort=a.dataset.s;localStorage.setItem('spend.p',JSON.stringify(P));paint()};
 async function load(){try{const r=await (await fetch('/api/spend')).json();if(!r.error){D=r;paint()}}catch(e){}}
 load();setInterval(load,30000);
-</script></body></html>
+</script><script src="/repo.js" defer></script>
+</body></html>
