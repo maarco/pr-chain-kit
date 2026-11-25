@@ -32,7 +32,7 @@ with sync_playwright() as p:
                 pg.wait_for_timeout(300)
                 key = f"{slug}-{size}-{theme}"
                 overflow[key] = pg.evaluate("document.documentElement.scrollWidth > window.innerWidth")
-                pg.screenshot(path=str(out / f"{key}.png"))
+                pg.screenshot(path=str(out / f"{key}.png"), animations="disabled")
                 ctx.close()
     br.close()
 (out / "overflow.json").write_text(json.dumps(overflow, indent=1))
