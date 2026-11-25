@@ -36,6 +36,20 @@ jobs:
           done
           exit $fail
 
+  # The check the chain requires (pr-chain.toml [accounts] checks): one check for the whole suite. It also runs after a
+  # red shard, so a red shard reads as FAILURE; a skipped check never finishes and the chain waits for it.
+  gate:
+    name: ci/tests
+    needs: tests
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail unless every test shard passed
+        run: |
+          result="${{ needs.tests.result }}"
+          echo "tests: $result"
+          test "$result" = success
+
   package:
     runs-on: ubuntu-latest
     steps:
