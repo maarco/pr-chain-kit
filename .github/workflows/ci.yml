@@ -55,6 +55,8 @@ jobs:
 
   package:
     runs-on: ubuntu-latest
+    # A hung step is stopped here, so the package check finishes instead of waiting 360 minutes.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
