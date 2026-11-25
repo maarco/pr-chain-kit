@@ -32,6 +32,6 @@ for name in required:
     body = "\n".join(line[10:] for line in script.splitlines() if line.startswith(" " * 10))
     for result in ("success", "failure", "cancelled"):
         rc = subprocess.run(["bash", "-e", "-c", body.replace("${{ needs.tests.result }}", result)],
-                            capture_output=True, text=True).returncode
+                            check=False, capture_output=True, text=True).returncode
         assert (rc == 0) == (result == "success"), f"the {name!r} gate with tests {result} exits {rc}"
 print("PASS")
