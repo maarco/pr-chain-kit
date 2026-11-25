@@ -28,7 +28,8 @@ the clone with `python3 -B bin/pr-chain ...` and a `pr-chain.local.toml` (gitign
 
 - One change per PR, linked to its issue (`Fixes #N`).
 - New behavior gets a test in `chain/tests/` that fails without the change. Tests stay stub-only.
-- Add a line under `## [Unreleased]` in `CHANGELOG.md` (not needed for docs-only or test-only changes).
+- Add `changes/<name>.<section>.md` with the entry (not needed for docs-only or test-only changes). Do not edit
+  `CHANGELOG.md`: CI refuses it outside `release/` and `changelog/` branches. `changes/README.md` has the format.
 - A new setting goes in `chain/config.py` with a safe default, plus a commented line in `pr-chain.toml`.
 - Nothing project-specific in the kit: names, paths and commands of one repo belong in `pr-chain.toml`
   or `examples/`.
@@ -43,7 +44,8 @@ the `pr-chain` command. A maintainer reviews and merges.
 Versions follow Semantic Versioning. The version lives only in `pr_chain_kit/__init__.py`.
 
 1. Set `__version__` in `pr_chain_kit/__init__.py`.
-2. In `CHANGELOG.md`, rename `## [Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD` and add a new empty `## [Unreleased]` above it.
+2. On a `release/X.Y.Z` branch, run `python3 scripts/changelog.py build` to fold `changes/` into `## [Unreleased]`.
+   Then rename `## [Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD` and add a new empty `## [Unreleased]` above it.
 3. Commit, then `git tag vX.Y.Z && git push origin main vX.Y.Z`.
 
 The tag runs `.github/workflows/release.yml`: all tests, a check that the tag matches the version and the
