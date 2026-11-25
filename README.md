@@ -34,6 +34,9 @@ command on your PATH, use `uv tool install git+https://github.com/maarco/pr-chai
 `pr-chain init` asks for the repo, its local checkout, your two accounts and the required checks,
 writes `~/.config/pr-chain/pr-chain.toml`, and checks that `gh`, `git` and an agent CLI are ready.
 
+Stable release updates are off by default and require an explicit managed installation. See
+[the operator guide](docs/OPERATOR.md#stable-release-updates) for setup and recovery.
+
 | What | Where |
 |---|---|
 | Your config | `~/.config/pr-chain/pr-chain.toml` (`PR_CHAIN_CONFIG` overrides it) |
