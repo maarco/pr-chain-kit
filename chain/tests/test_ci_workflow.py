@@ -6,7 +6,8 @@ the PR to a fixer. The gate that reports the name must run after a red shard too
 skipped check never finishes either. The gate fails unless the test job succeeded.
 
 A hung job keeps its check pending for GitHub's default limit of 360 minutes, while the chain gives up after its CI wait
-and retries the same head. So the test job and the gate each set timeout-minutes, and together they finish inside that wait.
+and retries the same head. So every job sets timeout-minutes below that wait, and the test job and the gate together
+finish inside it.
 """
 
 import re
@@ -44,4 +45,9 @@ for name in required:
         rc = subprocess.run(["bash", "-e", "-c", body.replace("${{ needs.tests.result }}", result)],
                             check=False, capture_output=True, text=True).returncode
         assert (rc == 0) == (result == "success"), f"the {name!r} gate with tests {result} exits {rc}"
+# every job is bounded, not only the ones a required check waits on: a job without a bound holds its check for 360 minutes
+for job_id, body in jobs.items():
+    bound = re.search(r"(?m)^    timeout-minutes: (\d+)$", body)
+    assert bound, f"ci.yml job {job_id!r} has no timeout-minutes: a hang keeps its check pending for the 360-minute default"
+    assert int(bound.group(1)) < CHAIN_WAIT, f"ci.yml job {job_id!r} can run {bound.group(1)} minutes, past the chain's {CHAIN_WAIT}-minute wait"
 print("PASS")
