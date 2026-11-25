@@ -47,3 +47,16 @@ jobs:
           uvx twine check dist/*
           uvx --from dist/*.whl pr-chain --help
           uvx --from dist/*.whl pr-chain path
+
+  # The required check pr-chain waits for (pr-chain.toml [accounts] checks). It reports after every job above has
+  # finished and fails unless they all passed: a skipped check reads as pending to the chain, which waits for it forever.
+  ci-tests:
+    name: ci/tests
+    if: always()
+    needs: [tests, package]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail unless the test and package jobs passed
+        run: |
+          test "${{ needs.tests.result }}" = success
+          test "${{ needs.package.result }}" = success
