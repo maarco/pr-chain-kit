@@ -36,6 +36,15 @@ jobs:
           done
           exit $fail
 
+  tests-gate:
+    name: ci/tests
+    needs: tests
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every test leg passed
+        run: test "${{ needs.tests.result }}" = success
+
   package:
     runs-on: ubuntu-latest
     steps:
