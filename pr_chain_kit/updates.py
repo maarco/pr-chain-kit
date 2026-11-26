@@ -261,7 +261,7 @@ def install(root: Path, source: Path, package_dir: Path) -> str:
         wrapper.write_text("#!/bin/sh\nROOT=$(CDPATH= cd -- \"$(dirname -- \"$0\")/..\" && pwd)\n"
                            "PR_CHAIN_MANAGED_PYTHONPATH=\"$ROOT/current\" exec \"${PYTHON:-python3}\" -B -c "
                            "'import os,runpy,sys; sys.path.insert(0, os.environ[\"PR_CHAIN_MANAGED_PYTHONPATH\"]); "
-                           "sys.argv=sys.argv[1:]; runpy.run_module(\"pr_chain_kit.cli\", run_name=\"__main__\")' \"$@\"\n")
+                           "runpy.run_module(\"pr_chain_kit.cli\", run_name=\"__main__\")' \"$@\"\n")
         wrapper.chmod(0o755)
         _validate_files(stage, version[1:])
         _activate(stage_root, version)
