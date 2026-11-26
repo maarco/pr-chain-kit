@@ -44,12 +44,12 @@ def check_gate(jobs, check):
     assert check in names, f"{check!r} is not the name of any job, so no run reports it: {sorted(names)}"
     gate = names[check]
     body = "\n".join(jobs[gate])
-    needs = re.search(r"^    needs: \[(.*)\]$", body, re.M)
+    needs = re.search(r"^    needs: \[(.*)\]$", body, re.MULTILINE)
     assert needs, f"the {check!r} job has no `needs: [...]` list"
     others = [j for j in jobs if j != gate]
     listed = {x.strip() for x in needs.group(1).split(",")}
     assert set(others) <= listed, f"the {check!r} job must need every other job: {others}"
-    assert re.search(r"^    if: always\(\)$", body, re.M), f"the {check!r} job must run with `if: always()`"
+    assert re.search(r"^    if: always\(\)$", body, re.MULTILINE), f"the {check!r} job must run with `if: always()`"
     for j in others:
         assert f"needs.{j}.result" in body, f"the {check!r} job must check needs.{j}.result, or a failed {j} passes"
 
