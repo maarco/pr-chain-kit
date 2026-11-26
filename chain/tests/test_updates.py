@@ -77,6 +77,9 @@ def race_worker(root, release, barrier, calls):
 
 def main():
     base, root = fixture()
+    # The installed entrypoint hands its arguments to the real CLI unchanged (python -c already leaves them in sys.argv[1:]).
+    entry = __import__("subprocess").run([str(root / "bin" / "pr-chain"), "path"], capture_output=True, text=True, timeout=15)
+    assert entry.returncode == 0 and pathlib.Path(entry.stdout.strip()).resolve() == (root / "current").resolve(), entry.stdout + entry.stderr
     cfg = base / "pr-chain.toml"
     cfg.write_text("[repo]\nslug='owner/project'\n\n[updates]\nenabled=false\n")
     prompt = base / "prompts" / "review.md"
