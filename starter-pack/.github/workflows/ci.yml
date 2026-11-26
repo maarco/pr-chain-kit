@@ -81,7 +81,9 @@ jobs:
   gate:
     name: ci/tests
     needs: [tests, standards-check]
+    # Runs always: a skipped gate is not SUCCESS to the chain, so a red shard would leave it waiting forever.
+    if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Fail unless every required test job passed
-        run: exit 0
+        run: test "${{ needs.tests.result }}" = success && test "${{ needs.standards-check.result }}" = success
