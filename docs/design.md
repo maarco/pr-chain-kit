@@ -42,6 +42,7 @@ Other chains merge PRs while this one runs, so a PR goes BEHIND several times pe
   base (plus changelog-only commits), a short merge-only addendum (~3 minutes) covers the new head;
   anything else reruns the full audit.
 - A base-only move after the human gate keeps the human approval; only a real push reruns the chain.
+  A real push that changes no UI file keeps the approval too, once the rerun passes.
 - A UI verdict carries to the new head when the diff between the two heads lists no UI file.
 
 ## The carried PASS

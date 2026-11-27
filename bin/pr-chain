@@ -1688,6 +1688,17 @@ def main_only_move(old, new):
     return True
 
 
+def ui_unchanged(old, new):
+    """True when git can list the files old..new changed and none is a UI file (UI_RE): the screens shot at `old` still
+    show `new`. A diff git cannot compute counts as changed."""
+    # --no-renames lists both ends of a rename; -z gives raw paths (plain output quotes non-ASCII ones) (review of kit #23)
+    try:
+        dm = sh("git", "-C", str(CHECKOUT), "diff", "--name-only", "--no-renames", "-z", old, new)
+    except RuntimeError:  # timed out: unknown, so changed
+        return False
+    return dm.returncode == 0 and not any(UI_RE.search(f) for f in dm.stdout.split("\0") if f)
+
+
 def audit_current(pr, a, tag, first_head):
     """The full audit at the PR's current head. When main moved under it (BEHIND), fold main in and audit the new head.
     Returns (verdict, path, head); verdict is CONFLICT when the fold conflicts and BEHIND when main kept moving."""
@@ -2154,8 +2165,7 @@ def _run_chain_py(pr, a, from_gate=False, approved=None, seed=None):
                     # The screenshots belong to an older head. They still hold when the head moved only by merging main and
                     # main brought in no UI file (#1057, 11-14: UI PASS, then a reshoot of the same screen at a main-only
                     # merge gave FAIL). Anything else, or a diff git cannot compute: shoot the new head.
-                    dm = sh("git", "-C", str(CHECKOUT), "diff", "--name-only", shot_head, head)
-                    need_ui = how != "addendum" or dm.returncode != 0 or any(UI_RE.search(f) for f in dm.stdout.split())
+                    need_ui = how != "addendum" or not ui_unchanged(shot_head, head)
                     if not need_ui:
                         log(f"#{pr} UI verdict of {shot_head[:8]} carries to {head[:8]}: main brought in no UI file")
                         ledger(pr=pr, stage="ui-carried", old=shot_head, head=head)
@@ -2660,12 +2670,23 @@ def human_gate(pr, head, ui_vp, a):
     # A label that still approves this head (added after the last gate, head unchanged or moved only by merging main) is a
     # live approval: a same-head retry can reach this gate (review of kit #22). Posting a new gate would reset gate_at and
     # the label would stop counting, so nothing is posted and resume lands it. A read failure raises before any post.
+    # The approval is of the screens: a push since the approved head that changes no UI file keeps it too (Marco, 11-26).
+    # This run already reviewed, audited and shot the new head; the gate moves to it with gate_at kept, so the label counts.
     stale = HUMAN_LABEL in {lb["name"] for lb in gh_json("pr", "view", str(pr), "-R", REPO, "--json", "labels")["labels"]}
     prev = json.loads(state_path(pr).read_text()) if state_path(pr).exists() else {}
-    live = stale and bool(prev.get("gate_at") and prev.get("gate_head")) \
-        and (head == prev["gate_head"] or main_only_move(prev["gate_head"], head)) and human_signal(pr, prev)[0] == "approved"
-    if live:
-        return die(pr, "AWAIT-HUMAN", f"the {HUMAN_LABEL} label of {prev['gate_head'][:8]} still approves {head[:8]}; resume lands it")
+    old = prev.get("gate_head")
+    same = stale and bool(prev.get("gate_at") and old) and (head == old or main_only_move(old, head))
+    # an audit PASS must cover the new head: a --no-gate run reaches this gate with none (review of kit #23)
+    ui_same = stale and bool(prev.get("gate_at") and old) and not same and ui_unchanged(old, head) \
+        and carried_pass(pr, head) == head  # this exact head: an older head's audit misses a main merge no addendum judged
+    if (same or ui_same) and human_signal(pr, prev)[0] == "approved":
+        if ui_same:
+            sh("gh", "pr", "comment", str(pr), "-R", REPO, "--body",
+               f"{MARK}approval-stands old={old} head={head} -->\nThe `{HUMAN_LABEL}` label of {old[:12]} still approves "
+               f"{head[:12]}: no UI file changed between them, and the new head passed review, audit and UI review.", check=True)
+            set_state(pr, gate_head=head)
+            ledger(pr=pr, stage="approval-stands", old=old, head=head, why="no UI file changed")
+        return die(pr, "AWAIT-HUMAN", f"the {HUMAN_LABEL} label of {old[:8]} still approves {head[:8]}; resume lands it")
     commit, rel = push_shots(pr, head, shots)
     base = f"https://github.com/{REPO}/blob/{commit}/{rel}"
     imgs = "\n".join(f"<img src=\"{base}/{p.name}?raw=true\" width=\"320\" alt=\"{p.stem}\">" for p in pngs)
