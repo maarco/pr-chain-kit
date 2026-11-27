@@ -7,6 +7,7 @@ change to `pr-chain.toml`, the `pr-chain` command or the work-folder layout bump
 ## [Unreleased]
 
 ### Added
+- Every board page shows a title with the repo it works on and its open issue and pull request counts.
 - `[tools] gh` names the gh binary; unset, the first gh on PATH is used, then the old fixed paths. One resolver
   (`config.gh_bin()`) serves the board, `pr-chain`, the agent-kit and the janitor.
 - `[agent] env_allowlist` (opt-in) limits a stage agent's environment to the listed names plus `[agent] env`, and drops any

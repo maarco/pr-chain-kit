@@ -11,6 +11,7 @@ permissions:
 
 jobs:
   tests:
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -37,6 +38,7 @@ jobs:
           exit $fail
 
   package:
+    timeout-minutes: 30
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -47,3 +49,14 @@ jobs:
           uvx twine check dist/*
           uvx --from dist/*.whl pr-chain --help
           uvx --from dist/*.whl pr-chain path
+
+  gate:
+    # The chain requires the check named ci/tests (pr-chain.toml). It runs always and fails itself unless every job it
+    # needs passed: a skipped gate is not SUCCESS to the chain, so the chain would wait on it forever.
+    name: ci/tests
+    needs: [tests, package]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every job it needs passed
+        run: test "${{ needs.tests.result }}" = success && test "${{ needs.package.result }}" = success

@@ -1047,6 +1047,7 @@ h2 b{font-weight:500;display:flex;gap:14px;align-items:baseline}
  </div>
 </div>
 </main>
+<script src="/repo.js" defer></script>
 <script type="module">
 const STEPS=['Update Branch','Review','Fix','Audit','UI Review','Human Gate','CI','Merge'],SHORT=['Update','Review','Fix','Audit','UI','Gate','CI','Merge'],N=STEPS.length;
 const $=id=>document.getElementById(id),esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -1283,6 +1284,20 @@ def gh_fetch(key, args):
     return data
 
 
+def repo_view():
+    """The repo this board works on and its open issue and PR totals. totalCount, because the list reads are capped.
+    GitHub unreadable: the name alone."""
+    owner, _, name = CONF.slug.partition("/")
+    query = ("query($owner:String!,$name:String!){repository(owner:$owner,name:$name){"
+             "issues(states:OPEN){totalCount} pullRequests(states:OPEN){totalCount}}}")
+    try:
+        got = gh_json("repocounts", 60, ["api", "graphql", "-f", f"query={query}", "-f", f"owner={owner}", "-f", f"name={name}"])
+        repo = got["data"]["repository"]
+        return dict(repo=CONF.slug, issues=repo["issues"]["totalCount"], prs=repo["pullRequests"]["totalCount"])
+    except Exception:
+        return dict(repo=CONF.slug, issues=None, prs=None)
+
+
 def gh_refresh(key, args):
     try:
         gh_fetch(key, args)
@@ -1484,6 +1499,7 @@ import difflib
 from datetime import datetime
 
 RUNS_JS = PC / "board" / "runs.js"
+REPO_JS = RUNS_JS.with_name("repo.js")  # the repo title on every page
 RUN_RESULT = {"review": "verdict.md", "gate": "verdict.md", "ui": "ui-verdict.md", "fix": "fix-report.md", "build": "build-report.md"}
 RUN_ID = re.compile(r"p(\d+)/([A-Za-z0-9][A-Za-z0-9._-]*)|i(\d+)")
 BRIEF_HEAD = re.compile(r"[Pp]inned head:?\s*`?([0-9a-f]{12,40})|^head ([0-9a-f]{12,40})", re.M)
@@ -1723,6 +1739,10 @@ class H(BaseHTTPRequestHandler):
             body, ctype = json.dumps(data).encode(), "application/json"
         elif path == "/runs.js":
             body, ctype = RUNS_JS.read_bytes(), "text/javascript; charset=utf-8"
+        elif path == "/repo.js":
+            body, ctype = REPO_JS.read_bytes(), "text/javascript; charset=utf-8"
+        elif path == "/api/repo":
+            body, ctype = json.dumps(repo_view()).encode(), "application/json"
         elif self.path.startswith("/api/state"):
             try:
                 body, ctype = json.dumps({**state(int(m.group(1)) if (m := re.search(r"[?&]pr=(\d+)", self.path)) else None), "build": BUILD}).encode(), "application/json"
