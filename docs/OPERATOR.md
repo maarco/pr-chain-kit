@@ -123,7 +123,7 @@ nohup pr-chain board 8790 >> "<work>/logs/board.log" 2>&1 &
 - Start the loop from a shell whose `python3` is your system interpreter, not an activated project venv.
 - Each loop lap: `resume`, `pick`, `run <first FREE PR> --land`; no free PR → `auto` if a slot is free,
   else look again in 10 minutes. A PR is tried at most twice per 6 hours.
-- Threads: `<work>/board-config.json` `{"threads": 1..4}`, editable on the board. `pick` marks only
+- Threads: `<work>/board-config.json` `{"threads": 1..8}`, editable on the board. `pick` marks only
   `limits.prs_at_once` PRs free (set it with `[limits] prs_at_once` in `pr-chain.toml`); with 1, threads above 1 run nothing.
 - The board (pages `/`, `/prs`, `/issues`, `/spend`, `/wiki`, `/config`; JSON under `/api/`) never writes to GitHub.
   Save Prompt on `/wiki` writes your copy in `prompts/` beside your config (old text in `prompts/.history/`);

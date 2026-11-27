@@ -39,6 +39,8 @@ change to `pr-chain.toml`, the `pr-chain` command or the work-folder layout bump
 - UI review with no `[ui] stack_script` ends STACK-DOWN with a clear reason, so the PR is held, never merged unreviewed.
 
 ### Changed
+- The loop runs up to 8 chains at once (`{"threads": 1..8}` in board-config.json, the board's /config page and setup);
+  the cap was 4.
 - The fold worktree defaults to `<worktree_root>/../pr-chain-train`, inside the same root as the stage worktrees
   (was agent-kit's `~/wt/<agent>-train`).
 - `worktree-janitor` skips only the chain's own `pr-*` and `issue-*` folders in the worktree root; anything else

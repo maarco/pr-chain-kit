@@ -170,7 +170,7 @@ def read_prs_at_once():
 
 def read_threads():
     try:
-        return max(1, min(4, int(json.loads(CFG_FILE.read_text())["threads"])))
+        return max(1, min(8, int(json.loads(CFG_FILE.read_text())["threads"])))
     except Exception:
         return 1
 
@@ -353,8 +353,8 @@ def apply_config(body):
         saved.append(f"models -> {', '.join(f'{k}={m[k]}' for k in sorted(m) if m[k])}" + (f", cleared {', '.join(k for k in m if not m[k])}" if any(not v for v in m.values()) else ""))
     if "threads" in body:
         t = body["threads"]
-        if not isinstance(t, int) or isinstance(t, bool) or not 1 <= t <= 4:
-            return False, "threads must be an integer 1-4"
+        if not isinstance(t, int) or isinstance(t, bool) or not 1 <= t <= 8:
+            return False, "threads must be an integer 1-8"
         cur = {}
         if CFG_FILE.exists():
             try:

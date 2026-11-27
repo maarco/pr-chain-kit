@@ -73,7 +73,7 @@ tr.hit td{background:var(--raise)}
 
 <h2>Loop Setup <span>saved to board-config.json and the NO-BUILD file; the loop reads them every lap</span></h2>
 <div class="card"><div class="setup">
- <label>Threads (1-4)<input type="number" id="threads" min="1" max="4"></label>
+ <label>Threads (1-8)<input type="number" id="threads" min="1" max="8"></label>
  <label>Build issues when no PR is free<select id="build"><option value="1">On</option><option value="0">Off</option></select></label>
  <div class="act"><a class="go" id="savesetup">Save</a><span class="msg" id="setupmsg"></span></div>
 </div></div>
@@ -170,7 +170,7 @@ function lims(){if(!F)return;const r=Object.entries(F.limits).map(([k,v])=>[k,v.
 function ends(){if(!F){$('ends').innerHTML='<tr><td class="n">flow.json is not readable</td></tr>';return}
  $('ends').innerHTML=Object.entries(F.end_states).filter(([k,v])=>!v.unused).map(([k,v])=>`<tr id="e-${esc(k)}" data-row="${esc(k)}"><td class="k">${esc(k)}</td><td class="w">${esc(v.means)}${v.label?` <span class="f">label ${esc(v.label)}</span>`:''}</td><td class="n">${esc(v.then)}</td></tr>`).join('')}
 function setup(){$('threads').value=D.threads;$('build').value=D.build_issues?'1':'0'}
-$('savesetup').onclick=()=>{const t=+$('threads').value;if(!(t>=1&&t<=4)){$('setupmsg').className='msg bad';$('setupmsg').textContent='threads must be 1-4';return}
+$('savesetup').onclick=()=>{const t=+$('threads').value;if(!(t>=1&&t<=8)){$('setupmsg').className='msg bad';$('setupmsg').textContent='threads must be 1-8';return}
  post({threads:t,build_issues:$('build').value==='1'},$('setupmsg'))};
 $('flow').onclick=e=>{const n=e.target.closest('[data-s]');if(n){cur=n.dataset.s;tab=0;flow();detail();return}
  const a=e.target.closest('[data-e]');if(a){const r=document.querySelector(`tr[data-row="${CSS.escape(a.dataset.e)}"]`);document.querySelectorAll('tr.hit').forEach(x=>x.classList.remove('hit'));r.classList.add('hit');r.scrollIntoView({block:'center',behavior:'smooth'})}};

@@ -11,7 +11,7 @@ scout-skipped RESULT) starts no new one for IDLE seconds; PR launches are never 
 No free PR and no free slot: sleep 10
 minutes (30 s when chains are still out). A PR is tried at most twice per 6 hours (guards a retry loop).
 
-Threads: the board-config.json in the work folder ({"threads": 1..4}), editable on the board /config page.
+Threads: the board-config.json in the work folder ({"threads": 1..8}), editable on the board /config page.
 Read fresh every lap; the count may go up and down live. Fewer threads never kills a running chain: extra
 chains finish and are not replaced. Every live pr-chain process counts against the threads, including
 chains an earlier loop or a person started.
@@ -54,7 +54,7 @@ def say(msg):
 def threads():
     """Max concurrent chains, from the board config; 1 when the file is missing or bad."""
     try:
-        return max(1, min(4, int(json.loads(CFG.read_text())["threads"])))
+        return max(1, min(8, int(json.loads(CFG.read_text())["threads"])))
     except Exception:
         return 1
 

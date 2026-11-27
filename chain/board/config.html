@@ -88,7 +88,7 @@ input::placeholder,textarea::placeholder{color:var(--faint)}
   <div class="stats">
    <div class="stat"><b id="now">–</b><span id="nowl">chains running</span></div>
    <div class="stat"><b id="agents">–</b><span id="agentsl">agent processes</span></div>
-   <div class="stat"><input id="threads" type="number" min="1" max="4" step="1"><span>max threads · now <b id="cur" style="font:inherit;color:var(--mid)">–</b> · PRs at once <b id="pao" style="font:inherit;color:var(--mid)">–</b> (flow.json; threads above it run nothing while a focus PR is in flight)</span></div>
+   <div class="stat"><input id="threads" type="number" min="1" max="8" step="1"><span>max threads · now <b id="cur" style="font:inherit;color:var(--mid)">–</b> · PRs at once <b id="pao" style="font:inherit;color:var(--mid)">–</b> (flow.json; threads above it run nothing while a focus PR is in flight)</span></div>
    <div class="act" style="margin-bottom:3px"><a id="saveth" class="go">Set Threads</a><span class="msg" id="thmsg"></span></div>
   </div>
   <div class="proc" id="loopcmd"></div>
