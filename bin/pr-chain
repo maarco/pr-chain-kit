@@ -2662,9 +2662,16 @@ def human_gate(pr, head, ui_vp, a):
     term = " Terminal screens (term-*) come from the PR's own tmux specs." if any(p.name.startswith("term-") for p in pngs) else ""
     # An approval label from before this gate approved an older head and would never count (human_signal reads only
     # labels added after gate_at), yet it makes the PR look approved. Drop it and say so (#1184, 11-26).
+    # A label that still approves this head (added after the last gate, head unchanged or moved only by merging main) is a
+    # live approval and stays: a same-head retry can reach this gate (review of kit #22). A read failure raises here, before
+    # anything is posted.
     stale = HUMAN_LABEL in {lb["name"] for lb in gh_json("pr", "view", str(pr), "-R", REPO, "--json", "labels")["labels"]}
+    prev = json.loads(state_path(pr).read_text()) if state_path(pr).exists() else {}
+    if stale and prev.get("gate_at") and prev.get("gate_head"):
+        if head == prev["gate_head"] or main_only_move(prev["gate_head"], head):
+            stale = human_signal(pr, prev)[0] != "approved"
     if stale:
-        sh("gh", "pr", "edit", str(pr), "-R", REPO, "--remove-label", HUMAN_LABEL)
+        sh("gh", "pr", "edit", str(pr), "-R", REPO, "--remove-label", HUMAN_LABEL, check=True)
         term += (f" The earlier `{HUMAN_LABEL}` label was removed: it approved an older head, and this one changed since."
                  f" Add it again to approve these screens.")
     lead = f"The UI review passed at {head[:12]}. Screenshots of the changed screens (desktop, 820 and 390 wide, dark and light):{term}"
