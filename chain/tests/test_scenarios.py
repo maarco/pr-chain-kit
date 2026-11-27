@@ -548,14 +548,15 @@ for had in (True, False):
     else:
         check("gate: no label, nothing removed", order, ["comment"])
         check("gate: no label, no removal note", "was removed" in body, False)
-# review of kit #22: a label that still approves this head (same head, or moved only by merging main) is kept; one that
-# approved a head with real changes since is dropped; a removal that fails posts nothing
+# review of kit #22: a label that still approves this head (same head, or moved only by merging main) is a live approval:
+# no new gate comment (it would reset gate_at and the label would stop counting), no removal, gate_at untouched, so
+# resume lands it. One that approved a head with real changes since is dropped; a removal that fails posts nothing
 real.gh_json = lambda *a, **k: {"labels": [{"name": real.HUMAN_LABEL}]}
 real.state_path(9).parent.mkdir(parents=True, exist_ok=True)
 saved = (real.main_only_move, real.fetch, real.human_signal)
 for name, gh, move, signal, want in (
-        ("same head, approved after the last gate: label kept", "h" * 40, None, "approved", ["comment"]),
-        ("main-only move, approved: label kept", "m" * 40, True, "approved", ["comment"]),
+        ("same head, approved after the last gate: no new gate, label kept", "h" * 40, None, "approved", []),
+        ("main-only move, approved: no new gate, label kept", "m" * 40, True, "approved", []),
         ("real changes since the approved head: label removed", "n" * 40, False, "approved", ["remove", "comment"]),
         ("same head, label from before the last gate: label removed", "h" * 40, None, None, ["remove", "comment"])):
     lab.clear()
@@ -563,9 +564,15 @@ for name, gh, move, signal, want in (
     real.main_only_move = lambda old, new, m=move: bool(m)
     real.fetch = lambda info: None
     real.human_signal = lambda pr, st, s=signal: (s, "t") if s else (None, None)
-    real.human_gate(9, gh, gate_dir / "ui-verdict.md", None)
+    states = []
+    real.set_state = lambda pr, **k: states.append(k)
+    got = real.human_gate(9, gh, gate_dir / "ui-verdict.md", None)
     check("gate: " + name, [("remove" if "--remove-label" in c else "comment") for c in lab
                             if "--remove-label" in c or c[:3] == ("gh", "pr", "comment")], want)
+    if not want:
+        check("gate: " + name + ": gate_at is not replaced and it waits for resume",
+              (got, [k for k in states if "gate_at" in k]), ("AWAIT-HUMAN", []))
+    real.set_state = lambda pr, **k: None
 real.state_path(9).unlink()
 real.main_only_move, real.fetch, real.human_signal = saved
 def fail_remove(*c, **k):
