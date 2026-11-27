@@ -27,6 +27,7 @@ main{max-width:1360px;margin:0 auto;padding:12px 20px 0;height:100%;display:flex
 .row .t{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--mid)}.row.sel .t,.row:hover .t{color:var(--fg)}
 .row .a{font:10.5px var(--mono);color:var(--faint);white-space:nowrap}
 .row .s{grid-column:2/4;font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.row .blocker{grid-column:2/4;min-width:0;color:var(--mid);font-size:11px;line-height:1.4;overflow-wrap:anywhere}.row .blocker b{color:var(--warn);font-weight:600}
 .ok{color:var(--hi)}.bad{color:var(--bad)}.warn{color:var(--warn)}.dim{color:var(--muted)}.f{color:var(--faint)}
 .mono{font-family:var(--mono);font-size:11px}
 h1{font-size:16px;font-weight:900;letter-spacing:-.01em;margin:0;line-height:1.35}h1 .num{font:500 12px var(--mono);color:var(--hi);margin-right:8px}
@@ -120,24 +121,27 @@ function blocks(s){const out=[];let para=[],list=null;
   para.push(l)});fp();fl();return out.join('')}
 const vcls=v=>/PASS|APPROVED|^READY|SUCCESS|MERGED|CLEAN/.test(v)?'ok':/FAIL|CHANGES|NOT READY|ERROR|DIRTY|CONFLICT/.test(v)?'bad':/HUMAN|BEHIND|BLOCKED|TIMEOUT|UNSTABLE|REVIEW_REQUIRED|DRAFT/.test(v)?'warn':'dim';
 function ck(p){return p.fail?`<span class="bad">${p.fail} failing</span>`:p.wait?`<span class="warn">${p.wait} running</span>`:p.ok?`<span class="ok">checks pass</span>`:'no checks'}
-function listHtml(){const q=$('q').value.trim().toLowerCase(),rows=prs.filter(p=>(!q||('#'+p.n+' '+p.title+' '+p.branch+' '+p.author+' '+p.chain).toLowerCase().includes(q))&&(!P.flt.human||/human/i.test(p.chain||''))&&(!P.flt.fail||p.fail)&&(!P.flt.ui||p.ui));
+const attention=/^(AWAIT-HUMAN|NEEDS-PERSON|STUCK|POLICY-HOLD|HOLD-UI|LAND-STOPPED|CI-TIMEOUT|ERROR|MAIN-MOVING|UI-FAILED)$/;
+const blockerLabel=s=>({'AWAIT-HUMAN':'Human Review','NEEDS-PERSON':'Needs Person','STUCK':'Stuck','POLICY-HOLD':'Policy Hold','HOLD-UI':'UI Review','LAND-STOPPED':'Merge Stopped','CI-TIMEOUT':'CI Timeout','ERROR':'Chain Error','MAIN-MOVING':'Main Moving','UI-FAILED':'UI Review Failed'}[s]||s);
+function listHtml(){const q=$('q').value.trim().toLowerCase(),rows=prs.filter(p=>(!q||('#'+p.n+' '+p.title+' '+p.branch+' '+p.author+' '+p.chain+' '+p.chain_why).toLowerCase().includes(q))&&(!P.flt.human||attention.test(p.chain||''))&&(!P.flt.fail||p.fail)&&(!P.flt.ui||p.ui));
  if(P.sort==='number')rows.sort((a,b)=>b.n-a.n);else if(P.sort==='size')rows.sort((a,b)=>b.add+b.rem-a.add-a.rem);
  $('tools').innerHTML=`<a data-sort title="Click To Change The Order">Sort: ${{updated:'Updated',number:'Number',size:'Size'}[P.sort]}</a>${[['human','Needs Human'],['fail','Failing'],['ui','UI']].map(([k,l])=>`<a data-f="${k}"${P.flt[k]?' class="on"':''}>${l}</a>`).join('')}<span class="cnt">${rows.length===prs.length?'':rows.length+' of '+prs.length}</span>`;
  $('list').innerHTML=rows.length?rows.map(p=>`<div class="row${p.n===sel?' sel':''}" data-n="${p.n}"><span class="n">#${p.n}</span><span class="t">${esc(p.title)}</span><span class="a${seen[p.n]&&p.at>seen[p.n]&&p.n!==sel?' new" title="Changed Since You Last Opened It':''}">${ago(p.at)}</span>
-  <span class="s">${ck(p)} · ${p.draft?'draft · ':''}${p.merge&&p.state==='OPEN'?`<span class="${vcls(p.merge)}">${low(p.merge)}</span> · `:''}+${p.add} −${p.rem}${p.ui?' · UI':''}${p.tok?' · '+tk(p.tok)+' tokens'+us(p.usd):''}${p.chain?` · chain <span class="${vcls(p.chain)}">${low(p.chain)}</span>`:''}</span></div>`).join('')
+  <span class="s">${ck(p)} · ${p.draft?'draft · ':''}${p.merge&&p.state==='OPEN'?`<span class="${vcls(p.merge)}">${low(p.merge)}</span> · `:''}+${p.add} −${p.rem}${p.ui?' · UI':''}${p.tok?' · '+tk(p.tok)+' tokens'+us(p.usd):''}${p.chain?` · chain <span class="${vcls(p.chain)}">${low(p.chain)}</span>`:''}</span>${p.state==='OPEN'&&attention.test(p.chain||'')?`<span class="blocker"><b>${esc(blockerLabel(p.chain))}${p.chain_head&&p.head&&p.chain_head!==p.head?' (Earlier Head)':''}</b>${p.chain_why?' · '+esc(p.chain_why):' · No reason recorded'}</span>`:''}</div>`).join('')
   :`<div class="empty">${prs.length?'No pull request matches the filter.':'Loading pull requests from GitHub…'}</div>`;
  document.querySelectorAll('#sw a').forEach(a=>a.classList.toggle('on',a.dataset.s===which))}
 async function loadList(fresh){try{const r=await (await fetch('/api/prs?state='+which+(fresh?'&fresh=1':''))).json();
   if(r.error){$('meta').innerHTML='<span class="warn">'+esc(r.error)+'</span>';return}
   if(r.state!==which)return;prs=r.prs;markSeen();$('meta').textContent=`${prs.length} ${which} · GitHub read ${r.age<5?'just now':r.age+' s ago'}`;listHtml()}
  catch(e){$('meta').innerHTML='<span class="bad">Board server not answering</span>'}}
-function attn(d){const ch=d.chain;if(!ch||d.state!=='OPEN'||!/^(AWAIT-HUMAN|NEEDS-PERSON|STUCK|HOLD-UI|LAND-STOPPED|CI-TIMEOUT|ERROR|MAIN-MOVING|UI-FAILED)$/.test(ch.status||''))return'';
+function attn(d){const ch=d.chain;if(!ch||d.state!=='OPEN'||!attention.test(ch.status||''))return'';
  const n=d.n,why=String(ch.why||''),c=d.checks,h8=String(ch.head||'').slice(0,8),cp=x=>`<code>${esc(x)}</code> <a data-copy="${esc(x)}">Copy</a>`,gh=(t,u)=>`<a href="${esc(u)}" target="_blank" rel="noopener">${t}</a>`;
  const again=`Run the chain again: ${cp('pr-chain run '+n+' --land')}`,land=`Land it: ${cp('pr-chain land '+n+' --land')}`,verdict='<a data-attn="v">Open The Latest Verdict</a>';
  const when=`stopped ${since(ch.updated)} at ${h8}, round ${ch.round??0}`;
- if(ch.head&&ch.head!==d.head&&ch.status!=='NEEDS-PERSON')return`<div class="at"><div class="ah"><span class="dim">Nothing To Do Yet</span><span class="f">${when}</span></div><div>A new push arrived after this stop (the head is now ${d.head.slice(0,8)}). The loop runs this pull request again on its own within about 10 minutes.</div></div>`;
+ if(ch.head&&ch.head!==d.head&&ch.status!=='NEEDS-PERSON')return`<div class="at"><div class="ah"><span class="warn">${esc(blockerLabel(ch.status))} · Earlier Head</span><span class="f">${when}</span></div><div>The current head is ${esc(d.head.slice(0,8))}; this stop belongs to an earlier head.</div>${why?`<div class="why">${esc(why.trim())}</div>`:''}</div>`;
  let what='',steps=[];
- if(ch.status==='AWAIT-HUMAN'){what='The UI review passed. The chain posted screenshots of the changed screens and waits for your look before it merges.';
+ if(ch.status==='POLICY-HOLD'){what='The chain stopped on a recorded policy hold.';steps=['Review the recorded reason and the latest verdict before deciding how to proceed.']}
+ else if(ch.status==='AWAIT-HUMAN'){what='The UI review passed. The chain posted screenshots of the changed screens and waits for your look before it merges.';
   steps=[`Look at the screenshots: <a data-attn="g">Show Them Here</a> or ${gh('Open Them On GitHub',d.url+(ch.gate_comment?'#issuecomment-'+ch.gate_comment:''))}.`,
    `They look right: ${gh('on GitHub',d.url)}, add the label ${cp('human-approved')}. The loop then waits for CI and merges on its next lap.`,
    `They look wrong: leave a comment on the pull request saying what to change. The fixer takes the comment on the next lap and the reviews start over.`]}
@@ -163,7 +167,7 @@ function attn(d){const ch=d.chain;if(!ch||d.state!=='OPEN'||!/^(AWAIT-HUMAN|NEED
   else if(/fixer/.test(why))steps=[verdict+' and the stop reason below: the fixer gave up.','Fix it by hand on <code>'+esc(d.branch)+'</code> and push (the loop runs the new head on its own).',`Or try once more: ${cp('pr-chain run '+n+' --land')}`];
   else steps=[verdict+'.',again]}
  const also=[];if(ch.status!=='LAND-STOPPED'&&!d.issues.length)also.push('the description links no issue, and landing refuses that');if(d.mergeable==='CONFLICTING'&&!/conflict/.test(why))also.push('the branch conflicts with main');if(c.fail&&ch.status!=='CI-TIMEOUT')also.push(c.fail+' checks are failing');
- return`<div class="at"><div class="ah"><span class="warn">Needs Your Attention</span><span class="f">${when}</span></div><div>${what}</div><ol>${steps.map(s=>'<li>'+s+'</li>').join('')}</ol>${also.length?`<div class="dim">Also in the way: ${also.join('; ')}.</div>`:''}${why?`<div class="f why">Stop reason: ${esc(why.trim())}</div>`:''}</div>`}
+ return`<div class="at"><div class="ah"><span class="warn">${esc(blockerLabel(ch.status))}</span><span class="f">${when}</span></div>${why?`<div class="why">${esc(why.trim())}</div>`:'<div>No reason recorded.</div>'}<div>${what}</div><ol>${steps.map(s=>'<li>'+s+'</li>').join('')}</ol>${also.length?`<div class="dim">Also in the way: ${also.join('; ')}.</div>`:''}</div>`}
 function kv(k,v){return v?`<div><dt>${k}</dt><dd>${v}</dd></div>`:''}
 function detHtml(){const d=det;if(!d||d.error)$('dh').innerHTML='';if(!d){$('det').innerHTML=`<div class="empty">${sel?'Loading #'+sel+' from GitHub…':'Select a pull request to see its properties and conversation.'}</div>`;return}
  if(d.error){$('det').innerHTML=`<div class="empty"><a class="link" id="back">Back To List</a> <span class="warn">${esc(d.error)}</span></div>`;return}

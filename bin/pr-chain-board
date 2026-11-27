@@ -1248,7 +1248,7 @@ ILIST_FIELDS = "number,title,author,labels,state,stateReason,assignees,updatedAt
 IVIEW_FIELDS = ILIST_FIELDS + ",body,comments,milestone,url"
 GH = config.gh_bin()  # [tools] gh, else gh on PATH, else the old fixed paths
 gh_cache = {}
-LIST_FIELDS = "number,title,author,headRefName,isDraft,state,mergeStateStatus,reviewDecision,labels,updatedAt,additions,deletions,changedFiles,statusCheckRollup,mergedAt,closedAt"
+LIST_FIELDS = "number,title,author,headRefName,headRefOid,isDraft,state,mergeStateStatus,reviewDecision,labels,updatedAt,additions,deletions,changedFiles,statusCheckRollup,mergedAt,closedAt"
 VIEW_FIELDS = ("number,title,body,author,state,isDraft,headRefName,baseRefName,headRefOid,mergeable,mergeStateStatus,reviewDecision,labels,additions,"
                "deletions,changedFiles,files,commits,comments,reviews,statusCheckRollup,closingIssuesReferences,url,createdAt,updatedAt,mergedAt,closedAt")
 HTMLC = re.compile(r"<!--.*?-->", re.S)
@@ -1384,7 +1384,7 @@ def pr_list(which, fresh=False):
                         state=r["state"], merge=r.get("mergeStateStatus") or "", review=r.get("reviewDecision") or "",
                         labels=[x["name"] for x in r.get("labels") or []], at=r.get("mergedAt") or r.get("closedAt") or r["updatedAt"],
                         add=r["additions"], rem=r["deletions"], files=r["changedFiles"], ok=c["ok"], fail=c["fail"], wait=c["wait"],
-                        chain=st.get("status", ""), ui=pick.get(n, {}).get("ui"), owner=pick.get(n, {}).get("owner", ""), tok=ptok.get(n, 0),
+                        chain=st.get("status", ""), chain_why=st.get("why", ""), chain_head=st.get("head", ""), head=r.get("headRefOid", ""), ui=pick.get(n, {}).get("ui"), owner=pick.get(n, {}).get("owner", ""), tok=ptok.get(n, 0),
                         usd=usd_maps()[0].get(n, 0)))
     out.sort(key=lambda x: x["at"], reverse=True)
     return dict(state=which, prs=out, age=int(time.time() - gh_cache["list:" + which][0]))
