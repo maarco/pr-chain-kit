@@ -2673,8 +2673,8 @@ def human_gate(pr, head, ui_vp, a):
     term = " Terminal screens (term-*) come from the PR's own tmux specs." if any(p.name.startswith("term-") for p in pngs) else ""
     if stale:
         sh("gh", "pr", "edit", str(pr), "-R", REPO, "--remove-label", HUMAN_LABEL, check=True)
-        term += (f" The earlier `{HUMAN_LABEL}` label was removed: it approved an older head, and this one changed since."
-                 f" Add it again to approve these screens.")
+        term += (f" The earlier `{HUMAN_LABEL}` label was removed: it was added before these screens, so it does not"
+                 f" approve them. Add it again to approve these screens.")
     lead = f"The UI review passed at {head[:12]}. Screenshots of the changed screens (desktop, 820 and 390 wide, dark and light):{term}"
     body = (f"{MARK}human-gate head={head} -->\n{lead}\n\n{imgs}\n\n{scrub(summary)}\n\n"
             f"To approve, add the `{HUMAN_LABEL}` label. To ask for changes, comment here; a fixer picks the comment up on the next "
