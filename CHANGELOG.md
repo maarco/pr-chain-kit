@@ -7,6 +7,9 @@ change to `pr-chain.toml`, the `pr-chain` command or the work-folder layout bump
 ## [Unreleased]
 
 ### Added
+- `pr-chain report` (read-only): end state per PR, review rounds and minutes per merged PR, rests and their causes,
+  script errors by cause, and reverts and fix follow-ups on main. The cause buckets and the follow-up match are heuristics,
+  marked as such in the output. `--json`, `--since DAYS`, `--no-git`, `--main BRANCH`. Code in `chain/report.py`.
 - `[tools] gh` names the gh binary; unset, the first gh on PATH is used, then the old fixed paths. One resolver
   (`config.gh_bin()`) serves the board, `pr-chain`, the agent-kit and the janitor.
 - `[agent] env_allowlist` (opt-in) limits a stage agent's environment to the listed names plus `[agent] env`, and drops any

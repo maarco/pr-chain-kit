@@ -11,6 +11,8 @@ Usage:
   pr-chain land <pr> [options]               skip review/fix: gate + land the PR at its current head
   pr-chain models                            effective model per role (review/fix/gate/ui/build/scout) and its source
   pr-chain status                            one line per PR the chain has touched
+  pr-chain report [--json] [--since DAYS] [--no-git] [--main BRANCH]
+                                             read-only effectiveness report: end states, review rounds, minutes, rests, reverts (chain/report.py)
   pr-chain stop                              ask a running chain to stop after its current stage
   pr-chain clean <pr>                        remove the PR's leftover worktrees (never --force)
 
@@ -3042,6 +3044,11 @@ def main():
         if name in ("auto", "resume"):
             s.add_argument("--count", type=int, default=1, help="how many PRs to take, one after another")
     sub.add_parser("status")
+    rp = sub.add_parser("report", help="read-only: end states, review rounds, minutes, rests, reverts and fix follow-ups")
+    rp.add_argument("--json", action="store_true", help="machine-readable output")
+    rp.add_argument("--since", type=int, metavar="DAYS", default=None, help="only ledger rows from the last DAYS days")
+    rp.add_argument("--no-git", action="store_true", help="skip reading main's history (no revert / fix follow-up figures)")
+    rp.add_argument("--main", default="main", metavar="BRANCH", help="branch whose first-parent history is read (default main)")
     sub.add_parser("doctor", help="stale state, stray labels, loop down, who needs the maintainer; writes doctor.json")
     sub.add_parser("stop")
     cl = sub.add_parser("clean")
@@ -3061,6 +3068,9 @@ def main():
         cmd_pick(a)
     elif a.cmd == "status":
         cmd_status(a)
+    elif a.cmd == "report":
+        import report  # noqa: E402 - chain/ is on sys.path; read-only, so no lock and no config backup
+        raise SystemExit(report.run(WORK, as_json=a.json, since_days=a.since, checkout=CHECKOUT, branch=a.main, use_git=not a.no_git))
     elif a.cmd == "stop":
         STOPFILE.write_text(f"stop requested {now()}\n")
         print("STOP file written; the chain stops after its current stage. Remove it with: rm", STOPFILE)
