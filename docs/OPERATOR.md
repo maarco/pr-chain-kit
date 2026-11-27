@@ -43,7 +43,9 @@ a clone use `python3 -B bin/pr-chain ...`. Every project-specific value lives in
    the screenshots are posted on the PR and it waits for a person (`AWAIT-HUMAN`).
 6. Required CI, then merge (approve as the non-author account from `[accounts] approver_of`, merge
    commit). A person's approval (the `[labels] human_approved` label after the gate comment) stands for
-   the gate head and any base-only move of it on every later run. Checks still running: the PR ends
+   the gate head and any base-only move of it on every later run. A push that changes no UI file (`[ui]
+   paths_regex`) keeps it too: the run still reviews, audits and shoots the new head, then the gate moves
+   to that head without asking again and says so on the PR. Checks still running: the PR ends
    `WAITING-CI`, its slot is freed, and `resume` lands it once CI is green.
 
 ## What each agent is told
