@@ -557,7 +557,7 @@ for had in (True, False):
 real.gh_json = lambda *a, **k: {"labels": [{"name": real.HUMAN_LABEL}]}
 real.state_path(9).parent.mkdir(parents=True, exist_ok=True)
 saved = (real.main_only_move, real.fetch, real.human_signal, real.carried_pass)
-real.carried_pass = lambda pr, cur, review=False: None if cur.startswith("u") else cur  # "u..." heads were never audited
+real.carried_pass = lambda pr, cur, review=False: None if cur.startswith("u") else "o" * 40 if cur.startswith("w") else cur  # "u...": never audited; "w...": only an older head was
 # Marco 11-26: the approval is of the screens, so a push that changes no UI file (UI_RE) keeps it: the gate points at the
 # new head (gate_at kept, so the label still counts), says so on the PR, and resume lands it. A UI file changed, or a diff
 # git cannot compute: the label is dropped and the new screens are posted.
@@ -570,6 +570,8 @@ for name, gh, move, signal, want, diff in (
         ("real changes, no UI file: approval stands, note posted", "n" * 40, False, "approved", ["comment"], (0, "bin/x.py\0tests/t.py\0")),
         # review of kit #23: a --no-gate run reaches the gate with no audit of the new head: nothing may carry the approval to it
         ("real changes, no UI file, no audit PASS at the new head: label removed", "u" * 40, False, "approved", ["remove", "comment"], (0, "bin/x.py\0")),
+        # round 2: an audit of an OLDER head (main merged since, no addendum) does not cover this one
+        ("real changes, no UI file, audit PASS only of an older head: label removed", "w" * 40, False, "approved", ["remove", "comment"], (0, "bin/x.py\0")),
         ("same head, label from before the last gate: label removed", "h" * 40, None, None, ["remove", "comment"], (0, ""))):
     lab.clear(); gate_diff = diff
     real.state_path(9).write_text(json.dumps(dict(gate_head="h" * 40, gate_at="2026-11-25T00:00:00Z")))
@@ -609,6 +611,13 @@ check("ui_unchanged: a non-UI change keeps the screens", real.ui_unchanged(c0, c
 check("ui_unchanged: a rename out of a UI path is a UI change", real.ui_unchanged(c1, c2), False)
 check("ui_unchanged: a non-ASCII UI path is a UI change", real.ui_unchanged(c2, c3), False)
 check("ui_unchanged: an unknown commit counts as changed", real.ui_unchanged(c0, "f" * 40), False)
+def _hang(*c, **k):
+    raise RuntimeError("git diff: timed out after 300 s")
+real.sh = _hang
+try:
+    check("ui_unchanged: a git diff that times out counts as changed", real.ui_unchanged(c0, c1), False)
+except RuntimeError:
+    check("ui_unchanged: a git diff that times out counts as changed", "raised", False)
 real.CHECKOUT, real.UI_RE, real.sh = _ck, _ure, _rsh
 def fail_remove(*c, **k):
     lab.append(c)
