@@ -2660,6 +2660,13 @@ def human_gate(pr, head, ui_vp, a):
     imgs = "\n".join(f"<img src=\"{base}/{p.name}?raw=true\" width=\"320\" alt=\"{p.stem}\">" for p in pngs)
     summary = ui_vp.read_text().split("Summary:", 1)[-1].strip()[:1200] if "Summary:" in ui_vp.read_text() else ""
     term = " Terminal screens (term-*) come from the PR's own tmux specs." if any(p.name.startswith("term-") for p in pngs) else ""
+    # An approval label from before this gate approved an older head and would never count (human_signal reads only
+    # labels added after gate_at), yet it makes the PR look approved. Drop it and say so (#1184, 11-26).
+    stale = HUMAN_LABEL in {lb["name"] for lb in gh_json("pr", "view", str(pr), "-R", REPO, "--json", "labels")["labels"]}
+    if stale:
+        sh("gh", "pr", "edit", str(pr), "-R", REPO, "--remove-label", HUMAN_LABEL)
+        term += (f" The earlier `{HUMAN_LABEL}` label was removed: it approved an older head, and this one changed since."
+                 f" Add it again to approve these screens.")
     lead = f"The UI review passed at {head[:12]}. Screenshots of the changed screens (desktop, 820 and 390 wide, dark and light):{term}"
     body = (f"{MARK}human-gate head={head} -->\n{lead}\n\n{imgs}\n\n{scrub(summary)}\n\n"
             f"To approve, add the `{HUMAN_LABEL}` label. To ask for changes, comment here; a fixer picks the comment up on the next "

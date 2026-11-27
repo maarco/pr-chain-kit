@@ -29,6 +29,8 @@ change to `pr-chain.toml`, the `pr-chain` command or the work-folder layout bump
 - The PR picker parks a PR stacked on a branch other than the default branch instead of picking it every lap.
 
 ### Fixed
+- A new human gate removes an older `human-approved` label and says so in its comment. The gate only counts a label
+  added after it, so an old one never approved the new head but made the PR look approved.
 - `pr-chain-loop` with no repo set (or only the template `owner/name`) exits 0 with a message naming the repo setting; it used
   to treat the template as a real repo and keep calling `gh`.
 - `[ui] enabled = false` turns UI review off; it was read and then ignored, so every .tsx change still went to UI review.
