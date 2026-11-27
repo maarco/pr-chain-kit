@@ -1692,7 +1692,10 @@ def ui_unchanged(old, new):
     """True when git can list the files old..new changed and none is a UI file (UI_RE): the screens shot at `old` still
     show `new`. A diff git cannot compute counts as changed."""
     # --no-renames lists both ends of a rename; -z gives raw paths (plain output quotes non-ASCII ones) (review of kit #23)
-    dm = sh("git", "-C", str(CHECKOUT), "diff", "--name-only", "--no-renames", "-z", old, new)
+    try:
+        dm = sh("git", "-C", str(CHECKOUT), "diff", "--name-only", "--no-renames", "-z", old, new)
+    except RuntimeError:  # timed out: unknown, so changed
+        return False
     return dm.returncode == 0 and not any(UI_RE.search(f) for f in dm.stdout.split("\0") if f)
 
 
@@ -2675,7 +2678,7 @@ def human_gate(pr, head, ui_vp, a):
     same = stale and bool(prev.get("gate_at") and old) and (head == old or main_only_move(old, head))
     # an audit PASS must cover the new head: a --no-gate run reaches this gate with none (review of kit #23)
     ui_same = stale and bool(prev.get("gate_at") and old) and not same and ui_unchanged(old, head) \
-        and carried_pass(pr, head) is not None
+        and carried_pass(pr, head) == head  # this exact head: an older head's audit misses a main merge no addendum judged
     if (same or ui_same) and human_signal(pr, prev)[0] == "approved":
         if ui_same:
             sh("gh", "pr", "comment", str(pr), "-R", REPO, "--body",
