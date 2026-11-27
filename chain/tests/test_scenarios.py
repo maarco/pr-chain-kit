@@ -530,8 +530,11 @@ check("die AWAIT-HUMAN: the label is left alone", [c for c in lab if "--remove-l
 gate_dir = tmp / "gate9" / "r1-ui"; (gate_dir / "shots").mkdir(parents=True); (gate_dir / "shots" / "a.png").write_bytes(b"png")
 (gate_dir / "ui-verdict.md").write_text("PASS\nSummary: fine")
 real.push_shots = lambda pr, head, shots: ("c0", "shots/9")
+gate_diff = (0, "")  # (returncode, stdout) of `git diff --name-only` between the approved head and this one
 def gate_sh(*c, **k):
     lab.append(c)
+    if "diff" in c and c[0] == "git":
+        return types.SimpleNamespace(returncode=gate_diff[0], stdout=gate_diff[1], stderr="")
     out = "https://github.com/o/r/pull/9#issuecomment-123" if c[:3] == ("gh", "pr", "comment") else \
           "2026-11-26T00:00:00Z" if c[:2] == ("gh", "api") else real.HUMAN_LABEL if c[:3] == ("gh", "label", "list") else ""
     return types.SimpleNamespace(returncode=0, stdout=out, stderr="")
@@ -554,12 +557,18 @@ for had in (True, False):
 real.gh_json = lambda *a, **k: {"labels": [{"name": real.HUMAN_LABEL}]}
 real.state_path(9).parent.mkdir(parents=True, exist_ok=True)
 saved = (real.main_only_move, real.fetch, real.human_signal)
-for name, gh, move, signal, want in (
-        ("same head, approved after the last gate: no new gate, label kept", "h" * 40, None, "approved", []),
-        ("main-only move, approved: no new gate, label kept", "m" * 40, True, "approved", []),
-        ("real changes since the approved head: label removed", "n" * 40, False, "approved", ["remove", "comment"]),
-        ("same head, label from before the last gate: label removed", "h" * 40, None, None, ["remove", "comment"])):
-    lab.clear()
+# Marco 11-26: the approval is of the screens, so a push that changes no UI file (UI_RE) keeps it: the gate points at the
+# new head (gate_at kept, so the label still counts), says so on the PR, and resume lands it. A UI file changed, or a diff
+# git cannot compute: the label is dropped and the new screens are posted.
+ui_file = "packages/kollabor-webui/frontend/src/App.tsx"
+for name, gh, move, signal, want, diff in (
+        ("same head, approved after the last gate: no new gate, label kept", "h" * 40, None, "approved", [], (0, "")),
+        ("main-only move, approved: no new gate, label kept", "m" * 40, True, "approved", [], (0, "")),
+        ("real changes to a UI file since the approved head: label removed", "n" * 40, False, "approved", ["remove", "comment"], (0, f"x.py\n{ui_file}\n")),
+        ("real changes, diff unreadable: label removed", "n" * 40, False, "approved", ["remove", "comment"], (128, "")),
+        ("real changes, no UI file: approval stands, note posted", "n" * 40, False, "approved", ["comment"], (0, "bin/x.py\ntests/t.py\n")),
+        ("same head, label from before the last gate: label removed", "h" * 40, None, None, ["remove", "comment"], (0, ""))):
+    lab.clear(); gate_diff = diff
     real.state_path(9).write_text(json.dumps(dict(gate_head="h" * 40, gate_at="2026-11-25T00:00:00Z")))
     real.main_only_move = lambda old, new, m=move: bool(m)
     real.fetch = lambda info: None
@@ -569,12 +578,18 @@ for name, gh, move, signal, want in (
     got = real.human_gate(9, gh, gate_dir / "ui-verdict.md", None)
     check("gate: " + name, [("remove" if "--remove-label" in c else "comment") for c in lab
                             if "--remove-label" in c or c[:3] == ("gh", "pr", "comment")], want)
-    if not want:
+    if want in ([], ["comment"]) and signal:
         check("gate: " + name + ": gate_at is not replaced and it waits for resume",
               (got, [k for k in states if "gate_at" in k]), ("AWAIT-HUMAN", []))
+    if want == ["comment"]:
+        body = next(c[c.index("--body") + 1] for c in lab if c[:3] == ("gh", "pr", "comment"))
+        check("gate: " + name + ": the gate moves to the new head", [k["gate_head"] for k in states if "gate_head" in k], [gh])
+        check("gate: " + name + ": the note is the chain's own (never read as feedback) and names both heads",
+              (body.startswith(real.MARK), "h" * 8 in body, gh[:8] in body), (True, True, True))
     real.set_state = lambda pr, **k: None
 real.state_path(9).unlink()
 real.main_only_move, real.fetch, real.human_signal = saved
+gate_diff = (0, "")
 def fail_remove(*c, **k):
     lab.append(c)
     if "--remove-label" in c:  # like sh(): a failed command raises only under check=True
