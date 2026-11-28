@@ -655,7 +655,7 @@ check("resume: the landing retry skips review and uses the stopped head", calls,
 calls.clear(); put(970, status="LAND-STOPPED", head="h0", why=DOD, land_tries={"h0": pc.LAND_TRIES})
 check(f"resume: LAND-STOPPED is left alone after {pc.LAND_TRIES} refused merges", (pc.resume_all(a), calls), ([], []))
 put(970, status="LAND-STOPPED", head="h0", why=DOD); infos[970] = mk(st="MERGED")
-check("resume: LAND-STOPPED on a PR merged elsewhere becomes CLOSED", pc.resume_all(a), [(970, "CLOSED")])
+check("resume: LAND-STOPPED on a PR merged elsewhere becomes MERGED", pc.resume_all(a), [(970, "MERGED")])
 put(1015, status="AWAIT-HUMAN", head="h0", gate_head="h0", gate_at="t"); infos[1015] = mk(author="stranger")
 check("resume: an outside PR waiting at the human gate becomes NOT-OURS (replay #1015)", pc.resume_all(a), [(1015, "NOT-OURS")])
 check("resume: the outside PR is not polled again", (pc.resume_all(a), calls), ([], []))
