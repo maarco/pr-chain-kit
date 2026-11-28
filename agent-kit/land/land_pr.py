@@ -26,6 +26,8 @@ REQUIRED = set(kit.CHECKS)
 FIELDS = "state,isDraft,author,headRefOid,baseRefOid,mergeStateStatus,reviewDecision,statusCheckRollup,mergedBy,mergeCommit"
 LOG = kit.work("landings.jsonl")
 APPROVE_ONLY = "--approve-only" in sys.argv[6:]
+# --batch: the PR is a merge-flow batch; a required check that ended SKIPPED or NEUTRAL passes, as on GitHub
+PASSING = ("SUCCESS", "SKIPPED", "NEUTRAL") if "--batch" in sys.argv[6:] else ("SUCCESS",)
 number, head, approver, reviewed, reviewer = sys.argv[1:6]
 if reviewed != head:
     sys.exit(f"STOP: reviewed {reviewed[:8]} is not the head {head[:8]}; the review must pin the exact head")
@@ -64,7 +66,7 @@ if s["state"] != "OPEN" or s["headRefOid"] != head:
 if s["author"]["login"] == approver:
     sys.exit(f"STOP: {approver} wrote #{number} and cannot approve it")
 found = results(s)
-missing = {name: found.get(name) for name in REQUIRED if found.get(name) != "SUCCESS"}
+missing = {name: found.get(name) for name in REQUIRED if found.get(name) not in PASSING}
 if missing:
     sys.exit(f"STOP: required checks not green on {head[:8]}: {missing}")
 ci_runs = {c.get("name") or c.get("context"): c.get("detailsUrl") or c.get("targetUrl")
@@ -75,16 +77,28 @@ if s["mergeStateStatus"] in ("BEHIND", "DIRTY") and not APPROVE_ONLY:
 
 gh(approver, "api", "-X", "POST", f"repos/{REPO}/statuses/{head}", "-f", "state=success",
    "-f", "context=review/independent", "-f", "description=Independent review passed at this head")
-approved = APPROVE_ONLY and f"{approver} {head}" in gh(
+approved = f"{approver} {head}" in gh(  # one approval per account and commit, however often a land is retried
     approver, "api", "--paginate", f"repos/{REPO}/pulls/{number}/reviews",
     "--jq", '.[] | select(.state == "APPROVED") | "\\(.user.login) \\(.commit_id)"').splitlines()
-if not approved:
+if not approved and APPROVE_ONLY:  # pinned to the reviewed commit: a push in these seconds is not approved
+    gh(approver, "api", "-X", "POST", f"repos/{REPO}/pulls/{number}/reviews", "-f", f"commit_id={head}",
+       "-f", "event=APPROVE", "-f", f"body=Reviewed at {head}")
+elif not approved:
     gh(approver, "pr", "review", number, "-R", REPO, "--approve", "--body", f"Reviewed at {head}")
 print("already approved by" if approved else "approved as", approver)
+if APPROVE_ONLY and (now := state()["headRefOid"]) != head:  # the caller must not record this PR as approved at `head`
+    sys.exit(f"STOP: head moved to {now}")
 if s["isDraft"]:  # approve-only too: a live batch landed PRs that were ready and approved
     gh(kit.MERGER, "pr", "ready", number, "-R", REPO)
     print("marked ready")
+def record(**row):
+    with open(LOG, "a") as fh:
+        fh.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "pr": number, "head": head,
+                             "reviewed": reviewed, "reviewer": reviewer, "approver": approver, "ci": ci_runs, **row}) + "\n")
+
+
 if APPROVE_ONLY:
+    record(base=s.get("baseRefOid"), state=s["state"], approve_only=True)
     sys.exit(0)
 time.sleep(int(os.environ.get("LAND_PAUSE", "0")))  # gives the dry-run bot time to log its decision
 ready_at = time.time()
@@ -134,7 +148,4 @@ if s["state"] == "OPEN" and s["headRefOid"] == head:
 s = state()
 merge = (s.get("mergeCommit") or {}).get("oid")
 print(f"#{number} {s['state']} by {(s.get('mergedBy') or {}).get('login')} merge commit {merge}")
-with open(LOG, "a") as fh:
-    fh.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "pr": number, "head": head,
-                         "base": s.get("baseRefOid"), "reviewed": reviewed, "reviewer": reviewer, "approver": approver,
-                         "ci": ci_runs, "state": s["state"], "merge_commit": merge}) + "\n")
+record(base=s.get("baseRefOid"), state=s["state"], merge_commit=merge)
