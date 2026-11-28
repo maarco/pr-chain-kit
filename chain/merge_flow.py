@@ -340,10 +340,16 @@ def land_window(root: Path, remote: str, repo: str, branch: str, number: int, ch
         return 1
     note = f"Verified: exactly the approved heads of {', '.join(f'#{n}' for n in sorted(heads))} merged onto {branch}."
     _gh("pr", "review", str(number), "--repo", repo, "--approve", "--body", note)
-    _gh(
-        "pr", "merge", str(number), "--repo", repo, "--merge", "--match-head-commit", window
-    )  # GitHub refuses a moved head
+    refused = None
+    try:
+        _gh(
+            "pr", "merge", str(number), "--repo", repo, "--merge", "--match-head-commit", window
+        )  # GitHub refuses a moved head
+    except (subprocess.CalledProcessError, RuntimeError) as e:
+        refused = e
     state = json.loads(_gh("pr", "view", str(number), "--repo", repo, "--json", "state"))["state"]
+    if refused and state != "MERGED":  # an auto-merge bot can merge it on the approval, before the explicit merge
+        raise refused
     if state == "MERGED":
         print(f"landed #{number}: " + ", ".join(f"#{n}" for n in sorted(heads)))
         return 0
