@@ -107,10 +107,10 @@ class World:
         rollup = [dict(name=c, conclusion="" if p["checks"] == "PENDING" else p["checks"],
                        state="PENDING" if p["checks"] == "PENDING" else "",
                        detailsUrl=f"https://github.com/{REPO}/actions/runs/7{n}/job/1") for c in REQUIRED]
-        return dict(number=n, state=p["state"], title=f"pr {n}", body=f"Fixes #{n}00", isDraft=True, headRefName=p["branch"],
+        return dict(number=n, state=p["state"], title=f"pr {n}", body=f"Fixes #{n}00", isDraft=p.get("draft", False), headRefName=p["branch"],
                     headRefOid=p["head"], mergeStateStatus="BEHIND", author={"login": "owner"}, isCrossRepository=False,
                     closingIssuesReferences=[{"number": n * 100}], files=[{"path": "x.py"}], baseRefName=p["base"],
-                    statusCheckRollup=rollup, additions=1, deletions=0, labels=[], reviewDecision="APPROVED")
+                    statusCheckRollup=rollup, additions=1, deletions=0, labels=[], reviewDecision=p.get("review", "APPROVED"))
 
     def sh(self, *c, **k):
         if c and str(c[0]).endswith("fold.py") or any(str(x).endswith("fold.py") for x in c):
@@ -431,6 +431,59 @@ with section("member retargeted off main"):
     check("retarget: ledger batch-close", [r["batch"] for r in ledger_rows("batch-close")], [900])
     check("retarget: #1 leaves the batch; #2 goes in the next one and #1 stays held",
           (st(1).get("batch"), w.batch().get("pr"), w.batch().get("heads"), w.batch().get("held")), (None, 901, {"2": h2}, [1]))
+
+with section("changes requested in an open batch"):
+    w = World(); w.pr(1, {"f1.py": "1\n"}); h2 = w.pr(2, {"f2.py": "2\n"})
+    pc.batch_step(ARGS)
+    w.prs[900]["checks"] = "SUCCESS"
+    w.prs[1]["review"] = "CHANGES_REQUESTED"
+    pc.batch_step(ARGS)
+    reasons = [c[c.index("--comment") + 1] for c in w.writes() if c[:2] == ("pr", "close")]
+    check("changes requested: nothing lands", w.lands, [])
+    check("changes requested: the batch PR closes with a one-line reason that names #1",
+          (w.prs[900]["state"], [("\n" not in r, "#1" in r) for r in reasons]), ("CLOSED", [(True, True)]))
+    check("changes requested: #1 ends NEEDS-PERSON with the reason", (st(1)["status"], st(1).get("why", "")),
+          ("NEEDS-PERSON", "approval withdrawn after BATCH-READY: changes requested; a person decides"))
+    check("changes requested: #2 is planned again alone", (w.batch().get("pr"), w.batch().get("heads")), (901, {"2": h2}))
+
+with section("draft in an open batch"):
+    w = World(); w.pr(1, {"f1.py": "1\n"}); h2 = w.pr(2, {"f2.py": "2\n"})
+    pc.batch_step(ARGS)
+    w.prs[900]["checks"] = "SUCCESS"
+    w.prs[1]["draft"] = True
+    pc.batch_step(ARGS)
+    check("draft: nothing lands", w.lands, [])
+    check("draft: the batch PR closes, #1 ends NEEDS-PERSON, #2 is planned again",
+          (w.prs[900]["state"], st(1)["status"], w.batch().get("pr"), w.batch().get("heads")), ("CLOSED", "NEEDS-PERSON", 901, {"2": h2}))
+
+with section("approval dismissed, no batch"):
+    w = World(); w.pr(1, {"f1.py": "1\n"}); h2 = w.pr(2, {"f2.py": "2\n"})
+    w.prs[1]["review"] = "REVIEW_REQUIRED"
+    pc.batch_step(ARGS)
+    check("approval dismissed: #1 is not planned, #2 is", (w.batch().get("heads"), st(1)["status"]), ({"2": h2}, "NEEDS-PERSON"))
+    check("approval dismissed: #1's reason says so", "approval dismissed" in st(1).get("why", ""), True)
+
+with section("no review required"):
+    w = World(); w.pr(1, {"f1.py": "1\n"}); w.pr(2, {"f2.py": "2\n"})
+    w.prs[1]["review"] = w.prs[2]["review"] = ""
+    pc.batch_step(ARGS)
+    w.prs[900]["checks"] = "SUCCESS"
+    pc.batch_step(ARGS)
+    check("no review required: the batch lands and both PRs end MERGED",
+          ([p for p, _, _ in w.lands], st(1)["status"], st(2)["status"]), ([900], "MERGED", "MERGED"))
+
+with section("withdrawn approval, dry run"):
+    w = World(); w.pr(1, {"f1.py": "1\n"}); w.pr(2, {"f2.py": "2\n"})
+    pc.batch_step(ARGS)
+    w.prs[900]["checks"] = "SUCCESS"; w.prs[1]["review"] = "CHANGES_REQUESTED"
+    w.calls.clear(); said = []
+    pc.DRY, pc.log = True, said.append
+    pc.batch_step(ARGS)
+    pc.DRY, pc.log = False, lambda m: None
+    check("withdrawn dry: writes nothing, lands nothing, ends nothing",
+          (w.writes(), w.lands, st(1)["status"], w.prs[900]["state"]), ([], [], "BATCH-READY", "OPEN"))
+    check("withdrawn dry: logs the NEEDS-PERSON it would end", any("[dry] #1 would end NEEDS-PERSON" in m for m in said), True)
+    check("withdrawn dry: the plan leaves #1 out", any("lands [2]" in m for m in said), True)
 
 with section("pair clash"):
     w = World(); h1 = w.pr(1, {"a.py": "one\n"}); w.pr(2, {"a.py": "two\n"})
