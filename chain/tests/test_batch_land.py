@@ -493,11 +493,11 @@ elif a[0] == "api" and any(x.endswith("/reviews") for x in a): print(w["reviews"
         return p.returncode, did, p.stdout + p.stderr
     for status in ("BEHIND", "DIRTY"):
         rc, did, out = land_pr(status)
-        check(f"approve-only ({status}): status and approval, no ready, no merge", (rc, did), (0, ["status", "review"]))
+        check(f"approve-only ({status}): status, approval and ready (the sequence a live batch landed with), no merge", (rc, did), (0, ["status", "review", "ready"]))
     rc, did, out = land_pr(reviews=f"bot {head}")
-    check("approve-only: this head already approved -> no second approval", (rc, did), (0, ["status"]))
+    check("approve-only: this head already approved -> no second approval", (rc, did), (0, ["status", "ready"]))
     rc, did, out = land_pr(reviews=f"bot {'c' * 40}\nsomeone {head}")
-    check("approve-only: another head or account does not count", (rc, did), (0, ["status", "review"]))
+    check("approve-only: another head or account does not count", (rc, did), (0, ["status", "review", "ready"]))
     rc, did, out = land_pr(check_result="FAILURE")
     check("approve-only: a red check still stops", (rc != 0, did), (True, []))
     rc, did, out = land_pr(flag=False)
