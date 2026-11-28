@@ -55,6 +55,9 @@ So any behavior that needs a reply, a peer or a timed event must be STAGED. Stag
       never run the app in a terminal any other way.
    A staged shot counts. Say in the verdict how it was staged. When a shot shows the behavior missing, that is a finding only
    after you rule out your own staging: compare with the PR's proof for the same scenario, and say which one you trust and why.
+   Every screenshot, from the shooting script, an edited browser proof or your own script, passes `animations="disabled"`
+   (`animations: "disabled"` in JavaScript). It finishes running transitions first, so a screenshot taken right after a
+   resize or a theme change shows the settled page.
 3. Shoot the rest with `{{UI_SHOOT}}`:
    `uv run -q --no-project --with playwright==1.62.0 python -I {{UI_SHOOT}} --url {{STACK_URL}} --routes <r1,r2> --out {{SHOTS}}`
    It writes dark and light at 1440x900, 820 wide and 390 wide, plus overflow.json. Kind A: every changed state gets shots at
