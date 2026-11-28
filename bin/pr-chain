@@ -3102,7 +3102,7 @@ def batch_red(b, bad, rollup, live, chains):
     chains.append((n, seed))
 
 
-def batch_open_step(b, live, ready, rows, chains):
+def batch_open_step(b, live, ready, rows, chains, stacked):
     """Look at the open batch PR. Returns the state left behind and whether this lap may plan a new batch."""
     num = b["pr"]
     view = gh_json("pr", "view", str(num), "-R", REPO, "--json", "state,headRefOid,statusCheckRollup")
@@ -3117,8 +3117,10 @@ def batch_open_step(b, live, ready, rows, chains):
     sh("git", "-C", str(CHECKOUT), "fetch", "-q", "origin", CFG.branch, check=True)
     main = sh("git", "-C", str(CHECKOUT), "rev-parse", f"origin/{CFG.branch}", check=True).stdout.strip()
     moved = [int(n) for n, sha in b["heads"].items() if live.get(int(n)) != sha or ready[int(n)].get("gate_head") != sha]
+    aimed = [int(n) for n in b["heads"] if int(n) in stacked]  # a member retargeted off main counts as changed, as a new head does
     why = (f"Closed: {CFG.branch} moved; a new batch is planned on the new {CFG.branch}." if main != b["base"]
            else f"Closed: {', '.join(f'#{n}' for n in moved)} changed or left the batch; planning again." if moved
+           else f"Closed: {', '.join(f'#{n}' for n in aimed)} retargeted off {CFG.branch}; planning again." if aimed
            else "Closed: the batch branch no longer holds the planned commit." if view["headRefOid"] != b["commit"] else None)
     if why:
         if not batch_close(b, why):
@@ -3265,7 +3267,7 @@ def batch_step(a):
         if b.get("pr"):
             for n in b["heads"]:  # a PR of the batch that stopped waiting (a manual run, closed) counts as changed
                 ready.setdefault(int(n), {})
-            b, plan_now = batch_open_step(b, live, ready, rows, chains)
+            b, plan_now = batch_open_step(b, live, ready, rows, chains, stacked)
             ready = batch_ready()
         if plan_now:
             batch_plan(b, live, ready, skip, stacked, rows, chains)
