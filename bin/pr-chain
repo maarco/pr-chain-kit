@@ -3060,16 +3060,24 @@ def batch_close(b, why):
 
 
 def batch_landed(b, live, rows):
-    """The batch PR merged: every PR in it is on main. One pushed to since is not finished: its new commits are not."""
+    """The batch PR merged: a PR whose approved head is on main is finished. One pushed to since, or one whose approved
+    head is not on main, is not: it stays BATCH-READY for the next lap."""
     prs = sorted(int(n) for n in b["heads"])
     if DRY:
         log(f"[dry] batch #{b['pr']} is merged: {', '.join(f'#{n}' for n in prs)} would end MERGED")
         return
     ledger(stage="batch-land", batch=b["pr"], prs=prs, state="MERGED")
+    sh("git", "-C", str(CHECKOUT), "fetch", "-q", "origin", CFG.branch, check=True)
     ready = batch_ready()
     for n in prs:
-        if n in ready and live.get(n, b["heads"][str(n)]) == b["heads"][str(n)]:
-            rows.append((n, die(n, "MERGED", f"landed in merge-flow batch #{b['pr']}")))
+        head = b["heads"][str(n)]
+        if n not in ready or live.get(n, head) != head:
+            continue
+        if sh("git", "-C", str(CHECKOUT), "merge-base", "--is-ancestor", head, f"origin/{CFG.branch}").returncode:
+            log(f"#{n} is not on {CFG.branch}: batch #{b['pr']} merged without {head[:8]}; #{n} stays BATCH-READY")
+            ledger(stage="batch-land", batch=b["pr"], prs=[n], missing=True)
+            continue  # batch_clear below clears its batch field
+        rows.append((n, die(n, "MERGED", f"landed in merge-flow batch #{b['pr']}")))
     batch_clear(b)
 
 
