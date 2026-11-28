@@ -687,6 +687,23 @@ def test_land_merges_with_the_checked_head_pinned(repo: Path, monkeypatch: pytes
     assert merge[merge.index("--match-head-commit") + 1] == _git(repo, "rev-parse", "refs/merge-flow/window")
 
 
+def test_land_counts_a_window_merged_before_the_explicit_merge(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import merge_flow as cli
+
+    calls = _land_setup(repo, monkeypatch, {})
+    gh = cli._gh
+
+    def bot_merged_first(*args: str) -> str:
+        if args[:2] == ("pr", "merge"):
+            raise subprocess.CalledProcessError(1, ["gh", *args], stderr="Merge already in progress")
+        return gh(*args)
+
+    monkeypatch.setattr(cli, "_gh", bot_merged_first)
+
+    assert cli.land_window(repo, "origin", "o/r", "main", 42, ()) == 0
+    assert calls[-1][:2] == ("pr", "view")
+
+
 def test_land_refuses_when_source_readiness_changes_during_local_verification(
     repo: Path, monkeypatch: pytest.MonkeyPatch, capsys
 ) -> None:

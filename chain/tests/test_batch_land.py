@@ -110,7 +110,8 @@ class World:
         return dict(number=n, state=p["state"], title=f"pr {n}", body=f"Fixes #{n}00", isDraft=p.get("draft", False), headRefName=p["branch"],
                     headRefOid=p["head"], mergeStateStatus="BEHIND", author={"login": "owner"}, isCrossRepository=False,
                     closingIssuesReferences=[{"number": n * 100}], files=[{"path": "x.py"}], baseRefName=p["base"],
-                    statusCheckRollup=rollup, additions=1, deletions=0, labels=[], reviewDecision=p.get("review", "APPROVED"))
+                    statusCheckRollup=rollup, additions=1, deletions=0, labels=[dict(name=x) for x in p.get("labels", [])],
+                    url=f"https://github.com/{REPO}/pull/{n}", reviewDecision=p.get("review", "APPROVED"))
 
     def sh(self, *c, **k):
         if c and str(c[0]).endswith("fold.py") or any(str(x).endswith("fold.py") for x in c):
@@ -123,7 +124,9 @@ class World:
         if a[:2] == ("pr", "view"):
             return ok_proc(json.dumps(self.view(int(a[2]))))
         if a[:2] == ("pr", "list"):
-            return ok_proc(json.dumps([self.view(n) for n, p in self.prs.items() if p["state"] == "OPEN"]))
+            head = a[a.index("--head") + 1] if "--head" in a else None
+            return ok_proc(json.dumps([self.view(n) for n, p in self.prs.items()
+                                       if p["state"] == "OPEN" and head in (None, p["branch"])]))
         if a[:2] == ("issue", "list"):
             return ok_proc("[]")
         if a[:2] == ("pr", "create"):
@@ -540,6 +543,175 @@ with section("dry run"):
         check(f"dry ({stage}): writes nothing", (w.writes(), w.lands, w.chains, snap() == before, w.remote_batches() == branches),
               ([], [], [], True, True))
         check(f"dry ({stage}): logs its decisions", any("[dry]" in m for m in said), True)
+
+# ---------------------------------------------------------------- parallel review findings (A to K)
+class Killed(BaseException):
+    """The process dies: no `except Exception` runs."""
+
+
+def die_after(w, verb):
+    """The next `gh pr <verb>` reaches GitHub, then the process dies before anything is written locally."""
+    def sh(*c, **k):
+        r = w.sh(*c, **k)
+        if c[:3] == ("gh", "pr", verb):
+            pc.sh = w.sh
+            raise Killed
+        return r
+    pc.sh = sh
+
+
+def lap_that_dies():
+    try:
+        pc.batch_step(ARGS)
+    except Killed:
+        return True
+    return False
+
+
+def creates(w):
+    return len([c for c in w.writes() if c[:2] == ("pr", "create")])
+
+
+with section("A: fixer and main"):
+    def fixed_on(verdict_name, files={"f1.py": "1\n"}, mode="batch"):
+        """True when the fixer's worktree starts with main merged in."""
+        w = World(); head = w.pr(1, files); main = w.move_main({"m.py": "m\n", "a.py": "main\n"})
+        pc.CFG.land_mode = mode
+        pc.issues_text = lambda info: ""
+        seen = []
+        def agent(role, model, brief, wt, d, pr, **kw):
+            seen.append(pc.sh("git", "-C", str(wt), "merge-base", "--is-ancestor", main, "HEAD").returncode == 0
+                        or bool(pc.sh("git", "-C", str(wt), "diff", "--name-only", "--diff-filter=U").stdout.strip()))
+            return {}
+        pc.run_agent = agent
+        vp = tmp / verdict_name; vp.write_text(f"FAIL\nhead {head}\nFindings:\n- P1 x:1 - y\n")
+        pc.fix(1, 1, "fix", vp, head, None)
+        return seen
+    check("A: the fixer merges main only for a conflict, a batch-red seed or pr mode (not a clean recent head in batch mode)",
+          (fixed_on("verdict.md"), fixed_on("batch-red-1.md"), fixed_on("verdict.md", {"a.py": "pr\n"}), fixed_on("verdict.md", mode="pr")),
+          ([False], [True], [True], [True]))
+
+with section("B: config values"):
+    def refused(land):
+        try:
+            cfg({"land": land})
+        except SystemExit as e:
+            return next(iter(land)) in str(e)
+        except Exception:  # noqa: BLE001 - not the clear error
+            return False
+        return False
+    for bad in (-1, float("nan"), float("inf"), "soon"):
+        check(f"B: max_base_age_hours = {bad!r} is refused by name", refused({"max_base_age_hours": bad}), True)
+    for bad in ("bad prefix", "../outside", "x..y"):
+        check(f"B: batch_branch_prefix = {bad!r} is refused by name", refused({"batch_branch_prefix": bad}), True)
+
+with section("C: killed after pr create"):
+    w = World(); h1 = w.pr(1, {"f1.py": "1\n"})
+    die_after(w, "create"); died = lap_that_dies()
+    pc.batch_step(ARGS)
+    b = w.batch() or {}
+    check("C: the open batch PR is adopted, no second one",
+          (died, creates(w), b.get("pr"), b.get("heads"), b.get("pending"), st(1).get("batch")),
+          (True, 1, 900, {"1": h1}, None, 900))
+    w.prs[900]["checks"] = "SUCCESS"; pc.batch_step(ARGS)
+    check("C: the adopted batch lands", ([p for p, _, _ in w.lands], st(1)["status"]), ([900], "MERGED"))
+    w = World(); w.pr(1, {"f1.py": "1\n"})
+    die_after(w, "create"); lap_that_dies()
+    w.prs[900]["head"] = w.base  # the open PR no longer holds the planned commit
+    pc.batch_step(ARGS)
+    check("C: a stray PR at another head is closed and a new one planned",
+          (w.prs[900]["state"], creates(w), (w.batch() or {}).get("pr")), ("CLOSED", 2, 901))
+    w = World(); h1 = w.pr(1, {"f1.py": "1\n"}); w.pr(2, {"f2.py": "2\n"})
+    pc.batch_save(dict(pr=None, queue=[[1], [2]], held=[]))
+    seen = []
+    def no_create(*c, **k):
+        if c[:3] == ("gh", "pr", "create"):
+            seen.append(w.batch())
+            raise Killed
+        return w.sh(*c, **k)
+    pc.sh = no_create; lap_that_dies(); pc.sh = w.sh
+    check("C: the intent is on disk before the PR is created",
+          [(s.get("pr"), s.get("pending"), s.get("heads"), bool(s.get("branch") and s.get("commit") and s.get("base") and s.get("opened"))) for s in seen],
+          [(None, True, {"1": h1}, True)])
+    pc.batch_step(ARGS)
+    check("C: with no PR the intent is dropped and the same queued group is planned",
+          ((w.batch() or {}).get("heads"), (w.batch() or {}).get("queue"), (w.batch() or {}).get("pending")), ({"1": h1}, [[2]], None))
+
+with section("D: killed after closing a red batch of two"):
+    w = World(); h1 = w.pr(1, {"f1.py": "1\n"}); w.pr(2, {"f2.py": "2\n"})
+    pc.batch_step(ARGS); w.prs[900]["checks"] = "FAILURE"
+    die_after(w, "close"); died = lap_that_dies()
+    pc.batch_step(ARGS)
+    check("D: the split queue survives", (died, (w.batch() or {}).get("heads"), (w.batch() or {}).get("queue")), (True, {"1": h1}, [[2]]))
+
+with section("D: killed after closing a red batch of one"):
+    w = World(); w.pr(1, {"f1.py": "1\n"})
+    pc.batch_step(ARGS); w.prs[900]["checks"] = "FAILURE"
+    die_after(w, "close"); died = lap_that_dies()
+    pc.batch_step(ARGS)
+    check("D: the fixer seed survives and runs, no new batch",
+          (died, [(c["pr"], bool(c["seed"] and c["seed"].exists())) for c in w.chains], creates(w)), (True, [(1, True)], 1))
+    w.chains.clear(); pc.set_state(1, status="RESTING"); pc.batch_step(ARGS)
+    check("D: the seed is consumed once", (w.chains, (w.batch() or {}).get("fix")), ([], None))
+
+with section("E: a member's check turned red"):
+    for result in ("FAILURE", "CANCELLED"):
+        w = World(); w.pr(1, {"f1.py": "1\n"}); h2 = w.pr(2, {"f2.py": "2\n"})
+        pc.batch_step(ARGS)
+        w.prs[900]["checks"] = "SUCCESS"; w.prs[1]["checks"] = result
+        pc.batch_step(ARGS)
+        check(f"E ({result}): nothing lands, the batch closes, #1 runs its chain, #2 is planned again",
+              (w.lands, w.prs[900]["state"], [(c["pr"], c["seed"]) for c in w.chains], (w.batch() or {}).get("heads")),
+              ([], "CLOSED", [(1, None)], {"2": h2}))
+
+with section("F: labels"):
+    for label in ("merge/hold", "hold", "do-not-merge", "status/blocked", "wontfix"):
+        w = World(); w.pr(1, {"f1.py": "1\n"}); h2 = w.pr(2, {"f2.py": "2\n"})
+        pc.batch_step(ARGS)
+        w.prs[900]["checks"] = "SUCCESS"; w.prs[1]["labels"] = [label]
+        pc.batch_step(ARGS)
+        check(f"F ({label}): #1 is withdrawn and the batch closes",
+              (w.lands, w.prs[900]["state"], st(1)["status"], (w.batch() or {}).get("heads")), ([], "CLOSED", "NEEDS-PERSON", {"2": h2}))
+    got = []
+    for labels in ([], [pc.CFG.human_label]):
+        w = World(); w.pr(1, {"f1.py": "1\n"}); w.prs[1]["labels"] = [pc.CFG.human_label]
+        pc.set_state(1, gate_at="2026-01-01T00:00:00Z", gate_comment=1)  # it passed the human gate
+        pc.batch_step(ARGS)
+        w.prs[900]["checks"] = "SUCCESS"; w.prs[1]["labels"] = labels
+        pc.batch_step(ARGS)
+        got.append(([p for p, _, _ in w.lands], st(1)["status"]))
+    check("F: after the human gate a removed label withdraws, a kept one lands", got, [([], "NEEDS-PERSON"), ([900], "MERGED")])
+
+with section("G: draft batch PR"):
+    w = World(); w.pr(1, {"f1.py": "1\n"})
+    pc.batch_step(ARGS)
+    w.prs[900]["checks"] = "SUCCESS"; w.prs[900]["draft"] = True
+    said = []; pc.log = said.append
+    pc.batch_step(ARGS); w.pr(2, {"f2.py": "2\n"}); pc.batch_step(ARGS)
+    check("G: a draft batch is never landed, readied, closed or replaced",
+          (w.lands, [c[:2] for c in w.writes()], w.prs[900]["state"], (w.batch() or {}).get("pr")), ([], [("pr", "create")], "OPEN", 900))
+    check("G: logged once", len([m for m in said if "draft" in m]), 1)
+
+with section("H: a push while the batch lands"):
+    w = World(); h1 = w.pr(1, {"f1.py": "1\n"}); w.pr(2, {"f2.py": "2\n"})
+    pc.batch_step(ARGS); w.prs[900]["checks"] = "SUCCESS"
+    def land(pr, head, reviewer, approve_only=False):
+        w.push(1, {"f1.py": "late\n"})
+        return w.land(pr, head, reviewer)
+    pc.land = land
+    pc.batch_step(ARGS)
+    check("H: the pushed member stays BATCH-READY, the other ends MERGED", (st(1)["status"], st(2)["status"]), ("BATCH-READY", "MERGED"))
+
+with section("K: cap"):
+    w = World()
+    for n in range(1, 23):
+        w.pr(n, {f"f{n}.py": f"{n}\n"})
+    pc.batch_step(ARGS)
+    b = w.batch()
+    check("K: one plan holds 20 PRs in rank order, the rest wait",
+          (len(b["heads"]), b["held"], w.chains, st(21)["status"], st(22)["status"],
+           sorted(map(int, b["heads"])) == sorted([r["number"] for r in pc.rank(pc.list_prs())][:20])),
+          (20, [], [], "BATCH-READY", "BATCH-READY", True))
 
 # ---------------------------------------------------------------- resume and doctor
 with section("resume"):
