@@ -24,6 +24,12 @@ def check(name, got, want):
     print(("ok   " if ok else "FAIL ") + name + ("" if ok else f": got {got!r}, want {want!r}"))
     if not ok: fails.append(name)
 
+LEDGER_ROWS = []  # every ledger row any section writes
+_ledger = pc.ledger
+def _record(**kw):
+    LEDGER_ROWS.append(dict(kw))
+    _ledger(**kw)
+pc.ledger = _record
 ORIG = dict(pc.__dict__)
 REAL_SH = pc.sh
 REPO = pc.REPO
@@ -107,7 +113,9 @@ class World:
         rollup = [dict(name=c, conclusion="" if p["checks"] == "PENDING" else p["checks"],
                        state="PENDING" if p["checks"] == "PENDING" else "",
                        detailsUrl=f"https://github.com/{REPO}/actions/runs/7{n}/job/1") for c in REQUIRED]
-        return dict(number=n, state=p["state"], title=f"pr {n}", body=f"Fixes #{n}00", isDraft=p.get("draft", False), headRefName=p["branch"],
+        if p["checks"] == "MISSING":
+            rollup = []
+        return dict(number=n, state=p["state"], title=f"pr {n}", body=p.get("text", f"Fixes #{n}00"), isDraft=p.get("draft", False), headRefName=p["branch"],
                     headRefOid=p["head"], mergeStateStatus="BEHIND", author={"login": "owner"}, isCrossRepository=False,
                     closingIssuesReferences=[{"number": n * 100}], files=[{"path": "x.py"}], baseRefName=p["base"],
                     statusCheckRollup=rollup, additions=1, deletions=0, labels=[dict(name=x) for x in p.get("labels", [])],
@@ -349,7 +357,8 @@ with section("merged batch, a head not on main"):
           [(r["batch"], r["prs"]) for r in ledger_rows("batch-land") if r.get("missing")], [(900, [2])])
 
 with section("land refused"):
-    for msg, closed in (("LAND-FAILED: STOP: #900 is BEHIND", True), ("LAND-FAILED: STOP: approval refused", False)):
+    for msg, closed in (("LAND-FAILED: STOP: #900 is BEHIND", True),
+                        ("LAND-FAILED: GraphQL: the head branch is not up to date with the base branch", True), ("LAND-FAILED: STOP: approval refused", False)):
         w = World(); w.pr(1, {"f1.py": "1\n"})
         pc.batch_step(ARGS); w.prs[900]["checks"] = "SUCCESS"
         pc.land = lambda pr, head, reviewer, approve_only=False, m=msg: m
@@ -365,6 +374,7 @@ with section("verify refuses"):
     pc.batch_step(ARGS)
     merge_flow.verify = real_verify
     check("verify problems: nothing lands", (w.lands, st(1)["status"]), ([], "BATCH-READY"))
+    check("verify problems: the batch PR stays open", (w.prs[900]["state"], w.batch()["pr"]), ("OPEN", 900))
 
 with section("red of two splits"):
     w = World(); h1, h2 = w.pr(1, {"f1.py": "1\n"}), w.pr(2, {"f2.py": "2\n"})
@@ -757,6 +767,277 @@ with section("doctor"):
     pc.doctor()
     check("doctor leaves a merged BATCH-READY PR to resume", st(1)["status"], "BATCH-READY")
 
+# ---------------------------------------------------------------- second review round (M1 to M10) and test gaps
+def closes(w):
+    return [c[c.index("--comment") + 1] for c in w.writes() if c[:2] == ("pr", "close")]
+
+
+def age_batch(w, minutes):
+    b = w.batch()
+    b["opened"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - minutes * 60))
+    (pc.WORK / "batch.json").write_text(json.dumps(b))
+
+
+with section("M1: the batch PR is never taken"):
+    w = World(); w.pr(1, {"f1.py": "1\n"})
+    pc.batch_step(ARGS)
+    view = dict(w.view(900), author={"login": "owner"})
+    check("M1: owner_reason names the open batch PR", pc.owner_reason(view, ""), "merge-flow batch PR")
+    check("M1: by batch.json's number alone", pc.owner_reason(dict(view, headRefName="other"), ""), "merge-flow batch PR")
+    check("M1: by the branch prefix alone",
+          pc.owner_reason(dict(view, number=950, headRefName="merge-flow/batch-20260101-000000"), ""), "merge-flow batch PR")
+    check("M1: pick lists it as owned", [r["owner"] for r in pc.rank([view], prios={})], ["merge-flow batch PR"])
+    ran = []
+    pc._run_chain_py = lambda pr, *a: (ran.append(pr), "RAN")[1]
+    ORIG["run_chain"](900, ARGS)
+    pc.batch_save(dict(pr=None, queue=[], held=[]))
+    ORIG["run_chain"](900, ARGS)  # a stray one the batch.json no longer names: its branch still says what it is
+    check("M1: no chain runs it and it gets no STATE", (ran, (pc.WORK / "prs" / "900" / "STATE.json").exists()), ([], False))
+
+with section("M2: a land that keeps failing"):
+    w = World(); w.pr(1, {"f1.py": "1\n"})
+    pc.batch_step(ARGS); w.prs[900]["checks"] = "SUCCESS"
+    commit = w.batch()["commit"]
+    tried = []
+    pc.land = lambda pr, head, reviewer, approve_only=False: (tried.append(pr), "LAND-FAILED: STOP: BLOCKED\nnot green: {}")[1]
+    pc.batch_step(ARGS)
+    check("M2: the first failure is counted for the batch commit", (w.prs[900]["state"], (w.batch().get("land_tries") or {}).get(commit)), ("OPEN", 1))
+    pc.batch_step(ARGS)
+    check("M2: at 2 the batch closes with a one-line reason", (w.prs[900]["state"], ["\n" in r for r in closes(w)], w.batch()["pr"]), ("CLOSED", [False], None))
+    check("M2: no new batch in that lap, the member waits", (creates(w), st(1)["status"], tried), (1, "BATCH-READY", [900, 900]))
+    pc.batch_step(ARGS)
+    check("M2: planned again next lap", (creates(w), w.batch().get("pr")), (2, 901))
+
+with section("M3: skipped and neutral checks pass"):
+    for result in ("SKIPPED", "NEUTRAL"):
+        w = World(); w.pr(1, {"f1.py": "1\n"})
+        pc.batch_step(ARGS); w.prs[900]["checks"] = result
+        pc.batch_step(ARGS)
+        check(f"M3 ({result}): the batch lands", ([p for p, _, _ in w.lands], st(1)["status"]), ([900], "MERGED"))
+
+with section("M3: checks that never finish"):
+    limit = pc.LIM["ci_wait_max_minutes"]
+    for result in ("PENDING", "MISSING"):
+        w = World(); w.pr(1, {"f1.py": "1\n"})
+        pc.batch_step(ARGS); w.prs[900]["checks"] = result
+        age_batch(w, limit - 5); pc.batch_step(ARGS)
+        early = w.prs[900]["state"]
+        age_batch(w, limit + 5); pc.batch_step(ARGS)
+        check(f"M3 ({result}): waits inside the limit, closes after it",
+              (early, w.prs[900]["state"], [f"checks did not finish in {limit} min" in r for r in closes(w)], st(1)["status"]),
+              ("OPEN", "CLOSED", [True], "BATCH-READY"))
+
+with section("M3: land() marks the batch land"):
+    w = World(); pc.land = ORIG["land"]
+    pc.batch_save(dict(pr=900, heads={}, queue=[], held=[]))
+    ran = []
+    pc.pr_info = lambda n: dict(author={"login": "owner"})
+    pc.sh = lambda *c, **k: (ran.append(c), ok_proc())[1]
+    pc.land(900, "h" * 40, "r"); pc.land(1, "h" * 40, "r", approve_only=True)
+    check("M3: only the batch PR's land gets --batch", ["--batch" in c for c in ran if any(str(x).endswith("land_pr.py") for x in c)], [True, False])
+
+with section("M4: the same head red twice"):
+    w = World(); h1 = w.pr(1, {"f1.py": "1\n"})
+    pc.batch_step(ARGS); w.prs[900]["checks"] = "FAILURE"; pc.batch_step(ARGS)
+    first = ([c["pr"] for c in w.chains], (st(1).get("batch_reds") or {}).get(h1))
+    check("M4: the first red goes to a fixer and is counted", first, ([1], 1))
+    w.chains.clear(); w.ready(1)  # the fixer changed nothing: the same head waits again
+    pc.batch_step(ARGS); w.prs[901]["checks"] = "FAILURE"
+    rows = pc.batch_step(ARGS)
+    check("M4: the second red of that head rests it, no fixer",
+          (w.chains, st(1)["status"], REQUIRED[0] in st(1).get("why", ""), (st(1).get("batch_reds") or {}).get(h1), w.prs[901]["state"], rows),
+          ([], "RESTING", True, 2, "CLOSED", [(1, "RESTING")]))
+    w = World(); h1 = w.pr(1, {"f1.py": "1\n"})
+    pc.batch_step(ARGS); w.prs[900]["checks"] = "FAILURE"; pc.batch_step(ARGS)
+    w.chains.clear(); h2 = w.push(1, {"f1.py": "fixed\n"}); w.ready(1)
+    pc.batch_step(ARGS); w.prs[901]["checks"] = "FAILURE"; pc.batch_step(ARGS)
+    check("M4: a new head starts its own count", ([c["pr"] for c in w.chains], st(1)["status"]), ([1], "BATCH-READY"))
+
+with section("M5: one root per window"):
+    w = World()
+    heads = {n: w.pr(n, {f"f{n}.py": f"{n}\n"}) for n in (1, 2, 3)}
+    w.g("fetch", "-q", "origin", *(f"refs/pull/{n}/head" for n in heads), cwd=w.repo)
+    real_build = merge_flow._build_tree
+    def two_roots(repo, hs):
+        if len(hs) != 3:
+            return real_build(repo, hs)
+        big, levels = real_build(repo, hs[:2])
+        return big + real_build(repo, hs[2:])[0], levels
+    merge_flow._build_tree = two_roots
+    try:
+        r = merge_flow.plan(w.repo, w.base, [merge_flow.Head(n, h, frozenset({f"f{n}.py"})) for n, h in heads.items()])
+    finally:
+        merge_flow._build_tree = real_build
+    check("M5: only the largest root lands, the rest wait", (r["landed"], r["held"], r["prs"]), ([1, 2], [3], [1, 2, 3]))
+    check("M5: the window sits on main and verifies",
+          (w.g("rev-parse", f"{r['window_commit']}^1", cwd=w.repo), merge_flow.verify(w.repo, w.base, {n: heads[n] for n in r["landed"]}, r["window_commit"])),
+          (w.base, []))
+
+with section("M6 / gap: a batch closed by hand"):
+    w = World(); w.pr(1, {"f1.py": "1\n"})
+    pc.batch_step(ARGS)
+    w.prs[900]["state"] = "CLOSED"
+    pc.batch_step(ARGS)
+    check("hand-closed: a batch-close row says found CLOSED", [(r["batch"], r["why"]) for r in ledger_rows("batch-close")], [(900, "found CLOSED")])
+    check("hand-closed: cleared, the member stays BATCH-READY", (w.batch()["pr"], st(1)["status"], st(1).get("batch")), (None, "BATCH-READY", None))
+    check("M6: no new batch in the same lap", creates(w), 1)
+    pc.batch_step(ARGS)
+    check("hand-closed: planned again next lap", (creates(w), w.batch().get("pr")), (2, 901))
+
+with section("M8: rollback respects a withdrawn approval"):
+    for name, change in (("draft", dict(draft=True)), ("dismissed", dict(review="REVIEW_REQUIRED")),
+                         ("changes requested", dict(review="CHANGES_REQUESTED")), ("hold label", dict(labels=["hold"])), ("gate label", {})):
+        w = World(); w.pr(1, {"f1.py": "1\n"}); pc.CFG.land_mode = "pr"; w.prs[1].update(change)
+        if name == "gate label":
+            pc.set_state(1, gate_at="2026-01-01T00:00:00Z", gate_comment=1)
+        pc.resume_all(ARGS)
+        check(f"M8 ({name}): NEEDS-PERSON, no chain", (st(1)["status"], w.chains), ("NEEDS-PERSON", []))
+    for state in ("MERGED", "CLOSED"):
+        w = World(); w.pr(1, {"f1.py": "1\n"}); pc.CFG.land_mode = "pr"; w.prs[1]["state"] = state
+        pc.resume_all(ARGS)
+        check(f"M8: resume records {state} for a PR GitHub says is {state}", st(1)["status"], state)
+
+with section("gap: rollback with a moved head"):
+    w = World(); w.pr(1, {"f1.py": "1\n"}); pc.CFG.land_mode = "pr"; w.push(1, {"f1.py": "new\n"})
+    pc.resume_all(ARGS)
+    check("rollback: a moved head runs the chain with approved None", [(c["pr"], c["approved"]) for c in w.chains], [(1, None)])
+
+with section("M9: one bad head"):
+    w = World(); w.pr(1, {"f1.py": "1\n"}); h2 = w.pr(2, {"f2.py": "2\n"})
+    w.g("checkout", "-q", "--orphan", "lost"); w.g("rm", "-rqf", ".")
+    orphan = w.commit({"z.py": "z\n"}, "no common history")
+    w.g("push", "-qf", "origin", "lost:pr1", "lost:refs/pull/1/head")
+    w.prs[1]["head"] = orphan; w.ready(1)
+    pc.batch_step(ARGS)
+    check("M9: the others are still planned", ((w.batch() or {}).get("heads"), (w.batch() or {}).get("held"), st(1)["status"]), ({"2": h2}, [1], "BATCH-READY"))
+    check("M9: a ledger row says why #1 is held", any("#1" in r.get("why", "") and "git" in r.get("why", "") for r in LEDGER_ROWS if r["stage"].startswith("batch-")
+          and 1 in (r.get("held") or r.get("prs") or [])), True)
+
+with section("M10: every batch row says why"):
+    del LEDGER_ROWS[:]
+    w = World(); w.pr(1, {"f1.py": "1\n"}); w.pr(2, {"f2.py": "2\n"})
+    pc.batch_step(ARGS); w.prs[900]["checks"] = "SUCCESS"
+    real_verify = merge_flow.verify
+    merge_flow.verify = lambda *a: ["not the approved heads"]
+    pc.batch_step(ARGS)
+    merge_flow.verify = real_verify
+    pc.land = lambda pr, head, reviewer, approve_only=False: "LAND-FAILED: STOP: approval refused"
+    pc.batch_step(ARGS)
+    w.prs[900]["checks"] = "FAILURE"; pc.batch_step(ARGS)  # split
+    whys = [r.get("why", "") for r in LEDGER_ROWS if r["stage"] == "batch-land"]
+    check("M10: the verify row carries the problems", any("not the approved heads" in x for x in whys), True)
+    check("M10: the refused-land row carries the error", any("approval refused" in x for x in whys), True)
+    split = [r.get("why", "") for r in LEDGER_ROWS if r["stage"] == "batch-split"]
+    check("M10: the split row names the groups", [("[1]" in x or "#1" in x) and ("[2]" in x or "#2" in x) for x in split], [True])
+    w = World(); h1 = w.pr(1, {"f1.py": "1\n"}); w.pr(2, {"f2.py": "2\n"})
+    pc.batch_step(ARGS); w.g("push", "-q", "origin", f"{h1}:refs/heads/main"); w.prs[900]["state"] = "MERGED"; pc.batch_step(ARGS)
+    check("M10: the missing-head row says which", any("#2" in r.get("why", "") for r in LEDGER_ROWS if r["stage"] == "batch-land" and r.get("missing")), True)
+    w = World(); w.pr(1, {"f1.py": "1\n"})
+    def broken(*a):
+        raise RuntimeError("planner broke")
+    pc.batch_plan = broken
+    rows = pc.batch_step(ARGS)
+    check("M10: a failed lap's row carries the error", ["planner broke" in r.get("why", "") for r in ledger_rows("batch-plan")], [True])
+    bare = sorted({r["stage"] for r in LEDGER_ROWS if r["stage"].startswith("batch-") and not (isinstance(r.get("why"), str) and r["why"].strip())})
+    check("M10: no batch row without a why", bare, [])
+
+with section("T6: an unchanged plan is logged once"):
+    w = World(); w.pr(1, {"f1.py": "1\n"}); w.prs[1]["base"] = "release"
+    for _ in range(3):
+        pc.batch_step(ARGS)
+    check("T6: one batch-plan row for three equal plans", len(ledger_rows("batch-plan")), 1)
+    w.pr(2, {"f2.py": "2\n"}); pc.batch_step(ARGS)
+    check("T6: a changed plan is logged", len(ledger_rows("batch-plan")), 2)
+
+with section("T4: owner text after a rollback"):
+    w = World(); h = w.pr(1, {"f1.py": "1\n"}); pc.CFG.land_mode = "pr"
+    check("T4: pr mode", pc.owner_reason(w.view(1), ""), "approved; resume lands it")
+
+with section("T7: a queued rerun is the newest run"):
+    w = World(); w.pr(1, {"f1.py": "1\n"})
+    pc.batch_step(ARGS)
+    real_view = w.view
+    def rerun(n):
+        v = real_view(n)
+        if n == 900:
+            v["statusCheckRollup"] = [dict(name=c, status="QUEUED", conclusion="") for c in REQUIRED] + [
+                dict(name=c, conclusion="FAILURE", startedAt="2026-01-01T00:00:00Z") for c in REQUIRED]
+        return v
+    w.view = rerun
+    pc.batch_step(ARGS)
+    check("T7: the batch waits for the rerun", (w.prs[900]["state"], w.chains), ("OPEN", []))
+
+for result in ("ERROR", "TIMED_OUT", "CANCELLED", "STARTUP_FAILURE", "ACTION_REQUIRED"):
+    with section(f"gap: red status {result}"):
+        w = World(); w.pr(1, {"f1.py": "1\n"}); w.pr(2, {"f2.py": "2\n"})
+        pc.batch_step(ARGS); w.prs[900]["checks"] = result
+        pc.batch_step(ARGS)
+        check(f"red ({result}): the batch splits", (w.prs[900]["state"], (w.batch() or {}).get("queue")), ("CLOSED", [[1], [2]]))
+
+with section("gap: a red batch of three"):
+    w = World()
+    for n in (1, 2, 3):
+        w.pr(n, {f"f{n}.py": f"{n}\n"})
+    pc.batch_step(ARGS); w.prs[900]["checks"] = "FAILURE"
+    pc.batch_step(ARGS)
+    check("red 3: splits [[1, 2], [3]]", w.batch()["queue"], [[1, 2], [3]])
+
+with section("gap: the seed text"):
+    w = World(); h1 = w.pr(1, {"f1.py": "1\n"})
+    pc.batch_step(ARGS); base = w.batch()["base"]; w.prs[900]["checks"] = "FAILURE"
+    pc.batch_step(ARGS)
+    check("red 1: the seed text, exactly", w.chains[0]["seed"].read_text(),
+          f"FAIL\nhead {h1}\nFindings:\n- P1 batch-ci:0 - the batch PR #900 (this PR merged with main at {base}) failed "
+          f"{', '.join(REQUIRED)} (https://github.com/{REPO}/actions/runs/7900/job/1) - merge main into this branch, reproduce the "
+          "failure and fix it red-first, or end BLOCKED with the evidence\n")
+
+with section("gap: the branch prefix"):
+    w = World(); w.pr(1, {"f1.py": "1\n"}); pc.CFG.batch_branch_prefix = "x/y"
+    pc.batch_step(ARGS)
+    b = w.batch()
+    check("prefix: the batch branch uses batch_branch_prefix",
+          (bool(re.fullmatch(r"x/y-\d{8}-\d{6}", b["branch"])), w.g("rev-parse", b["branch"], cwd=w.up) == b["commit"]), (True, True))
+
+with section("gap: linked issues from GitHub"):
+    w = World(); w.pr(1, {"f1.py": "1\n"}); w.prs[1]["text"] = "No keyword here."
+    pc.batch_step(ARGS)
+    check("issues: closingIssuesReferences alone links the issue", "Refs #100" in w.prs[900]["body"], True)
+
+with section("gap: the review brief's base"):
+    w = World(); w.pr(1, {"f1.py": "1\n"}); w.move_main({"m.py": "m\n"})
+    class Briefed(Exception):
+        pass
+    seen = []
+    def render(tpl, **kv):
+        seen.append(kv["MAIN"])
+        raise Briefed
+    pc.render, pc.issues_text, pc.public_pr_body = render, lambda info: "", lambda info: ""
+    try:
+        pc.review(1, 1, "review", "rev", False)
+    except Briefed:
+        pass
+    check("review: MAIN is the merge-base for a behind-but-clean PR", seen, [w.base])
+
+def reordered_window():
+    """Three heads that merge cleanly in any order, to different files: git's three-way merge of repeated lines depends on
+    the order. Every commit of the window is a clean merge and it sits on base, so only the file check can refuse it."""
+    w = World()
+    text = lambda s: "".join(c + "\n" for c in s)
+    w.base = w.commit({"f": text("cbbbbbbccaa")}, "base f")
+    w.g("push", "-q", "origin", "main")
+    heads = {n: w.pr(n, {"f": text(s)}) for n, s in ((1, "cbbbbbbccccaa"), (2, "cbbbbbbbccbccaa"), (3, "cbbbbbbcbcccaa"))}
+    w.g("fetch", "-q", "origin", *(f"refs/pull/{n}/head" for n in heads), cwd=w.repo)
+    window = merge_flow.merge(w.repo, heads[1], heads[3], "x")  # the planner pairs 1 with 2 first; this pairs 1 with 3
+    window = merge_flow.merge(w.repo, window, heads[2], "y")
+    return w, heads, merge_flow.merge(w.repo, w.base, window, "window")
+
+
+with section("gap: verify and the window's files"):
+    w, heads, window = reordered_window()
+    problems = merge_flow.verify(w.repo, w.base, heads, window)
+    check("verify: clean merges in another order with other files are refused",
+          problems, ["the window's files differ from the listed heads merged onto base"])
+
 # ---------------------------------------------------------------- land_pr.py --approve-only, against a fake gh on PATH
 with section("land_pr.py"):
     fake = tmp / "fakegh"; fake.mkdir()
@@ -766,23 +1047,34 @@ d = os.environ["FAKE_GH"]; a = sys.argv[1:]
 w = json.load(open(d + "/world.json"))
 open(d + "/calls.jsonl", "a").write(json.dumps(a) + "\\n")
 if a[:2] == ["auth", "token"]: print("tok")
-elif a[:2] == ["pr", "view"]: print(json.dumps(w["pr"]))
-elif a[0] == "api" and any(x.endswith("/reviews") for x in a): print(w["reviews"])
+elif a[:2] == ["pr", "view"]:
+    pr = dict(w["pr"])
+    if w["moves"] and os.path.exists(d + "/approved"): pr["headRefOid"] = "d" * 40
+    seen = [json.loads(x)[:2] for x in open(d + "/calls.jsonl")].count(["pr", "view"])
+    if w["merges"] and seen > 2: pr["state"] = "MERGED"
+    print(json.dumps(pr))
+elif a[:2] == ["pr", "review"]: open(d + "/approved", "w").close()
+elif a[0] == "api" and any(x.endswith("/reviews") for x in a):
+    if "POST" in a: open(d + "/approved", "w").close(); print("{{}}")
+    else: print(w["reviews"])
 """)
     (fake / "gh").chmod(0o755)
     head = "a" * 40
-    def land_pr(status="BEHIND", reviews="", flag=True, check_result="SUCCESS"):
+    def land_pr(status="BEHIND", reviews="", flag=True, check_result="SUCCESS", moves=False, merges=False, batch=False):
         pr = dict(state="OPEN", isDraft=True, author={"login": "owner"}, headRefOid=head, baseRefOid="b" * 40, mergeStateStatus=status,
                   reviewDecision="", statusCheckRollup=[dict(name=c, conclusion=check_result) for c in REQUIRED], mergedBy=None, mergeCommit=None)
-        (fake / "world.json").write_text(json.dumps(dict(pr=pr, reviews=reviews)))
+        (fake / "world.json").write_text(json.dumps(dict(pr=pr, reviews=reviews, moves=moves, merges=merges)))
+        (fake / "approved").unlink(missing_ok=True)
         (fake / "calls.jsonl").write_text("")
         env = {**os.environ, "PATH": str(fake) + os.pathsep + os.environ["PATH"], "FAKE_GH": str(fake), "KIT_REPO": REPO,
                "KIT_MERGER": "bot", "KIT_CHECKS": ",".join(REQUIRED), "KIT_WORK": str(tmp / "landwork")}
         p = subprocess.run([sys.executable, "-B", str(root / "agent-kit/land/land_pr.py"), "1", head, "bot", head, "rev",
-                            *(["--approve-only"] if flag else [])], capture_output=True, text=True, env=env, timeout=60)
+                            *(["--approve-only"] if flag else []), *(["--batch"] if batch else [])], capture_output=True, text=True, env=env, timeout=60)
         calls = [json.loads(x) for x in (fake / "calls.jsonl").read_text().splitlines()]
-        did = [("status" if any("/statuses/" in x for x in c) else c[1]) for c in calls
-               if c[:1] == ["pr"] and c[1] in ("review", "ready", "merge") or any("/statuses/" in x for x in c)]
+        posted = lambda c: "POST" in c and any(x.endswith("/reviews") for x in c)
+        did = [("status" if any("/statuses/" in x for x in c) else "review" if posted(c) else c[1]) for c in calls
+               if c[:1] == ["pr"] and c[1] in ("review", "ready", "merge") or posted(c) or any("/statuses/" in x for x in c)]
+        land_pr.calls = calls
         return p.returncode, did, p.stdout + p.stderr
     for status in ("BEHIND", "DIRTY"):
         rc, did, out = land_pr(status)
@@ -795,6 +1087,32 @@ elif a[0] == "api" and any(x.endswith("/reviews") for x in a): print(w["reviews"
     check("approve-only: a red check still stops", (rc != 0, did), (True, []))
     rc, did, out = land_pr(flag=False)
     check("without the flag BEHIND still stops before any write", (rc != 0, did, "is BEHIND" in out), (True, [], True))
+    with section("M7 / T5 approve-only"):
+        log_file = tmp / "landwork" / "landings.jsonl"
+        log_file.unlink(missing_ok=True)
+        rc, did, out = land_pr()
+        post = [c for c in land_pr.calls if "POST" in c and any(x.endswith("/reviews") for x in c)]
+        check("M7: the approval is a REST review pinned to the head",
+              [(f"repos/{REPO}/pulls/1/reviews" in c, f"commit_id={head}" in c, "event=APPROVE" in c) for c in post], [(True, True, True)])
+        rows = [json.loads(x) for x in log_file.read_text().splitlines()] if log_file.exists() else []
+        check("T5: approve-only writes its landings row", [(r.get("approve_only"), r.get("head"), r.get("approver")) for r in rows],
+              [(True, head, "bot")])
+        rc, did, out = land_pr(moves=True)
+        check("M7: a head that moved during the approval exits non-zero, not readied",
+              (rc != 0, "head moved" in out, did), (True, True, ["status", "review"]))
+        rc, did, out = land_pr(reviews=f"bot {head}", moves=False)
+        check("M7: a deduped approval still exits 0", rc, 0)
+    with section("M2 approve once"):
+        rc, did, out = land_pr("CLEAN", reviews=f"bot {head}", flag=False, merges=True)
+        check("M2: a land of a head already approved posts no second approval", (rc, did), (0, ["status", "ready"]))
+        rc, did, out = land_pr("CLEAN", flag=False, merges=True)
+        check("M2: a land of an unapproved head approves once", (rc, did.count("review")), (0, 1))
+    with section("M3 land_pr"):
+        for result in ("SKIPPED", "NEUTRAL"):
+            rc, did, out = land_pr("CLEAN", flag=False, merges=True, check_result=result, batch=True)
+            check(f"M3: a batch land passes a required check that ended {result}", (rc, "review" in did), (0, True))
+            rc, did, out = land_pr("CLEAN", flag=False, merges=True, check_result=result)
+            check(f"M3: a PR land still stops on {result}", (rc != 0, did), (True, []))
 
 print("\nFAILED: " + ", ".join(fails) if fails else "\nall batch landing checks passed")
 sys.exit(1 if fails else 0)

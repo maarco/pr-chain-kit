@@ -1,6 +1,6 @@
 """Merge-flow batch on the board: GET /api/batch (open batch, none, missing, broken), batch-* ledger rows without a
 pr field next to the APIs the main page calls, and the Merge-Flow Batch panel in the page. Stubs only: no gh, no network."""
-import http.server, importlib.machinery, importlib.util, json, os, pathlib, shutil, sys, tempfile, threading, time, urllib.request
+import http.server, importlib.machinery, importlib.util, json, os, pathlib, re, shutil, sys, tempfile, threading, time, urllib.request
 sys.dont_write_bytecode = True
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 WORK = pathlib.Path(tempfile.mkdtemp(prefix="batchwork--"))
@@ -114,6 +114,15 @@ st, ctype, html = get("/")
 assert st == 200 and "text/html" in ctype, (st, ctype)
 assert "Merge-Flow Batch" in html and 'id="batch"' in html and "/api/batch" in html
 assert "batch-ready" in bd.PAGE and "in batch #" in bd.PAGE and "BATCH-READY" in bd.PAGE
+
+# the page starts the batch poll and repeats it
+assert re.search(r"(?m)(^|;)batchTick\(\);setInterval\(batchTick,\s*\d+\)", bd.PAGE), "the page never polls /api/batch"
+
+# a row appended after the first read is served: the cache follows the ledger
+with open(WORK / "ledger.jsonl", "a") as fh:
+    fh.write("\n" + json.dumps({"stage": "batch-close", "batch": 1530, "prs": [1501], "why": "appended later"}) + "\n")
+b = batch_api()
+assert b["recent"][0].get("why") == "appended later" and len(b["recent"]) == 10, b["recent"][0]
 
 srv.shutdown()
 srv.server_close()
