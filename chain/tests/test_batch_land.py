@@ -374,7 +374,10 @@ with section("verify refuses"):
     pc.batch_step(ARGS)
     merge_flow.verify = real_verify
     check("verify problems: nothing lands", (w.lands, st(1)["status"]), ([], "BATCH-READY"))
-    check("verify problems: the batch PR stays open", (w.prs[900]["state"], w.batch()["pr"]), ("OPEN", 900))
+    closed = [c[c.index("--comment") + 1] for c in w.writes() if c[:2] == ("pr", "close")]
+    check("verify problems: the batch closes with the problems as the reason, one strike",
+          (w.prs[900]["state"], w.batch()["pr"], ["not the approved heads" in r and "\n" not in r for r in closed],
+           list((st(1).get("batch_strikes") or {}).values())), ("CLOSED", None, [True], [1]))
 
 with section("red of two splits"):
     w = World(); h1, h2 = w.pr(1, {"f1.py": "1\n"}), w.pr(2, {"f2.py": "2\n"})
@@ -922,8 +925,8 @@ with section("M10: every batch row says why"):
     pc.batch_step(ARGS)
     merge_flow.verify = real_verify
     pc.land = lambda pr, head, reviewer, approve_only=False: "LAND-FAILED: STOP: approval refused"
-    pc.batch_step(ARGS)
-    w.prs[900]["checks"] = "FAILURE"; pc.batch_step(ARGS)  # split
+    pc.batch_step(ARGS); w.prs[901]["checks"] = "SUCCESS"; pc.batch_step(ARGS)
+    w.prs[901]["checks"] = "FAILURE"; pc.batch_step(ARGS)  # split
     whys = [r.get("why", "") for r in LEDGER_ROWS if r["stage"] == "batch-land"]
     check("M10: the verify row carries the problems", any("not the approved heads" in x for x in whys), True)
     check("M10: the refused-land row carries the error", any("approval refused" in x for x in whys), True)
@@ -1037,6 +1040,71 @@ with section("gap: verify and the window's files"):
     problems = merge_flow.verify(w.repo, w.base, heads, window)
     check("verify: clean merges in another order with other files are refused",
           problems, ["the window's files differ from the listed heads merged onto base"])
+
+# ---------------------------------------------------------------- final review (P, Q)
+with section("P: a member's check is not green"):
+    for result in ("PENDING", "MISSING"):
+        w = World(); w.pr(1, {"f1.py": "1\n"}); h2 = w.pr(2, {"f2.py": "2\n"})
+        pc.batch_step(ARGS)
+        w.prs[900]["checks"] = "SUCCESS"; w.prs[1]["checks"] = result
+        pc.batch_step(ARGS)
+        check(f"P ({result}): nothing lands, the batch closes, #1 runs its chain, #2 is planned again",
+              (w.lands, w.prs[900]["state"], [(c["pr"], c["seed"]) for c in w.chains], (w.batch() or {}).get("heads")),
+              ([], "CLOSED", [(1, None)], {"2": h2}))
+        check(f"P ({result}): a one-line reason names the member and says not green",
+              ["#1" in r and "#2" not in r and "not green" in r and "\n" not in r for r in closes(w)], [True])
+
+
+def close_timeout(w, num):
+    age_batch(w, pc.LIM["ci_wait_max_minutes"] + 5)
+    return pc.batch_step(ARGS)
+
+
+def close_tries(w, num):
+    w.prs[num]["checks"] = "SUCCESS"
+    pc.land = lambda pr, head, reviewer, approve_only=False: "LAND-FAILED: STOP: approval refused"
+    pc.batch_step(ARGS)
+    return pc.batch_step(ARGS)
+
+
+def close_by_hand(w, num):
+    w.prs[num]["state"] = "CLOSED"
+    w.g("update-ref", "-d", f"refs/heads/{w.prs[num]['branch']}", cwd=w.up)  # or a replan in this second hits its name
+    return pc.batch_step(ARGS)
+
+
+def close_verify(w, num):
+    w.prs[num]["checks"] = "SUCCESS"
+    real = merge_flow.verify
+    merge_flow.verify = lambda *a: ["not the approved heads"]
+    try:
+        return pc.batch_step(ARGS)
+    finally:
+        merge_flow.verify = real
+
+
+for kind, trigger, reason in (("timeout", close_timeout, "checks did not finish"), ("land tries", close_tries, "did not land in 2 tries"),
+                              ("closed by hand", close_by_hand, "found CLOSED"), ("verify", close_verify, "not the approved heads")):
+    with section(f"Q: {kind}, same head twice"):
+        w = World(); h1 = w.pr(1, {"f1.py": "1\n"})
+        pc.batch_step(ARGS); trigger(w, 900)
+        first = (st(1)["status"], (st(1).get("batch_strikes") or {}).get(h1), w.batch().get("pr"))
+        check(f"Q ({kind}): the first close is one strike, the member waits", first, ("BATCH-READY", 1, None))
+        pc.batch_step(ARGS)
+        again = (creates(w), w.batch().get("heads"))
+        rows = trigger(w, 901)
+        pc.batch_step(ARGS)
+        check(f"Q ({kind}): planned again, then the second close rests it with the reason, no third batch",
+              (again, st(1)["status"], reason in st(1).get("why", ""), (st(1).get("batch_strikes") or {}).get(h1), rows,
+               creates(w), w.batch().get("pr"), w.chains),
+              ((2, {"1": h1}), "RESTING", True, 2, [(1, "RESTING")], 2, None, []))
+    with section(f"Q: {kind}, a new push"):
+        w = World(); h1 = w.pr(1, {"f1.py": "1\n"})
+        pc.batch_step(ARGS); trigger(w, 900)
+        h2 = w.push(1, {"f1.py": "new\n"}); w.ready(1)
+        pc.batch_step(ARGS); trigger(w, 901)
+        check(f"Q ({kind}): a new head starts at 0",
+              (st(1)["status"], (st(1).get("batch_strikes") or {}).get(h2)), ("BATCH-READY", 1))
 
 # ---------------------------------------------------------------- land_pr.py --approve-only, against a fake gh on PATH
 with section("land_pr.py"):
