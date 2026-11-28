@@ -81,11 +81,11 @@ approved = APPROVE_ONLY and f"{approver} {head}" in gh(
 if not approved:
     gh(approver, "pr", "review", number, "-R", REPO, "--approve", "--body", f"Reviewed at {head}")
 print("already approved by" if approved else "approved as", approver)
-if APPROVE_ONLY:
-    sys.exit(0)
-if s["isDraft"]:
+if s["isDraft"]:  # approve-only too: a live batch landed PRs that were ready and approved
     gh(kit.MERGER, "pr", "ready", number, "-R", REPO)
     print("marked ready")
+if APPROVE_ONLY:
+    sys.exit(0)
 time.sleep(int(os.environ.get("LAND_PAUSE", "0")))  # gives the dry-run bot time to log its decision
 ready_at = time.time()
 
