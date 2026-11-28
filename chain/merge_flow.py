@@ -3,8 +3,9 @@
 Ready PRs keep their heads. Every PR is checked against main, and every pair of PRs that
 shares a path is merged with ``git merge-tree`` (seconds, no CI). A clash marks the later
 PR for a fix, after any fix it depends on. The rest pair up by shared files into one
-combined commit, which merges onto main as the window commit. Merges are git objects
-only: nothing is pushed and nothing is written to GitHub.
+combined commit, which merges onto main as the window commit. The planner writes nothing:
+its merges are local git objects only. ``--open`` pushes the window and opens a PR;
+``--land`` approves and merges it.
 
     merge-flow                       # every ready PR
     merge-flow --prs 1450,1458       # just these
@@ -263,7 +264,7 @@ def window_body(base: str, heads: dict[int, str], issues: list[int] | None = Non
     issue_lines = f"{refs}\n\n" if refs else ""
     return (
         f"Lands {len(heads)} approved PRs in one merge onto `{base[:12]}`. Each PR keeps its reviewed head; "
-        f"this PR adds no change of its own (checked by `merge-flow --land`).\n\n"
+        f"this PR adds no change of its own (verified by pr-chain before the merge).\n\n"
         f"{issue_lines}| PR | Head |\n| --- | --- |\n{rows}\n\n{_MARKER}{data} -->\n"
     )
 

@@ -94,15 +94,21 @@ an approved PR's branch is left alone:
 1. A chain ends `BATCH-READY`: the status and the approval are posted at the audited head; nothing is merged.
 2. `resume` plans the ready PRs on current main (`chain/merge_flow.py`, `git merge-tree` only) and opens one batch PR.
    GitHub marks each PR in it merged when the batch PR merges.
-3. Green checks: the batch commit is verified to be exactly the approved heads on main, then approved and merged.
-4. Main moves or a PR gets a new push: the batch PR is closed and planned again. A pushed PR runs its chain again.
-5. Red checks: the PRs are split in half and each half gets its own batch; a single red PR goes to a fixer.
+3. Green checks (`SKIPPED` and `NEUTRAL` pass): the batch commit is verified to be exactly the approved heads on main,
+   then approved and merged. A batch whose checks do not finish in `ci_wait_max_minutes`, or that fails to land twice, is
+   closed and planned again.
+4. Main moves or a PR gets a new push: the batch PR is closed and planned again. A pushed PR runs its chain again. A
+   batch PR closed by someone else is planned again on the next lap.
+5. Red checks: the PRs are split in half and each half gets its own batch; a single red PR goes to a fixer, and rests
+   when the same head is red a second time.
 6. A PR that clashes with main, or whose base is older than the limit, takes main through the chain. A PR that clashes
    only with another ready PR (or is stacked on another branch) waits; `batch.json` in the work folder lists it as held.
 
 While a PR waits, `<work>/exclude.txt` keeps it out of batches (it stays `BATCH-READY`). A hold or blocking label, a
 removed human-approval label, a draft or a withdrawn review ends it `NEEDS-PERSON`. Either one closes an open batch
 that holds the PR. A batch PR turned into a draft is left alone until it is ready again.
+
+Known limit: if main moves faster than one batch's CI takes, batches keep restarting and none lands.
 
 | `[land]` key | Default | Meaning |
 | --- | --- | --- |

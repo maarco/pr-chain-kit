@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Approve, ready and merge one PR at an exact head. Stops on anything unexpected. Prints no tokens.
 
-Usage: land_pr.py <number> <full head sha> <approver account> <reviewed sha> <reviewer and verdict source> [--approve-only]
---approve-only (batch landing): the same checks without the BEHIND/DIRTY stop, then the status and the approval (none
-when the approver already approved this head), and exit 0 before marking ready or merging.
+Usage: land_pr.py <number> <full head sha> <approver account> <reviewed sha> <reviewer and verdict source> [--approve-only] [--batch]
+--approve-only (batch landing): the same checks without the BEHIND/DIRTY stop, then the status and an approval tied to
+the exact head (STOP "head moved" when it moved meanwhile); marks a draft ready, then exits 0; never merges.
+--batch (the batch PR itself): a required check that ended SKIPPED or NEUTRAL passes.
+In every mode there is no second approval when the approver already approved this head.
 WRITES to GitHub: a review/independent commit status, an approval (as the approver), ready-for-review and the merge
 (as KIT_MERGER); appends to $KIT_WORK/landings.jsonl.
 Refuses unless the reviewed sha IS the head. Appends PR, head, base, reviewer, the CI run links of the required
