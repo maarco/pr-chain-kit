@@ -432,6 +432,20 @@ with section("member retargeted off main"):
     check("retarget: #1 leaves the batch; #2 goes in the next one and #1 stays held",
           (st(1).get("batch"), w.batch().get("pr"), w.batch().get("heads"), w.batch().get("held")), (None, 901, {"2": h2}, [1]))
 
+with section("batch PR retargeted off main"):
+    w = World(); h1, h2 = w.pr(1, {"f1.py": "1\n"}), w.pr(2, {"f2.py": "2\n"})
+    pc.batch_step(ARGS)
+    w.prs[900]["checks"] = "SUCCESS"
+    w.prs[900]["base"] = "release"  # the batch PR itself is aimed at another base; its checks are green
+    pc.batch_step(ARGS)
+    reasons = [c[c.index("--comment") + 1] for c in w.writes() if c[:2] == ("pr", "close")]
+    check("batch retarget: nothing lands", w.lands, [])
+    check("batch retarget: the batch PR closes with a one-line reason that names the retarget",
+          (w.prs[900]["state"], reasons), ("CLOSED", [f"Closed: the batch PR was retargeted off {pc.CFG.branch}; planning again."]))
+    check("batch retarget: ledger batch-close", [r["batch"] for r in ledger_rows("batch-close")], [900])
+    check("batch retarget: both members stay BATCH-READY", (st(1)["status"], st(2)["status"]), ("BATCH-READY", "BATCH-READY"))
+    check("batch retarget: the members are planned again", (w.batch().get("pr"), w.batch().get("heads")), (901, {"1": h1, "2": h2}))
+
 with section("changes requested in an open batch"):
     w = World(); w.pr(1, {"f1.py": "1\n"}); h2 = w.pr(2, {"f2.py": "2\n"})
     pc.batch_step(ARGS)
