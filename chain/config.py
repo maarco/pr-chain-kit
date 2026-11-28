@@ -15,9 +15,11 @@ from __future__ import annotations
 import os
 import json
 import logging
+import math
 import re
 import shutil
 import stat
+import subprocess
 import tempfile
 import tomllib
 from pathlib import Path
@@ -140,8 +142,15 @@ class Cfg:
         if self.land_mode not in ("pr", "batch"):
             logging.getLogger(__name__).warning('pr-chain.toml [land] mode = %r is not "pr" or "batch"; using "pr"', self.land_mode)
             self.land_mode = "pr"
-        self.max_base_age_hours = float(land.get("max_base_age_hours", 48))
+        age = land.get("max_base_age_hours", 48)
+        if type(age) not in (int, float) or not (math.isfinite(age) and age >= 0):
+            raise SystemExit(f"pr-chain.toml [land] max_base_age_hours = {age!r}: it must be a finite number, 0 or more")
+        self.max_base_age_hours = float(age)
         self.batch_branch_prefix = str(land.get("batch_branch_prefix") or "merge-flow/batch")
+        # only a value from the file is checked: loading the defaults needs no git
+        if land.get("batch_branch_prefix") and subprocess.run(
+                ["git", "check-ref-format", "--branch", f"{self.batch_branch_prefix}-x"], capture_output=True).returncode:
+            raise SystemExit(f"pr-chain.toml [land] batch_branch_prefix = {self.batch_branch_prefix!r}: not a valid git branch prefix")
 
         self.gh = str(tools.get("gh") or "")  # [tools] gh: the gh binary; empty = the first gh on PATH
         self.agent_env = dict(agent.get("env", {}))
