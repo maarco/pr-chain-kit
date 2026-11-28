@@ -713,6 +713,33 @@ with section("K: cap"):
            sorted(map(int, b["heads"])) == sorted([r["number"] for r in pc.rank([p for p in pc.list_prs() if p["number"] < 900])][:20])),
           (20, [], [], "BATCH-READY", "BATCH-READY", True))
 
+with section("L: excluded while it waits"):
+    for line in ("1 operator hold", "branch:pr1 owned by someone else"):
+        w = World(); w.pr(1, {"f1.py": "1\n"}); h2 = w.pr(2, {"f2.py": "2\n"})
+        pc.batch_step(ARGS)
+        w.prs[900]["checks"] = "SUCCESS"; pc.EXCLUDE.write_text(line + "\n")
+        pc.batch_step(ARGS)
+        check(f"L ({line.split()[0]}): the open batch closes, nothing lands, #2 is planned without #1",
+              (w.lands, w.prs[900]["state"], st(1)["status"], (w.batch() or {}).get("heads"), w.chains),
+              ([], "CLOSED", "BATCH-READY", {"2": h2}, []))
+        w.prs[901]["checks"] = "SUCCESS"; pc.batch_step(ARGS); w.push(1, {"f1.py": "new\n"}); pc.batch_step(ARGS)
+        check(f"L ({line.split()[0]}): skipped each lap, even after a push",
+              ([p for p, _, _ in w.lands], st(1)["status"], (w.batch() or {}).get("heads"), w.chains),
+              ([901], "BATCH-READY", None, []))
+    w = World(); h1 = w.pr(1, {"f1.py": "1\n"}); pc.EXCLUDE.write_text("1 operator hold\n")
+    pc.batch_step(ARGS)
+    held = (creates(w), st(1)["status"])
+    pc.EXCLUDE.write_text(""); pc.batch_step(ARGS)
+    check("L: planned again once the exclusion is removed", (held, (w.batch() or {}).get("heads")), ((0, "BATCH-READY"), {"1": h1}))
+    w = World(); w.pr(1, {"f1.py": "1\n"})
+    pc.batch_step(ARGS); w.prs[900]["checks"] = "FAILURE"
+    die_after(w, "close"); lap_that_dies()
+    pc.EXCLUDE.write_text("1 operator hold\n"); pc.batch_step(ARGS)
+    held = (w.chains[:], creates(w))
+    pc.EXCLUDE.write_text(""); pc.batch_step(ARGS)
+    check("L: an owed fixer seed waits out the exclusion",
+          (held, [(c["pr"], bool(c["seed"])) for c in w.chains]), (([], 1), [(1, True)]))
+
 # ---------------------------------------------------------------- resume and doctor
 with section("resume"):
     w = World(); w.pr(1, {"f1.py": "1\n"})
