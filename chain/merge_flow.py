@@ -148,14 +148,18 @@ def plan(repo: Path, base: str, heads: list[Head], agents: int = FIX_AGENTS) -> 
     roots, levels = _build_tree(repo, window)
     roots.sort(key=lambda n: -len(n["prs"]))
     window_commit, landed, held = None, [], []
-    current = base
-    for node in roots:
-        sha = merge(repo, current, node["sha"], f"merge-flow: land {len(node['prs'])} PRs")
+    for k, node in enumerate(roots):  # one root per window: a second merge would not sit directly on base (verify)
+        sha = merge(repo, base, node["sha"], f"merge-flow: land {len(node['prs'])} PRs")
         if sha is None:
             held += node["prs"]
             continue
-        current, window_commit = sha, sha
-        landed += node["prs"]
+        window_commit, landed = sha, node["prs"]
+        waiting = [n for other in roots[k + 1 :] for n in other["prs"]]
+        if waiting:  # plan again with this root's PRs only, so verify's replay builds the same tree; the rest wait
+            alone = plan(repo, base, [h for h in window if h.number in landed], agents)
+            window_commit, landed, levels = alone["window_commit"], alone["landed"], alone["levels"]
+            held = [h.number for h in window if h.number not in landed]
+        break
 
     per_depth = [sum(1 for d in depth.values() if d == lv) for lv in range(1, max(depth.values(), default=0) + 1)]
     fix_rounds = sum(math.ceil(n / agents) for n in per_depth)
@@ -174,15 +178,20 @@ def plan(repo: Path, base: str, heads: list[Head], agents: int = FIX_AGENTS) -> 
     }
 
 
-def _latest(checks: list[dict[str, Any]]) -> dict[str, bool]:
-    """Pass or fail per check name, newest run only: a rerun replaces the run before it."""
-    latest: dict[str, bool] = {}
+def latest_results(checks: list[dict[str, Any]]) -> dict[str, str | None]:
+    """The result per check name, newest run only: a rerun replaces the run before it, and a queued one is newest."""
+    latest: dict[str, str | None] = {}
     for check in sorted(
         checks, key=lambda c: (c.get("startedAt") is None, c.get("startedAt") or "")
     ):  # queued = newest
         name = check.get("name") or check.get("context") or ""
-        latest[name] = (check.get("conclusion") or check.get("state")) == "SUCCESS"
+        latest[name] = check.get("conclusion") or check.get("state")
     return latest
+
+
+def _latest(checks: list[dict[str, Any]]) -> dict[str, bool]:
+    """Pass or fail per check name on its newest run."""
+    return {name: result == "SUCCESS" for name, result in latest_results(checks).items()}
 
 
 def green(rollup: list[dict[str, Any]], required: tuple[str, ...]) -> bool:
