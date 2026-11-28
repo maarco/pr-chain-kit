@@ -1095,7 +1095,7 @@ function paintBatch(){if(!batchS)return;const o=batchS.open,rd=batchS.ready||[],
  $('btc').textContent=o?'#'+o.pr+' open':rd.length+' batch-ready';
  let h;
  if(o){const q=[].concat(o.queue??[]).filter(g=>[].concat(g).length),when=o.opened&&!isNaN(Date.parse(o.opened))?' · opened '+ago(o.opened)+' ago':'';
-  h=`<table><tr><td class="k"><a href="/prs#${esc(o.pr)}" title="${esc(o.url||'')}">#${esc(o.pr)}</a></td><td class="f k" colspan="2">${esc(o.branch||'')}${when}</td></tr>`
+  h=`<table><tr><td class="k"><a href="${esc(o.url||'#')}" target="_blank" rel="noopener">#${esc(o.pr)}</a></td><td class="f k" colspan="2">${esc(o.branch||'')}${when}</td></tr>`
    +Object.entries(o.heads||{}).map(([n,sha])=>`<tr><td class="k"><a href="/prs#${esc(n)}">#${esc(n)}</a></td><td class="f k">${esc(String(sha).slice(0,8))}</td><td></td></tr>`).join('')
    +(q.length?`<tr><td class="d">queue</td><td class="k" colspan="2">${q.map(g=>plink(g)).join(' · ')}</td></tr>`:'')
    +([].concat(o.held??[]).length?`<tr><td class="d">held</td><td class="k" colspan="2">${plink(o.held)}</td></tr>`:'')+'</table>'}
