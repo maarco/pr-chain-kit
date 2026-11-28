@@ -3233,6 +3233,8 @@ def batch_landed(b, rows):
                    why=f"#{n} head {head[:8]} is missing from {CFG.branch}; it stays BATCH-READY")
             continue  # batch_clear below clears its batch field
         rows.append((n, die(n, "MERGED", f"landed in merge-flow batch #{b['pr']}")))
+    # a merged batch branch stays on GitHub (it is not deleted on merge): drop it; errors ignored
+    sh("git", "-C", str(CHECKOUT), "push", "-q", "origin", f":refs/heads/{b['branch']}")
     batch_clear(b)
 
 
@@ -3298,6 +3300,8 @@ def batch_open_step(b, live, ready, rows, chains, stacked, skip=None):
                 b = dict(b, red=batch_strikes(b, f"batch #{num} was found {view['state']}", skip))
                 batch_save(b)
             ledger(stage="batch-close", batch=num, prs=sorted(int(n) for n in b["heads"]), why=f"found {view['state']}")
+            # closed by hand, so batch_close did not drop the branch: drop it here too; errors ignored
+            sh("git", "-C", str(CHECKOUT), "push", "-q", "origin", f":refs/heads/{b['branch']}")
             return batch_settle_red(b, rows), ours
         return dict(b, pr=None), ours
     if view.get("isDraft"):  # a person holds it: no ready, no merge, no close, no second batch
