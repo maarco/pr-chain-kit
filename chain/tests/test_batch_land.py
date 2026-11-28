@@ -356,6 +356,22 @@ with section("merged batch, a head not on main"):
     check("merged batch: a batch-land row marks #2 missing",
           [(r["batch"], r["prs"]) for r in ledger_rows("batch-land") if r.get("missing")], [(900, [2])])
 
+with section("batch branch: dropped when it merges"):
+    w = World(); w.pr(1, {"f1.py": "1\n"}); w.pr(2, {"f2.py": "2\n"})
+    pc.batch_step(ARGS); w.prs[900]["checks"] = "SUCCESS"
+    check("merged branch: on the remote before the batch lands", w.remote_batches(), [w.batch()["branch"]])
+    pc.batch_step(ARGS)
+    check("merged branch: the batch PR is MERGED", w.prs[900]["state"], "MERGED")
+    check("merged branch: the batch branch is gone from the remote", w.remote_batches(), [])
+
+with section("batch branch: dropped when closed by hand"):
+    w = World(); w.pr(1, {"f1.py": "1\n"})
+    pc.batch_step(ARGS)
+    check("hand-closed branch: on the remote before the close", w.remote_batches(), [w.batch()["branch"]])
+    w.prs[900]["state"] = "CLOSED"  # closed by hand: nothing deletes the branch but the chain
+    pc.batch_step(ARGS)
+    check("hand-closed branch: the batch branch is gone from the remote", w.remote_batches(), [])
+
 with section("land refused"):
     for msg, closed in (("LAND-FAILED: STOP: #900 is BEHIND", True),
                         ("LAND-FAILED: GraphQL: the head branch is not up to date with the base branch", True), ("LAND-FAILED: STOP: approval refused", False)):
