@@ -785,7 +785,7 @@ def needs_main(head, main):
 def pr_info(pr):
     return gh_json("pr", "view", str(pr), "-R", REPO, "--json",
                    "number,state,title,body,isDraft,headRefName,headRefOid,mergeStateStatus,author,isCrossRepository,"
-                   "closingIssuesReferences,files,baseRefName")
+                   "closingIssuesReferences,files,baseRefName,reviewDecision")
 
 
 def live_head(pr):
@@ -3238,6 +3238,14 @@ def batch_plan(b, live, ready, skip, stacked, rows, chains):
     batch_save(opened)
 
 
+def approval_withdrawn(info):
+    """Why a BATCH-READY PR's approval no longer stands on GitHub, or None: a draft, changes requested, or an approval
+    dismissed (review required again). An empty reviewDecision (no review required) withdraws nothing."""
+    if info.get("isDraft"):
+        return "draft"
+    return {"CHANGES_REQUESTED": "changes requested", "REVIEW_REQUIRED": "approval dismissed"}.get(info.get("reviewDecision") or "")
+
+
 def batch_step(a):
     """One lap of batch landing. Returns resume's (pr, outcome) rows. Chains it starts (a new push, a PR that must take
     main, a red batch of one) run last, so a landing never waits behind an hour of agents."""
@@ -3271,6 +3279,14 @@ def batch_step(a):
                 log(f"{'[dry] ' if DRY else ''}#{n} has a new push since its approval: it leaves the batch flow")
                 chains.append((n, None))
                 skip.add(n)
+            elif (why := approval_withdrawn(info)):  # a person decides; an open batch that holds it closes as changed
+                note = f"approval withdrawn after BATCH-READY: {why}; a person decides"
+                if DRY:
+                    log(f"[dry] #{n} would end NEEDS-PERSON: {note}")
+                else:
+                    rows.append((n, die(n, "NEEDS-PERSON", note)))
+                del ready[n]  # not planned; a batch member with no ready entry counts as changed (batch_open_step)
+                skip.add(n)  # DRY writes nothing, so batch_ready() still lists it after the open batch closes
         plan_now = True
         if b.get("pr"):
             for n in b["heads"]:  # a PR of the batch that stopped waiting (a manual run, closed) counts as changed
