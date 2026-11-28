@@ -405,6 +405,20 @@ with section("left the batch"):
     pc.batch_step(ARGS)
     check("a closed PR ends CLOSED and closes the batch", (st(2)["status"], w.prs[901]["state"], w.batch()["pr"]), ("CLOSED", "CLOSED", None))
 
+with section("member retargeted off main"):
+    w = World(); w.pr(1, {"f1.py": "1\n"}); h2 = w.pr(2, {"f2.py": "2\n"})
+    pc.batch_step(ARGS)
+    w.prs[900]["checks"] = "SUCCESS"
+    w.prs[1]["base"] = "release"  # the same head, now aimed at another base
+    pc.batch_step(ARGS)
+    reasons = [c[c.index("--comment") + 1] for c in w.writes() if c[:2] == ("pr", "close")]
+    check("retarget: nothing lands", w.lands, [])
+    check("retarget: the batch PR closes with a one-line reason that names #1",
+          (w.prs[900]["state"], [("\n" not in r, "#1" in r) for r in reasons]), ("CLOSED", [(True, True)]))
+    check("retarget: ledger batch-close", [r["batch"] for r in ledger_rows("batch-close")], [900])
+    check("retarget: #1 leaves the batch; #2 goes in the next one and #1 stays held",
+          (st(1).get("batch"), w.batch().get("pr"), w.batch().get("heads"), w.batch().get("held")), (None, 901, {"2": h2}, [1]))
+
 with section("pair clash"):
     w = World(); h1 = w.pr(1, {"a.py": "one\n"}); w.pr(2, {"a.py": "two\n"})
     pc.batch_step(ARGS)
