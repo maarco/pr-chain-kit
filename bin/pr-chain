@@ -350,11 +350,24 @@ def exclusion(n, branch):
     return None
 
 
+def batch_pr_reason(n, branch=""):
+    """"merge-flow batch PR" when PR n is the open batch PR (batch.json) or sits on a batch branch, else None. The chain
+    never works on one: `resume` owns it (batch_step)."""
+    try:
+        b = json.loads(BATCH.read_text())
+    except (OSError, ValueError):
+        b = None
+    named = isinstance(b, dict) and b.get("pr") == n
+    return "merge-flow batch PR" if named or (branch or "").startswith(CFG.batch_branch_prefix + "-") else None
+
+
 def owner_reason(p, ps_text):
     """Why the PR is not free to take, or None. Heuristic: a running agent, a live claim, a fresh push, an unfinished lane."""
     n = p["number"]
     if p["author"]["login"] not in OUR_AUTHORS:
         return "not ours: outside contributor PR, the chain never touches it"
+    if why := batch_pr_reason(n, p.get("headRefName", "")):  # before state_path: it gets no work folder either
+        return why
     if why := exclusion(n, p.get("headRefName", "")):
         return why
     claim = CLAIMS / str(n)
@@ -371,7 +384,7 @@ def owner_reason(p, ps_text):
                 return f"needs a person: remove the {NEEDS_PERSON_LABEL} label to let the chain try again ({st.get('why', '')[:50]})"
             released = True  # run_chain starts the counters over
         if st.get("status") == "BATCH-READY":  # at any head: `resume` owns it and reruns the chain itself after a new push
-            return "approved; waits for a merge-flow batch"
+            return "approved; waits for a merge-flow batch" if CFG.land_mode == "batch" else "approved; resume lands it"
         if st.get("status") == "AWAIT-HUMAN":  # at any head: `pr-chain resume` owns it and reruns the chain itself when the PR's own code moved
             return "waiting for the human gate (approve with the human-approved label, or comment)"
         if st.get("status") == "WAITING-CI" and not st.get("ci_settled"):  # settled: resume handed it to the next free thread
@@ -1659,7 +1672,7 @@ def land(pr, head, reviewer, approve_only=False):
         log(f"[dry] would {'approve' if approve_only else 'land'} #{pr} at {head[:8]}: approver {approver}, merger {kit.MERGER}")
         return "DRY"
     p = sh(sys.executable, str(ROOT / "agent-kit" / "land" / "land_pr.py"), str(pr), head, approver, head, reviewer,
-           *(["--approve-only"] if approve_only else []), timeout=1500)
+           *(["--approve-only"] if approve_only else []), *(["--batch"] if batch_pr_reason(pr) else []), timeout=1500)
     ledger(pr=pr, stage="approve" if approve_only else "land", rc=p.returncode, tail=(p.stdout + p.stderr)[-400:])
     if p.returncode:
         return "LAND-FAILED: " + (p.stdout + p.stderr)[-200:]
@@ -1852,6 +1865,15 @@ def run_chain(pr, a, from_gate=False, approved=None, seed=None):
     for k in ("max_rounds", "max_audits", "max_ui"):  # --max-rounds -1 and friends: no limit, on both paths
         if isinstance(getattr(a, k, None), int) and getattr(a, k) < 0:
             setattr(a, k, math.inf)
+    why = batch_pr_reason(pr)
+    if not why:
+        try:
+            why = batch_pr_reason(pr, pr_info(pr).get("headRefName", ""))
+        except Exception:  # noqa: BLE001 - unreadable: the run's own lookup reports it
+            pass
+    if why:  # no claim, no STATE: nothing of this PR is the chain's
+        log(f"#{pr} {why}: the chain leaves it to resume")
+        return "BATCH-PR"
     if os.environ.get("PR_CHAIN_ENGINE", "py") == "flow":
         return chain_engine.run(globals(), pr, a, from_gate=from_gate, approved=approved, seed=seed)
     return _run_chain_py(pr, a, from_gate, approved, seed)
@@ -2930,7 +2952,7 @@ def resume_all(a):
         try:
             info = pr_info(pr)
             if info["state"] != "OPEN":
-                results.append((pr, die(pr, "CLOSED", f"PR is {info['state']}")))
+                results.append((pr, die(pr, "MERGED" if info["state"] == "MERGED" else "CLOSED", f"PR is {info['state']}")))
                 continue
             if info["author"]["login"] not in OUR_AUTHORS:
                 results.append((pr, die(pr, "NOT-OURS", "outside contributor PR: the chain only works on PRs opened by our own accounts")))
@@ -2941,6 +2963,10 @@ def resume_all(a):
                 continue
             if st["status"] == "BATCH-READY":  # rolled back to mode "pr": land it on its own
                 same = branch_head(info) == st.get("gate_head")
+                # the same order as batch_step: a new push reruns the chain; otherwise a withdrawn approval needs a person
+                if (same or held_label(info)) and (why := approval_withdrawn(info, st)):
+                    results.append((pr, die(pr, "NEEDS-PERSON", f"approval withdrawn after BATCH-READY: {why}; a person decides")))
+                    continue
                 log(f"#{pr} BATCH-READY in mode pr; {'landing' if same else 'head moved, running the chain again'}")
                 results.append((pr, run_chain(pr, a, approved=st if same else None)))
                 continue
@@ -3024,6 +3050,9 @@ def resume_all(a):
 # ---------------------------------------------------------------- batch landing ([land] mode = "batch")
 BATCH = WORK / "batch.json"  # the open batch PR, the queue of split halves and the held PRs; the board reads it
 BATCH_RED = ("FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE")
+BATCH_PASS = ("SUCCESS", "SKIPPED", "NEUTRAL")  # a required check of the batch PR that ended so passes, as on GitHub
+BATCH_LAND_TRIES = 2  # failed lands of one batch commit before the batch closes
+BATCH_REDS = 2  # red batches of one for the same head before the PR rests instead of getting another fixer
 merge_flow._gh = lambda *args: sh("gh", *args, check=True).stdout  # the kit's gh ([tools] gh); a failure is a RuntimeError
 
 
@@ -3036,6 +3065,30 @@ def batch_ready():
             if st.get("status") == "BATCH-READY":
                 found[int(sp.parent.name)] = st
     return dict(sorted(found.items()))
+
+
+def pr_list_text(prs):
+    return ", ".join(f"#{n}" for n in prs) or "none"
+
+
+def batch_plan_row(**kw):
+    """A batch-plan ledger row, written only when its result differs from the previous batch-plan row's."""
+    same = ("prs", "landed", "held", "refresh", "error", "why")
+    last = None
+    try:
+        with open(LEDGER) as fh:
+            for ln in fh:
+                if '"batch-plan"' in ln:
+                    try:
+                        r = json.loads(ln)
+                    except ValueError:
+                        continue
+                    if r.get("stage") == "batch-plan":
+                        last = r
+    except OSError:
+        pass
+    if last is None or any(last.get(k) != kw.get(k) for k in same):
+        ledger(stage="batch-plan", batch=None, **kw)
 
 
 def batch_save(b):
@@ -3057,7 +3110,7 @@ def batch_clear(b):
     return after
 
 
-def batch_settle_red(b):
+def batch_settle_red(b, rows):
     """The batch PR is closed: what its red checks decided (split halves, or one PR for a fixer) takes effect."""
     red = b.get("red") or {}
     b = {k: v for k, v in b.items() if k != "red"}
@@ -3065,6 +3118,13 @@ def batch_settle_red(b):
         b["queue"] = red["queue"]
     if "fix" in red:
         b["fix"] = (b.get("fix") or []) + [red["fix"]]
+    if "count" in red:  # counted only once the batch PR is closed, so a close that is retried counts once
+        c = red["count"]
+        path = state_path(c["pr"])
+        reds = (json.loads(path.read_text()) if path.exists() else {}).get("batch_reds") or {}
+        set_state(c["pr"], batch_reds={**reds, c["head"]: c["n"]})
+    if "rest" in red:
+        rows.append((red["rest"]["pr"], die(red["rest"]["pr"], "RESTING", red["rest"]["why"])))
     return batch_clear(b)
 
 
@@ -3102,7 +3162,8 @@ def batch_opened(b):
     prs = sorted(int(n) for n in b["heads"])
     for n in prs:
         set_state(n, batch=b["pr"])
-    ledger(stage="batch-open", batch=b["pr"], prs=prs, base=b["base"], commit=b["commit"])
+    ledger(stage="batch-open", batch=b["pr"], prs=prs, base=b["base"], commit=b["commit"],
+           why=f"opened for {pr_list_text(prs)} on {CFG.branch} {b['base'][:8]}")
     log(f"batch #{b['pr']} opened for {', '.join(f'#{n}' for n in prs)}")
 
 
@@ -3127,7 +3188,7 @@ def batch_landed(b, rows):
     if DRY:
         log(f"[dry] batch #{b['pr']} is merged: {', '.join(f'#{n}' for n in prs)} would end MERGED")
         return
-    ledger(stage="batch-land", batch=b["pr"], prs=prs, state="MERGED")
+    ledger(stage="batch-land", batch=b["pr"], prs=prs, state="MERGED", why=f"batch #{b['pr']} merged")
     sh("git", "-C", str(CHECKOUT), "fetch", "-q", "origin", CFG.branch, check=True)
     ready = batch_ready()
     for n in prs:
@@ -3140,15 +3201,16 @@ def batch_landed(b, rows):
             continue
         if sh("git", "-C", str(CHECKOUT), "merge-base", "--is-ancestor", head, f"origin/{CFG.branch}").returncode:
             log(f"#{n} is not on {CFG.branch}: batch #{b['pr']} merged without {head[:8]}; #{n} stays BATCH-READY")
-            ledger(stage="batch-land", batch=b["pr"], prs=[n], missing=True)
+            ledger(stage="batch-land", batch=b["pr"], prs=[n], missing=True,
+                   why=f"#{n} head {head[:8]} is missing from {CFG.branch}; it stays BATCH-READY")
             continue  # batch_clear below clears its batch field
         rows.append((n, die(n, "MERGED", f"landed in merge-flow batch #{b['pr']}")))
     batch_clear(b)
 
 
-def batch_red(b, bad, rollup, live):
-    """Red batch CI. Several PRs: close it and queue both halves. One PR: close it and hand that PR to a fixer. The
-    decision is saved before the PR closes, so a lap that dies in between still carries it out."""
+def batch_red(b, bad, rollup, live, rows):
+    """Red batch CI. Several PRs: close it and queue both halves. One PR: close it and hand that PR to a fixer, or rest
+    it when the same head was red before. The decision is saved before the PR closes, so a lap that dies in between still carries it out."""
     prs = sorted(int(n) for n in b["heads"])
     names = ", ".join(bad)
     why = f"Closed: required checks failed ({names})."
@@ -3162,25 +3224,36 @@ def batch_red(b, bad, rollup, live):
         b = dict(b, red=dict(queue=halves + (b.get("queue") or [])))
         batch_save(b)
         if batch_close(b, why):
-            ledger(stage="batch-split", batch=b["pr"], prs=prs, groups=halves, failed=bad)
-            batch_settle_red(b)
+            ledger(stage="batch-split", batch=b["pr"], prs=prs, groups=halves, failed=bad,
+                   why=f"required checks failed ({names}); split into {' and '.join(pr_list_text(h) for h in halves)}")
+            batch_settle_red(b, rows)
         return
-    n = prs[0]
+    n, head = prs[0], b["heads"][str(prs[0])]
+    path = state_path(n)
+    count = ((json.loads(path.read_text()) if path.exists() else {}).get("batch_reds") or {}).get(head, 0) + 1
     if DRY:
         batch_close(b, why)
-        log(f"[dry] would hand #{n} to a fixer: it fails {names} with main merged in")
+        log(f"[dry] would {f'rest #{n}' if count >= BATCH_REDS else f'hand #{n} to a fixer'}: it fails {names} with main merged in")
         return
+    counted = dict(pr=n, head=head, n=count)
     urls = sorted({u for c in rollup if (c.get("name") or c.get("context")) in bad
                    and (u := c.get("detailsUrl") or c.get("targetUrl"))})
-    d = state_path(n).parent
+    if count >= BATCH_REDS:
+        rest = f"red in a batch of one {count} times at this head: {names} ({' '.join(urls) or 'no run URL'})"
+        b = dict(b, red=dict(count=counted, rest=dict(pr=n, why=rest)))
+        batch_save(b)
+        if batch_close(b, why):
+            batch_settle_red(b, rows)
+        return
+    d = path.parent
     seed = d / f"batch-red-{int(time.time())}.md"
     seed.write_text(f"FAIL\nhead {live[n]}\nFindings:\n- P1 batch-ci:0 - the batch PR #{b['pr']} (this PR merged with main at "
                     f"{b['base']}) failed {names} ({' '.join(urls) or 'no run URL'}) - merge main into this branch, reproduce the "
                     "failure and fix it red-first, or end BLOCKED with the evidence\n")
-    b = dict(b, red=dict(fix=dict(pr=n, seed=str(seed), head=live[n])))
+    b = dict(b, red=dict(count=counted, fix=dict(pr=n, seed=str(seed), head=live[n])))
     batch_save(b)
     if batch_close(b, why):
-        batch_settle_red(b)
+        batch_settle_red(b, rows)
 
 
 def batch_open_step(b, live, ready, rows, chains, stacked, skip=None):
@@ -3191,10 +3264,11 @@ def batch_open_step(b, live, ready, rows, chains, stacked, skip=None):
         batch_landed(b, rows)
         return b, False
     if view["state"] != "OPEN":
+        ours = bool(b.get("red"))  # a lap closed it for red checks and died before saving that; anyone else's close waits a lap
         if not DRY:
             ledger(stage="batch-close", batch=num, prs=sorted(int(n) for n in b["heads"]), why=f"found {view['state']}")
-            return batch_settle_red(b), True
-        return dict(b, pr=None), True
+            return batch_settle_red(b, rows), ours
+        return dict(b, pr=None), ours
     if view.get("isDraft"):  # a person holds it: no ready, no merge, no close, no second batch
         if not b.get("draft"):
             log(f"{'[dry] ' if DRY else ''}batch #{num} is a draft: a person is holding it; left as it is")
@@ -3218,12 +3292,18 @@ def batch_open_step(b, live, ready, rows, chains, stacked, skip=None):
             return b, False
         return (dict(b, pr=None) if DRY else batch_clear(b)), True
     rollup = view.get("statusCheckRollup") or []
-    res = kit.check_results(rollup)
+    res = merge_flow.latest_results(rollup)
     bad = [c for c in kit.CHECKS if res.get(c) in BATCH_RED]
     if bad:
-        batch_red(b, bad, rollup, live)
+        batch_red(b, bad, rollup, live, rows)
         return b, False
-    if any(res.get(c) != "SUCCESS" for c in kit.CHECKS):
+    unfinished = [c for c in kit.CHECKS if res.get(c) not in BATCH_PASS]
+    if unfinished:
+        limit = LIM["ci_wait_max_minutes"]
+        if time.time() - calendar.timegm(time.strptime(b["opened"], "%Y-%m-%dT%H:%M:%SZ")) > limit * 60:
+            if batch_close(b, f"Closed: checks did not finish in {limit} min ({', '.join(unfinished)}); planning again."):
+                return (dict(b, pr=None) if DRY else batch_clear(b)), False
+            return b, False
         log(f"{'[dry] ' if DRY else ''}batch #{num}: waiting for its checks")
         return b, False
     heads = {int(n): sha for n, sha in b["heads"].items()}
@@ -3232,11 +3312,11 @@ def batch_open_step(b, live, ready, rows, chains, stacked, skip=None):
     if problems:
         log(f"{'[dry] ' if DRY else ''}batch #{num} is not landed: {'; '.join(problems)}")
         if not DRY:  # left open and unmerged: main moving or a new push closes it
-            ledger(stage="batch-land", batch=num, prs=sorted(heads), problems=problems)
+            ledger(stage="batch-land", batch=num, prs=sorted(heads), problems=problems, why="not landed: " + "; ".join(problems))
         return b, False
     red = []  # the batch's checks do not speak for a member whose own required check turned red since its approval
     for n in sorted(heads):
-        res = kit.check_results(gh_json("pr", "view", str(n), "-R", REPO, "--json", "statusCheckRollup")["statusCheckRollup"] or [])
+        res = merge_flow.latest_results(gh_json("pr", "view", str(n), "-R", REPO, "--json", "statusCheckRollup")["statusCheckRollup"] or [])
         if any(res.get(c) in BATCH_RED for c in kit.CHECKS):
             red.append(n)
     if red:
@@ -3250,15 +3330,26 @@ def batch_open_step(b, live, ready, rows, chains, stacked, skip=None):
     if DRY:
         log(f"[dry] would land batch #{num} at {b['commit'][:8]} ({reviewers})")
         return b, False
-    r = land(num, b["commit"], f"merge-flow batch of {reviewers}")
-    if r.startswith("MERGED") and pr_state(num) == "MERGED":
-        batch_landed(b, rows)
-    elif r.startswith("LAND-FAILED") and re.search(r"is (BEHIND|DIRTY)|not up to date with the base branch", r):
-        if batch_close(b, f"Closed: {CFG.branch} moved while the batch landed; planning again."):
+    commit = b["commit"]
+    tries = (b.get("land_tries") or {}).get(commit, 0)
+    if tries < BATCH_LAND_TRIES:  # at the limit only a close is left (an earlier one failed)
+        r = land(num, commit, f"merge-flow batch of {reviewers}")
+        if r.startswith("MERGED") and pr_state(num) == "MERGED":
+            batch_landed(b, rows)
+            return b, False
+        if r.startswith("LAND-FAILED") and re.search(r"is (BEHIND|DIRTY)|not up to date with the base branch", r):
+            if batch_close(b, f"Closed: {CFG.branch} moved while the batch landed; planning again."):
+                batch_clear(b)
+            return b, False
+        tries += 1
+        error = " ".join(r.split())[:300]
+        b = dict(b, land_tries={commit: tries}, land_error=error)
+        batch_save(b)
+        log(f"batch #{num} did not land (try {tries} of {BATCH_LAND_TRIES}): {error}")
+        ledger(stage="batch-land", batch=num, prs=sorted(heads), why=f"did not land (try {tries} of {BATCH_LAND_TRIES}): {error}")
+    if tries >= BATCH_LAND_TRIES:
+        if batch_close(b, f"Closed: the batch did not land in {tries} tries ({b.get('land_error', '')[:160]}); planning again."):
             batch_clear(b)
-    else:
-        log(f"batch #{num} did not land: {r}")
-        ledger(stage="batch-land", batch=num, prs=sorted(heads), result=r[:300])
     return b, False
 
 
@@ -3280,29 +3371,34 @@ def batch_plan(b, live, ready, skip, stacked, rows, chains):
     order = [r["number"] for r in rank([p for p in list_prs() if p["number"] in cands])]
     order += [n for n in cands if n not in order]
     stacked = stacked & set(cands)
-    sh("git", "-C", str(CHECKOUT), "fetch", "-q", "origin", CFG.branch,
-       *(f"+refs/pull/{n}/head:refs/merge-flow/pr/{n}" for n in order), check=True)
+    sh("git", "-C", str(CHECKOUT), "fetch", "-q", "origin", CFG.branch, check=True)
     main = sh("git", "-C", str(CHECKOUT), "rev-parse", f"origin/{CFG.branch}", check=True).stdout.strip()
-    heads, refresh = [], []
+    heads, refresh, errors = [], [], {}
     for n in order:
         sha = cands[n]
         if n in stacked:
             continue
         if len(heads) == 20:  # ponytail: cap 20 per batch; raise if planning time allows
             break
-        on_main = sh("git", "-C", str(CHECKOUT), "merge-base", "--is-ancestor", sha, main).returncode == 0
-        if not on_main and needs_main(sha, main):  # clashes with main, or too old: the chain takes main in
-            refresh.append(n)
-            continue
-        heads.append(merge_flow.Head(n, sha, merge_flow.changed_files(CHECKOUT, main, sha)))
+        try:  # one unreadable head is held with its error; the others still plan
+            sh("git", "-C", str(CHECKOUT), "fetch", "-q", "origin", f"+refs/pull/{n}/head:refs/merge-flow/pr/{n}", check=True)
+            on_main = sh("git", "-C", str(CHECKOUT), "merge-base", "--is-ancestor", sha, main).returncode == 0
+            if not on_main and needs_main(sha, main):  # clashes with main, or too old: the chain takes main in
+                refresh.append(n)
+                continue
+            heads.append(merge_flow.Head(n, sha, merge_flow.changed_files(CHECKOUT, main, sha)))
+        except (RuntimeError, ValueError) as e:
+            errors[n] = " ".join(str(e).split())[:200]
     result = merge_flow.plan(CHECKOUT, main, heads)
     landed = {h.number: h.sha for h in heads if h.number in result["landed"]}
-    held = sorted({f["pr"] for f in result["needs_fix"]} | set(result["held"]) | set(stacked))
+    held = sorted({f["pr"] for f in result["needs_fix"]} | set(result["held"]) | set(stacked) | set(errors))
     tag = "[dry] " if DRY else ""
+    failed = "".join(f"; #{n} held: {e}" for n, e in sorted(errors.items()))
     log(f"{tag}batch plan on {main[:8]}: lands {sorted(landed)}, held {held}, takes main {refresh}, "
-        f"already on {CFG.branch} {result['already_on_base']}")
+        f"already on {CFG.branch} {result['already_on_base']}{failed}")
     if not DRY:
-        ledger(stage="batch-plan", batch=None, prs=order, landed=sorted(landed), held=held, refresh=refresh, base=main)
+        batch_plan_row(prs=order, landed=sorted(landed), held=held, refresh=refresh, base=main,
+                       why=f"lands {pr_list_text(sorted(landed))}; held {pr_list_text(held)}; takes main {pr_list_text(refresh)}{failed}")
         for n in result["already_on_base"]:
             rows.append((n, die(n, "MERGED", f"its head is already on {CFG.branch}")))
     chains += [(n, None) for n in refresh]
@@ -3426,7 +3522,7 @@ def batch_step(a):
     except (RuntimeError, ValueError, KeyError) as e:  # one bad lap ends no PR: the next one looks again
         log(f"batch step failed: {str(e)[:300]}")
         if not DRY:
-            ledger(stage="batch-plan", batch=None, prs=[], error=str(e)[:300])
+            batch_plan_row(prs=[], error=str(e)[:300], why=f"batch step failed: {str(e)[:300]}")
     for n, seed in chains:
         if STOPFILE.exists():
             break
