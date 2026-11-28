@@ -102,3 +102,6 @@ field_guide = ""
 
 [notify]
 command = ""                         # pages you when the loop is down (called with one message argument); empty = off
+
+[updates]
+enabled = false                       # opt in to stable GitHub release updates (managed installations only)

@@ -17,6 +17,8 @@ jobs:
         os: [ubuntu-latest, macos-latest]
         python: ["3.11", "3.13"]
     runs-on: ${{ matrix.os }}
+    # A hung leg fails here after 30 minutes instead of holding the ci/tests gate for six hours.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -38,6 +40,7 @@ jobs:
 
   package:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
@@ -47,3 +50,15 @@ jobs:
           uvx twine check dist/*
           uvx --from dist/*.whl pr-chain --help
           uvx --from dist/*.whl pr-chain path
+
+  # The chain requires the check named ci/tests (pr-chain.toml [accounts] checks). This job runs always and fails itself
+  # unless every job it needs passed: a skipped job is not SUCCESS to the chain, so the chain would wait on it forever.
+  gate:
+    name: ci/tests
+    needs: [tests, package]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Every job it needs passed
+        run: test "${{ needs.tests.result }}" = success && test "${{ needs.package.result }}" = success

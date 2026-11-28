@@ -122,7 +122,8 @@ check("claude stream-json profiles pass --verbose", sorted(k for k, v in cmds.it
 # the builder stops at max_open_prs chain PRs (11-17: a CI jam made every PR WAITING-CI, so auto built 23 new PRs);
 # outside authors' PRs don't count
 pc.WORK.mkdir(parents=True, exist_ok=True)
-real_gh, real_claim, cap = pc.gh_json, pc.claim, pc.LIM["max_open_prs"]
+real_gh, real_claim, cap, real_floor = pc.gh_json, pc.claim, pc.LIM["max_open_prs"], pc.DISK_FLOOR_GB
+pc.DISK_FLOOR_GB = 0  # the floor reads this host's free disk; these checks are about the cap (test_drift covers the floor)
 pc.claim = lambda key: False  # under the cap the builder goes on to claim: stop it there
 pc.LIM["max_open_prs"] = 3
 pc.gh_json = lambda *a: [{"author": {"login": "owner"}}] * 2 + [{"author": {"login": "bot"}}] + [{"author": {"login": "someone"}}] * 9
@@ -131,7 +132,7 @@ pc.gh_json = lambda *a: [{"author": {"login": "owner"}}] * 2 + [{"author": {"log
 check("builder: under the cap it goes on (outside PRs don't count)", pc.build_issue(1, None), "CLAIMED")
 pc.LIM["max_open_prs"] = math.inf
 check("builder: max_open_prs -1 never caps", pc.build_issue(1, None), "CLAIMED")
-pc.gh_json, pc.claim, pc.LIM["max_open_prs"] = real_gh, real_claim, cap
+pc.gh_json, pc.claim, pc.LIM["max_open_prs"], pc.DISK_FLOOR_GB = real_gh, real_claim, cap, real_floor
 
 # an approved PR whose required CI is red goes through the normal run (rerun or fixer), not the landing shortcut (#1184 11-16)
 saved = {k: getattr(pc, k) for k in ("human_signal", "ci_red", "DRY", "main_flake_rerun")}

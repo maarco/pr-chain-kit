@@ -84,6 +84,7 @@ class Cfg:
         trip = data.get("tripwire", {})
         proj = data.get("project", {})
         notify = data.get("notify", {})
+        updates = data.get("updates", {})
         tools = data.get("tools", {})
         land = data.get("land", {})
         self.limits = dict(data.get("limits", {}))  # overrides flow.json limits.<name>.value, e.g. prs_at_once = 12
@@ -169,6 +170,7 @@ class Cfg:
         self.merge_checks = [dict(name=c["name"], match=tuple(c.get("match", ["*"])), cmd=list(c["cmd"]),
                                   timeout=int(c.get("timeout", 900))) for c in data.get("merge_checks", [])]
         self.notify_cmd = notify.get("command", "")  # pages the operator when the loop is down; empty = no page
+        self.updates_enabled = bool(updates.get("enabled", False))
 
 
 CFG = Cfg()                       # unconfigured: nothing is read until configure() or configure_standalone() runs
@@ -219,6 +221,16 @@ def ensure_standalone() -> Cfg:
     """For a script run on its own (a land script, the janitor): configure from the file and environment unless a host
     or an earlier call already did."""
     return CFG if CONFIGURED else configure_standalone()
+
+
+def updates_enabled() -> bool:
+    """Read the opt-in toggle fresh so `pr-chain updates disable` takes effect in a live loop."""
+    if CFG_PATH is None or not CFG_PATH.is_file():
+        return False
+    try:
+        return bool(tomllib.loads(CFG_PATH.read_text()).get("updates", {}).get("enabled", False))
+    except (OSError, tomllib.TOMLDecodeError):
+        return False
 
 
 def configure(settings: dict, data_dir) -> Cfg:

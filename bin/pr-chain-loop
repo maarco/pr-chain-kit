@@ -45,6 +45,16 @@ STOP = WORK / "STOP"
 ROW = re.compile(r"^\s*(\d+)\s+\d+\s+\S+\s+\S+\s+\S+\s+FREE\s*$")
 IDLE = 20  # seconds between looks when nothing is free (was 10 min; 11-14)
 tries = {}  # pr -> [timestamps]
+UPDATE_ROOT = None
+UPDATE_MODULE = None
+UPDATE_RELEASE = Path(__file__).resolve().parents[1]
+try:
+    kit_root = Path(config.__file__).resolve().parents[1]
+    sys.path.insert(0, str(kit_root))
+    from pr_chain_kit import updates as UPDATE_MODULE
+    UPDATE_ROOT = UPDATE_MODULE.root_for(kit_root / "pr_chain_kit")
+except Exception:
+    UPDATE_MODULE = None
 
 
 def say(msg):
@@ -157,6 +167,15 @@ def main():
     last_resume = 0.0
     next_auto = 0.0  # earliest time a new `auto` may start after one ended having built nothing (11-16)
     while not STOP.exists():
+        if UPDATE_ROOT is not None and config.updates_enabled():
+            try:
+                result = UPDATE_MODULE.maybe_update(UPDATE_ROOT)
+                if result:
+                    say(f"release update {result['status']}: installed {result['installed_version']}, "
+                        f"available {result.get('available_version') or 'none'}"
+                        + (f" ({result['error']})" if result.get("error") else ""))
+            except Exception as exc:
+                say(f"release update check failed safely: {exc}")
         for pr in [n for n, v in running.items() if v[0].poll() is not None]:
             p, log, pos = running.pop(pr)
             say(f"#{pr} ended {ended(pr, p, log, pos)}")
@@ -204,6 +223,11 @@ def main():
         if others and others != last_others:
             say(f"{others} chain(s) this loop did not start still out; they count against the {limit} thread(s)")
         last_others = others
+        if UPDATE_ROOT is not None and not running and not others:
+            selected = (UPDATE_ROOT / "current").resolve()
+            if selected != UPDATE_RELEASE:
+                say(f"all chains are idle; restarting loop on {selected.name}")
+                os.execv(sys.executable, [sys.executable, "-B", str(selected / "bin" / "pr-chain-loop")])
         if running or others:
             nap(10)
         else:

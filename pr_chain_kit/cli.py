@@ -16,6 +16,7 @@ USAGE = """usage: pr-chain <command> [args]
   board [port]         the read-only board (default http://127.0.0.1:8790)
   loop                 run continuously
   janitor              remove worktrees of finished PRs
+  updates              status | check | enable | disable | install <directory>
   path                 print where the kit's files live
   <other>              any bin/pr-chain subcommand (pr-chain help lists them)
 """
@@ -77,6 +78,36 @@ def main():
         return init(args[1:])
     if cmd == "path":
         print(KIT)
+        return
+    if cmd == "updates":
+        from . import updates
+        action = args[1] if len(args) > 1 else "status"
+        if action == "install" and len(args) == 3:
+            version = updates.install(Path(args[2]), KIT, HERE)
+            print(f"managed installation ready at {Path(args[2]).expanduser().absolute()} ({version}); add its bin directory to PATH")
+            return
+        root = updates.root_for(HERE)
+        if action == "enable":
+            if root is None:
+                sys.exit("release updates require an explicit managed installation; run `pr-chain updates install <directory>` first")
+            updates.set_enabled(True)
+            print("stable release updates enabled; managed loops check at most every 6 hours")
+            return
+        if action == "disable":
+            updates.set_enabled(False)
+            print("stable release updates disabled")
+            return
+        if root is None:
+            sys.exit("release updates require an explicit managed installation; run `pr-chain updates install <directory>`")
+        if action == "check":
+            result = updates.update(root)
+        elif action == "status":
+            result = updates.status(root)
+        else:
+            sys.exit("usage: pr-chain updates [status|check|enable|disable|install <directory>]")
+        available = result.get("available_version") or ("none" if result.get("status") == "no-release" else "unknown")
+        print(f"installed={result.get('installed_version', '?')} available={available} "
+              f"status={result.get('status', 'unknown')}" + (f" error={result['error']}" if result.get("error") else ""))
         return
     script = KIT / "bin" / SCRIPTS.get(cmd, "pr-chain")
     rest = args[1:] if cmd in SCRIPTS else args

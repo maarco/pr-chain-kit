@@ -130,6 +130,29 @@ nohup pr-chain board 8790 >> "<work>/logs/board.log" 2>&1 &
   Save Prompt on `/wiki` writes your copy in `prompts/` beside your config (old text in `prompts/.history/`);
   from a clone it edits `chain/prompts/` directly.
 
+## Stable release updates
+
+Updates default off and require an explicit managed installation. Ordinary checkouts, `uvx`, `uv tool`, and `pipx`
+installs are unsupported for automatic replacement and remain untouched. Create a separate managed installation,
+put its `bin/` directory on PATH, and point the loop/board service at that command:
+
+```bash
+pr-chain updates install ~/.local/share/pr-chain/managed
+export PATH="$HOME/.local/share/pr-chain/managed/bin:$PATH"
+pr-chain updates enable
+pr-chain updates status
+```
+
+The destination must not already exist. If your existing setup uses `PR_CHAIN_CONFIG`, keep that environment value
+for the managed command; a checkout-local `pr-chain.local.toml` is not copied into the managed release.
+
+An enabled managed loop checks the latest stable GitHub release at most every six hours. Loops serialize staging
+and activation. New work uses the activated immutable version; active chains stay pinned to the version they started
+with, then an idle loop replaces itself on the new version. A running board stays on its starting version until
+restarted. Previous versions are retained. `pr-chain updates check` retries immediately; `pr-chain updates disable`
+turns automatic checks off. Status reports installed and available versions and any error. See [the managed update
+spec](specs/17-managed-updates.md) for the trust, recovery and unsupported-platform details.
+
 ## Guards
 
 - Ours only: PRs whose author is not in `[accounts] authors` are never touched (`NOT-OURS`).
