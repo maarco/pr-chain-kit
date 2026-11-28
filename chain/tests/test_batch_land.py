@@ -148,6 +148,7 @@ class World:
     def land(self, pr, head, reviewer, approve_only=False):
         self.lands.append((pr, head, reviewer))
         self.prs[pr]["state"] = "MERGED"
+        self.g("update-ref", "refs/heads/main", head, cwd=self.up)  # a merge puts the window's history on main
         return "MERGED"
 
     def writes(self):
@@ -326,11 +327,23 @@ with section("open and land"):
 with section("merged elsewhere"):
     w = World(); w.pr(1, {"f1.py": "1\n"}); w.pr(2, {"f2.py": "2\n"})
     pc.batch_step(ARGS)
+    w.g("update-ref", "refs/heads/main", w.batch()["commit"], cwd=w.up)  # merged by hand: the window is on main
     for n in (1, 2, 900):
         w.prs[n]["state"] = "MERGED"
     pc.batch_step(ARGS)
     check("batch merged between laps: PRs end MERGED", (st(1)["why"], st(2)["status"], w.batch()["pr"], w.lands),
           ("landed in merge-flow batch #900", "MERGED", None, []))
+
+with section("merged batch, a head not on main"):
+    w = World(); h1 = w.pr(1, {"f1.py": "1\n"}); w.pr(2, {"f2.py": "2\n"})
+    pc.batch_step(ARGS)
+    w.g("push", "-q", "origin", f"{h1}:refs/heads/main")  # main got #1's approved head, not #2's
+    w.prs[900]["state"] = "MERGED"
+    pc.batch_step(ARGS)
+    check("merged batch: #1 ends MERGED", (st(1)["status"], st(1)["why"]), ("MERGED", "landed in merge-flow batch #900"))
+    check("merged batch: #2 stays BATCH-READY with no batch", (st(2)["status"], st(2).get("batch")), ("BATCH-READY", None))
+    check("merged batch: a batch-land row marks #2 missing",
+          [(r["batch"], r["prs"]) for r in ledger_rows("batch-land") if r.get("missing")], [(900, [2])])
 
 with section("land refused"):
     for msg, closed in (("LAND-FAILED: STOP: #900 is BEHIND", True), ("LAND-FAILED: STOP: approval refused", False)):
