@@ -3053,6 +3053,7 @@ BATCH_RED = ("FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "S
 BATCH_PASS = ("SUCCESS", "SKIPPED", "NEUTRAL")  # a required check of the batch PR that ended so passes, as on GitHub
 BATCH_LAND_TRIES = 2  # failed lands of one batch commit before the batch closes
 BATCH_REDS = 2  # red batches of one for the same head before the PR rests instead of getting another fixer
+BATCH_STRIKES = 2  # closes that would repeat (see batch_strikes) at the same head before the PR rests
 merge_flow._gh = lambda *args: sh("gh", *args, check=True).stdout  # the kit's gh ([tools] gh); a failure is a RuntimeError
 
 
@@ -3111,7 +3112,7 @@ def batch_clear(b):
 
 
 def batch_settle_red(b, rows):
-    """The batch PR is closed: what its red checks decided (split halves, or one PR for a fixer) takes effect."""
+    """The batch PR is closed: what was decided with the close (split halves, one PR for a fixer, strikes) takes effect."""
     red = b.get("red") or {}
     b = {k: v for k, v in b.items() if k != "red"}
     if "queue" in red:
@@ -3125,7 +3126,34 @@ def batch_settle_red(b, rows):
         set_state(c["pr"], batch_reds={**reds, c["head"]: c["n"]})
     if "rest" in red:
         rows.append((red["rest"]["pr"], die(red["rest"]["pr"], "RESTING", red["rest"]["why"])))
+    for c in red.get("strikes") or []:
+        path = state_path(c["pr"])
+        strikes = (json.loads(path.read_text()) if path.exists() else {}).get("batch_strikes") or {}
+        set_state(c["pr"], batch_strikes={**strikes, c["head"]: c["n"]})
+        if c["n"] >= BATCH_STRIKES:
+            rows.append((c["pr"], die(c["pr"], "RESTING", red["why"])))
     return batch_clear(b)
+
+
+def batch_strikes(b, why, skip):
+    """For a close that would repeat (no member changed, main did not move): one strike for each member that still waits
+    at its batch head."""
+    ready, found = batch_ready(), []
+    for n, head in sorted((int(n), sha) for n, sha in b["heads"].items()):
+        st = ready.get(n)
+        if st and n not in (skip or ()) and st.get("gate_head") == head:
+            found.append(dict(pr=n, head=head, n=(st.get("batch_strikes") or {}).get(head, 0) + 1))
+    return dict(strikes=found, why=why)
+
+
+def batch_end(b, comment, rows, red=None):
+    """Close the batch PR. What the close decides is saved first, so a lap that dies after it still carries it out; with
+    no strikes it still marks the close as ours. Returns the state left behind, or None when the PR could not be closed."""
+    b = dict(b, red=red or dict(strikes=[]))
+    batch_save(b)
+    if not batch_close(b, comment):
+        return None
+    return dict(b, pr=None) if DRY else batch_settle_red(b, rows)
 
 
 def batch_forget_fix(n):
@@ -3264,8 +3292,11 @@ def batch_open_step(b, live, ready, rows, chains, stacked, skip=None):
         batch_landed(b, rows)
         return b, False
     if view["state"] != "OPEN":
-        ours = bool(b.get("red"))  # a lap closed it for red checks and died before saving that; anyone else's close waits a lap
+        ours = bool(b.get("red"))  # a lap closed it and died before saving that; anyone else's close waits a lap
         if not DRY:
+            if not ours:
+                b = dict(b, red=batch_strikes(b, f"batch #{num} was found {view['state']}", skip))
+                batch_save(b)
             ledger(stage="batch-close", batch=num, prs=sorted(int(n) for n in b["heads"]), why=f"found {view['state']}")
             return batch_settle_red(b, rows), ours
         return dict(b, pr=None), ours
@@ -3288,9 +3319,8 @@ def batch_open_step(b, live, ready, rows, chains, stacked, skip=None):
            else f"Closed: {', '.join(f'#{n}' for n in aimed)} retargeted off {CFG.branch}; planning again." if aimed
            else "Closed: the batch branch no longer holds the planned commit." if view["headRefOid"] != b["commit"] else None)
     if why:
-        if not batch_close(b, why):
-            return b, False
-        return (dict(b, pr=None) if DRY else batch_clear(b)), True
+        after = batch_end(b, why, rows)
+        return (b, False) if after is None else (after, True)
     rollup = view.get("statusCheckRollup") or []
     res = merge_flow.latest_results(rollup)
     bad = [c for c in kit.CHECKS if res.get(c) in BATCH_RED]
@@ -3301,9 +3331,9 @@ def batch_open_step(b, live, ready, rows, chains, stacked, skip=None):
     if unfinished:
         limit = LIM["ci_wait_max_minutes"]
         if time.time() - calendar.timegm(time.strptime(b["opened"], "%Y-%m-%dT%H:%M:%SZ")) > limit * 60:
-            if batch_close(b, f"Closed: checks did not finish in {limit} min ({', '.join(unfinished)}); planning again."):
-                return (dict(b, pr=None) if DRY else batch_clear(b)), False
-            return b, False
+            why = f"checks did not finish in {limit} min ({', '.join(unfinished)})"
+            after = batch_end(b, f"Closed: {why}; planning again.", rows, batch_strikes(b, why, skip))
+            return (b if after is None else after), False
         log(f"{'[dry] ' if DRY else ''}batch #{num}: waiting for its checks")
         return b, False
     heads = {int(n): sha for n, sha in b["heads"].items()}
@@ -3311,21 +3341,24 @@ def batch_open_step(b, live, ready, rows, chains, stacked, skip=None):
     problems = merge_flow.verify(CHECKOUT, b["base"], heads, b["commit"])
     if problems:
         log(f"{'[dry] ' if DRY else ''}batch #{num} is not landed: {'; '.join(problems)}")
-        if not DRY:  # left open and unmerged: main moving or a new push closes it
+        if not DRY:
             ledger(stage="batch-land", batch=num, prs=sorted(heads), problems=problems, why="not landed: " + "; ".join(problems))
-        return b, False
-    red = []  # the batch's checks do not speak for a member whose own required check turned red since its approval
+        why = "not landed: " + " ".join("; ".join(problems).split())[:300]
+        after = batch_end(b, f"Closed: {why}", rows, batch_strikes(b, why, skip))
+        return (b if after is None else after), False
+    red = []  # the batch's checks do not speak for a member whose own required check is not green now
     for n in sorted(heads):
         res = merge_flow.latest_results(gh_json("pr", "view", str(n), "-R", REPO, "--json", "statusCheckRollup")["statusCheckRollup"] or [])
-        if any(res.get(c) in BATCH_RED for c in kit.CHECKS):
+        if any(res.get(c) not in BATCH_PASS for c in kit.CHECKS):
             red.append(n)
     if red:
-        if not batch_close(b, f"Closed: required checks of {', '.join(f'#{n}' for n in red)} failed; planning again."):
+        after = batch_end(b, f"Closed: required checks of {', '.join(f'#{n}' for n in red)} not green; planning again.", rows)
+        if after is None:
             return b, False
         chains += [(n, None) for n in red]
         if skip is not None:
             skip.update(red)
-        return (dict(b, pr=None) if DRY else batch_clear(b)), True
+        return after, True
     reviewers = "; ".join(f"#{n}: {ready[n].get('reviewer') or 'reviewed'}" for n in sorted(heads))
     if DRY:
         log(f"[dry] would land batch #{num} at {b['commit'][:8]} ({reviewers})")
@@ -3338,8 +3371,7 @@ def batch_open_step(b, live, ready, rows, chains, stacked, skip=None):
             batch_landed(b, rows)
             return b, False
         if r.startswith("LAND-FAILED") and re.search(r"is (BEHIND|DIRTY)|not up to date with the base branch", r):
-            if batch_close(b, f"Closed: {CFG.branch} moved while the batch landed; planning again."):
-                batch_clear(b)
+            batch_end(b, f"Closed: {CFG.branch} moved while the batch landed; planning again.", rows)
             return b, False
         tries += 1
         error = " ".join(r.split())[:300]
@@ -3348,8 +3380,8 @@ def batch_open_step(b, live, ready, rows, chains, stacked, skip=None):
         log(f"batch #{num} did not land (try {tries} of {BATCH_LAND_TRIES}): {error}")
         ledger(stage="batch-land", batch=num, prs=sorted(heads), why=f"did not land (try {tries} of {BATCH_LAND_TRIES}): {error}")
     if tries >= BATCH_LAND_TRIES:
-        if batch_close(b, f"Closed: the batch did not land in {tries} tries ({b.get('land_error', '')[:160]}); planning again."):
-            batch_clear(b)
+        why = f"the batch did not land in {tries} tries ({b.get('land_error', '')[:160]})"
+        batch_end(b, f"Closed: {why}; planning again.", rows, batch_strikes(b, why, skip))
     return b, False
 
 

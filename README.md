@@ -95,10 +95,12 @@ an approved PR's branch is left alone:
 2. `resume` plans the ready PRs on current main (`chain/merge_flow.py`, `git merge-tree` only) and opens one batch PR.
    GitHub marks each PR in it merged when the batch PR merges.
 3. Green checks (`SKIPPED` and `NEUTRAL` pass): the batch commit is verified to be exactly the approved heads on main,
-   then approved and merged. A batch whose checks do not finish in `ci_wait_max_minutes`, or that fails to land twice, is
-   closed and planned again.
+   then approved and merged, unless a PR in it has a required check that is not green: then the batch is closed and that
+   PR runs its chain. A batch that fails that verification, whose checks do not finish in `ci_wait_max_minutes`, or that
+   fails to land twice, is closed too.
 4. Main moves or a PR gets a new push: the batch PR is closed and planned again. A pushed PR runs its chain again. A
-   batch PR closed by someone else is planned again on the next lap.
+   batch PR closed by someone else is planned again on the next lap. That close, like the three at the end of step 3,
+   is a strike for each waiting PR's head; a second strike at the same head rests the PR instead of planning it again.
 5. Red checks: the PRs are split in half and each half gets its own batch; a single red PR goes to a fixer, and rests
    when the same head is red a second time.
 6. A PR that clashes with main, or whose base is older than the limit, takes main through the chain. A PR that clashes
