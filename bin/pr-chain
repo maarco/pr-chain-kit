@@ -3113,7 +3113,7 @@ def batch_red(b, bad, rollup, live, chains):
 def batch_open_step(b, live, ready, rows, chains, stacked):
     """Look at the open batch PR. Returns the state left behind and whether this lap may plan a new batch."""
     num = b["pr"]
-    view = gh_json("pr", "view", str(num), "-R", REPO, "--json", "state,headRefOid,statusCheckRollup")
+    view = gh_json("pr", "view", str(num), "-R", REPO, "--json", "state,headRefOid,baseRefName,statusCheckRollup")
     if view["state"] == "MERGED":
         batch_landed(b, live, rows)
         return b, False
@@ -3126,7 +3126,9 @@ def batch_open_step(b, live, ready, rows, chains, stacked):
     main = sh("git", "-C", str(CHECKOUT), "rev-parse", f"origin/{CFG.branch}", check=True).stdout.strip()
     moved = [int(n) for n, sha in b["heads"].items() if live.get(int(n)) != sha or ready[int(n)].get("gate_head") != sha]
     aimed = [int(n) for n in b["heads"] if int(n) in stacked]  # a member retargeted off main counts as changed, as a new head does
-    why = (f"Closed: {CFG.branch} moved; a new batch is planned on the new {CFG.branch}." if main != b["base"]
+    # a batch PR aimed off main would land its members on that base: it closes before any check is read
+    why = (f"Closed: the batch PR was retargeted off {CFG.branch}; planning again." if view["baseRefName"] != CFG.branch
+           else f"Closed: {CFG.branch} moved; a new batch is planned on the new {CFG.branch}." if main != b["base"]
            else f"Closed: {', '.join(f'#{n}' for n in moved)} changed or left the batch; planning again." if moved
            else f"Closed: {', '.join(f'#{n}' for n in aimed)} retargeted off {CFG.branch}; planning again." if aimed
            else "Closed: the batch branch no longer holds the planned commit." if view["headRefOid"] != b["commit"] else None)
