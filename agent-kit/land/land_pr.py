@@ -110,6 +110,8 @@ while True:
     s = state()
     if s["headRefOid"] != head:
         sys.exit(f"STOP: head moved to {s['headRefOid']}")
+    if s["state"] == "MERGED":  # the bot merged it during this wait: landed (GitHub reports UNKNOWN, not CLEAN)
+        break
     if s["mergeStateStatus"] == "CLEAN":
         break
     red = {k for k, v in results(s).items() if v in ("FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED")}
