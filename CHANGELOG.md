@@ -7,6 +7,7 @@ change to `pr-chain.toml`, the `pr-chain` command or the work-folder layout bump
 ## [Unreleased]
 
 ### Added
+- `[land] mode = "batch"`: approved PRs end `BATCH-READY` with their branch left alone, and `resume` lands them together through one batch PR built on current main (#26).
 - A human approval stands across a push that changes no UI file: after the rerun passes review, audit and UI review,
   the gate moves to the new head, keeps the label and posts a note naming both heads, instead of asking again.
 - `[tools] gh` names the gh binary; unset, the first gh on PATH is used, then the old fixed paths. One resolver

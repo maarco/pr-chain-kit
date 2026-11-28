@@ -32,7 +32,8 @@ POLICY = {
     "free":   ["CLAIMED", "STOPPED"],                                   # always free again
     "rest":   ["RESTING"],                                              # models could not finish it: back after a timed rest
     "parked": ["POLICY-HOLD", "STUCK", "NEEDS-PERSON", "READY", "MERGED", "CLOSED", "NOT-OURS",  # a person or a new head
-               "CI-HEAD-MOVED", "AWAIT-HUMAN", "LAND-STOPPED", "WAITING-CI"],                   # the last two are `resume`'s job
+               "CI-HEAD-MOVED", "AWAIT-HUMAN", "LAND-STOPPED", "WAITING-CI",                    # the last two are `resume`'s job
+               "BATCH-READY"],                                                                  # `resume`'s batch step owns it
 }
 known = {s for v in POLICY.values() for s in v}
 text = src.read_text()
@@ -69,7 +70,7 @@ pc.set_state(N, head="h1"); pc.die(N, "RESTING", "x")
 check("die: rests start over at a new head", round((json.loads(pc.state_path(N).read_text()).get("rest_until", 0) - time.time()) / 3600), 1)
 for s in POLICY["parked"]:
     state(status=s, head="h0"); check(f"pick: {s} stays parked at the same head", free(), False)
-    if s not in ("AWAIT-HUMAN", "WAITING-CI"):  # `resume` owns both at any head
+    if s not in ("AWAIT-HUMAN", "WAITING-CI", "BATCH-READY"):  # `resume` owns these at any head
         check(f"pick: {s} is free at a new head", free(dict(P, headRefOid="h1")), True)
 state(status="ERROR", head="h0"); check("pick: an outside contributor PR is never free", free(dict(P, author={"login": "stranger"})), False)
 state(status="running", head="h0")
@@ -654,7 +655,7 @@ check("resume: the landing retry skips review and uses the stopped head", calls,
 calls.clear(); put(970, status="LAND-STOPPED", head="h0", why=DOD, land_tries={"h0": pc.LAND_TRIES})
 check(f"resume: LAND-STOPPED is left alone after {pc.LAND_TRIES} refused merges", (pc.resume_all(a), calls), ([], []))
 put(970, status="LAND-STOPPED", head="h0", why=DOD); infos[970] = mk(st="MERGED")
-check("resume: LAND-STOPPED on a PR merged elsewhere becomes CLOSED", pc.resume_all(a), [(970, "CLOSED")])
+check("resume: LAND-STOPPED on a PR merged elsewhere becomes MERGED", pc.resume_all(a), [(970, "MERGED")])
 put(1015, status="AWAIT-HUMAN", head="h0", gate_head="h0", gate_at="t"); infos[1015] = mk(author="stranger")
 check("resume: an outside PR waiting at the human gate becomes NOT-OURS (replay #1015)", pc.resume_all(a), [(1015, "NOT-OURS")])
 check("resume: the outside PR is not polled again", (pc.resume_all(a), calls), ([], []))

@@ -77,6 +77,7 @@ The brief an agent actually got is `brief.md` in its round folder under `<work>/
 | `STUCK` | rested several times with new findings in the same area; the chain filed a design issue and stopped | read `why` and the filed issue |
 | `NEEDS-PERSON` | a new push lifted STUCK more than `stuck_lifts_max` times and it came back each time; label `chain/needs-person` | a person reads `why`; removing the label restarts it with fresh counters |
 | `POLICY-HOLD` | the only fix breaks a project rule (history rewrite, force push), or the PR body declares a hold only its owner can lift | the owner decides; the chain does not retry |
+| `BATCH-READY` | `[land] mode = "batch"`: approved at the audited head | nothing: `resume` lands it in a batch PR |
 | `WAITING-CI` | everything passed, required checks still running; the slot is free | nothing: `resume` lands it when CI is green |
 | `CI-TIMEOUT` / `CI-RED` | required checks did not go green (a base flake was already rerun once) | nothing: the loop runs it again (3 per head); red required checks go to the fixer before any review |
 | `BUILD-FAILED` | the scratch UI stack did not build, or the UI reviewer answered `STACK-BROKEN` | the loop retries (3 per head); the fault is in the stack script or the app, not the PR |

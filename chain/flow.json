@@ -513,6 +513,7 @@
    "do": "land",
    "next": {
     "merged": "MERGED",
+    "batch_ready": "BATCH-READY",
     "retry": "land_try",
     "check_red": "CI-RED",
     "refused": "LAND-STOPPED"
@@ -532,6 +533,11 @@
    "resume": {
     "rerun_as_land": "land_audit"
    }
+  },
+  "BATCH-READY": {
+   "group": "waiting",
+   "means": "approved at the audited head; waits for a merge-flow batch",
+   "then": "resume lands it in a batch PR; a new push runs the chain again"
   },
   "AWAIT-HUMAN": {
    "group": "waiting",

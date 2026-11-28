@@ -1011,8 +1011,8 @@ pre{margin:0;font:10.5px/1.6 var(--mono);color:var(--muted);white-space:pre-wrap
 .rz.y{cursor:row-resize;height:9px}.rz.y::after{top:4px;left:40%;right:40%;height:2px}
 .rz:hover::after,.rz.on::after{background:var(--muted)}
 #stage.flat+.rz{display:none}
-#queue,#ended,#log{overflow-y:auto;scrollbar-width:thin;scrollbar-color:var(--raise) transparent}
-#queue{max-height:206px}#ended{max-height:190px}#log{max-height:122px}
+#queue,#ended,#batch,#log{overflow-y:auto;scrollbar-width:thin;scrollbar-color:var(--raise) transparent}
+#queue{max-height:206px}#ended{max-height:190px}#batch{max-height:190px}#log{max-height:122px}
 .side{gap:9px}
 #feed.nt .e.run,#feed.nt .e.out,#feed.nt .e.tool{display:none}
 h2 b{font-weight:500;display:flex;gap:14px;align-items:baseline}
@@ -1043,6 +1043,7 @@ h2 b{font-weight:500;display:flex;gap:14px;align-items:baseline}
   <div><h2>Up Next</h2><div id="queue"></div><div class="rz y" data-rz="qh" title="Drag to resize. Double-click to reset."></div></div>
   <div><h2>Problems</h2><div id="problems"></div></div>
   <div><h2>Last Results</h2><div id="ended"></div><div class="rz y" data-rz="eh" title="Drag to resize. Double-click to reset."></div></div>
+  <div><h2>Merge-Flow Batch<span id="btc"></span></h2><div id="batch"><div class="dim">Reading…</div></div><div class="rz y" data-rz="bh" title="Drag to resize. Double-click to reset."></div></div>
   <div><h2>Chain Log</h2><pre id="log"></pre><div class="rz y" data-rz="lh" title="Drag to resize. Double-click to reset."></div></div>
  </div>
 </div>
@@ -1070,24 +1071,38 @@ function nodeStates(s){const c=s.current,st=Array(N).fill('pending'),sub=Array(N
 let feedKey='',curPr=0,prRows=null,isRows=null;
 const low=s=>String(s||'').toLowerCase().replace(/_/g,' ');
 const ago=t=>{const s=(Date.now()-new Date(t))/1e3;return s<3600?Math.max(1,Math.round(s/60))+'m':s<86400?Math.round(s/3600)+'h':Math.round(s/86400)+'d'};
-const vcls=v=>/PASS|APPROVED|^READY|SUCCESS|MERGED|CLEAN/.test(v)?'ok':/FAIL|CHANGES|NOT READY|ERROR|DIRTY|CONFLICT/.test(v)?'bad':/HUMAN|POLICY|BEHIND|BLOCKED|TIMEOUT|UNSTABLE|REVIEW_REQUIRED|DRAFT/.test(v)?'warn':'dim';
+const vcls=v=>/PASS|APPROVED|^READY|BATCH-READY|SUCCESS|MERGED|CLEAN/.test(v)?'ok':/FAIL|CHANGES|NOT READY|ERROR|DIRTY|CONFLICT/.test(v)?'bad':/HUMAN|POLICY|BEHIND|BLOCKED|TIMEOUT|UNSTABLE|REVIEW_REQUIRED|DRAFT/.test(v)?'warn':'dim';
 const tk=n=>n>=1e6?(n/1e6).toFixed(2)+'M':n>=1e3?Math.round(n/1e3)+'k':String(n||0);
 const us=n=>n?' · ~$'+(n>=100?Math.round(n):n>=0.01?n.toFixed(2):'0.01'):'';
 const w=(t,c)=>`<span class="${c||''}">${esc(t)}</span>`;
 function prBits(p){const b=[];
- if(p.n===curPr||p.chain==='running')b.push(w('in the chain now','ok'));else if(p.chain)b.push(w(low(p.chain),vcls(String(p.chain).toUpperCase())));
+ if(p.n===curPr||p.chain==='running')b.push(w('in the chain now','ok'));else if(p.batch)b.push(w('in batch #'+p.batch,'ok'));else if(p.chain)b.push(w(low(p.chain),vcls(String(p.chain).toUpperCase())));
  if(p.fail)b.push(w(p.fail+' failing','bad'));else if(p.wait)b.push(w('checks running'));
  if(p.merge==='DIRTY')b.push(w('conflict','bad'));else if(p.merge==='BEHIND')b.push(w('behind main','warn'));
  if(p.draft)b.push(w('draft'));else if(!b.length)b.push(p.review==='APPROVED'?w('approved','ok'):p.ok?w('checks green'):w('no checks'));
  return b.join(' · ')}
-function paintPrs(){if(!prRows)return;const r=prRows,f=r.filter(p=>p.fail).length,h=r.filter(p=>/AWAIT-HUMAN|POLICY-HOLD|NEEDS-PERSON|STUCK/.test(String(p.chain).toUpperCase())).length,d=r.filter(p=>p.draft).length;
- $('prc').innerHTML=[r.length+' open',f?w(f+' failing checks','bad'):'',h?w(h+' need you','warn'):'',d?d+' drafts':''].filter(Boolean).join(' · ');
+function paintPrs(){if(!prRows)return;const r=prRows,f=r.filter(p=>p.fail).length,h=r.filter(p=>/AWAIT-HUMAN|POLICY-HOLD|NEEDS-PERSON|STUCK/.test(String(p.chain).toUpperCase())).length,bt=r.filter(p=>String(p.chain).toUpperCase()==='BATCH-READY').length,d=r.filter(p=>p.draft).length;
+ $('prc').innerHTML=[r.length+' open',f?w(f+' failing checks','bad'):'',h?w(h+' need you','warn'):'',bt?w(bt+' batch-ready','ok'):'',d?d+' drafts':''].filter(Boolean).join(' · ');
  $('prl').innerHTML=r.length?r.map(p=>`<a class="lr${p.n===curPr?' now':''}" href="/prs#${p.n}" title="${esc(p.title)}"><span class="k">#${p.n}</span><span class="t">${esc(p.title)}</span><span class="s">${prBits(p)}${p.tok?' · '+tk(p.tok)+us(p.usd):''}</span><span class="a">${ago(p.at)}</span></a>`).join(''):'<div class="dim">No open pull requests.</div>'}
 function isBits(i){if(i.chain==='building')return w('in the chain now','ok');if(i.prs&&i.prs.length)return i.prs.map(q=>w('PR #'+q.n)+(q.chain?' '+w(low(q.chain),vcls(String(q.chain).toUpperCase())):'')).join(' · ');
  const l=i.labels.filter(x=>!/triage/.test(x)).slice(0,2).join(', ');return w(l||'no labels')}
 function paintIs(){if(!isRows)return;const r=isRows,b=r.filter(i=>i.labels.includes('bug')).length,n=r.filter(i=>!(i.prs&&i.prs.length)).length,top=[...r.filter(i=>i.chain==='building'),...r.filter(i=>i.chain!=='building')].slice(0,40);
  $('isc').innerHTML=[r.length+' open',b?b+' bugs':'',n?n+' without a pull request':''].filter(Boolean).join(' · ');
  $('isl').innerHTML=r.length?top.map(i=>`<a class="lr" href="/issues#${i.n}" title="${esc(i.title)}"><span class="k">#${i.n}</span><span class="t">${esc(i.title)}</span><span class="s">${isBits(i)}${i.tok?' · '+tk(i.tok)+us(i.usd):''}</span><span class="a">${ago(i.at)}</span></a>`).join('')+(r.length>top.length?`<a class="more" href="/issues">All ${r.length} Open Issues</a>`:''):'<div class="dim">No open issues.</div>'}
+let batchS=null;
+const plink=ns=>[].concat(ns??[]).map(n=>`<a href="/prs#${esc(n)}">#${esc(n)}</a>`).join(' ');
+function paintBatch(){if(!batchS)return;const o=batchS.open,rd=batchS.ready||[],rc=batchS.recent||[];
+ $('btc').textContent=o?'#'+o.pr+' open':rd.length+' batch-ready';
+ let h;
+ if(o){const q=[].concat(o.queue??[]).filter(g=>[].concat(g).length),when=o.opened&&!isNaN(Date.parse(o.opened))?' · opened '+ago(o.opened)+' ago':'';
+  h=`<table><tr><td class="k"><a href="${esc(o.url||'#')}" target="_blank" rel="noopener">#${esc(o.pr)}</a></td><td class="f k" colspan="2">${esc(o.branch||'')}${when}</td></tr>`
+   +Object.entries(o.heads||{}).map(([n,sha])=>`<tr><td class="k"><a href="/prs#${esc(n)}">#${esc(n)}</a></td><td class="f k">${esc(String(sha).slice(0,8))}</td><td></td></tr>`).join('')
+   +(q.length?`<tr><td class="d">queue</td><td class="k" colspan="2">${q.map(g=>plink(g)).join(' · ')}</td></tr>`:'')
+   +([].concat(o.held??[]).length?`<tr><td class="d">held</td><td class="k" colspan="2">${plink(o.held)}</td></tr>`:'')+'</table>'}
+ else h=`<div class="dim">No batch open · ${rd.length} batch-ready${rd.length?': '+plink(rd):''}</div>`;
+ h+=rc.length?'<table>'+rc.map(r=>{const why=[r.why,r.result].filter(Boolean).join(' · ');return `<tr><td class="f k">${esc(String(r.ts||'').slice(5,16).replace('T',' '))}</td><td class="k">${esc(r.stage)}</td><td class="k">${r.batch?plink([r.batch]):''}</td><td class="k">${plink(r.prs)}</td><td><div class="why" title="${esc(why)}">${esc(why)}</div></td></tr>`}).join('')+'</table>':'<div class="dim">No batch rows yet.</div>';
+ $('batch').innerHTML=h}
+async function batchTick(){try{batchS=await (await fetch('/api/batch')).json();paintBatch()}catch(e){}}
 async function lists(){const get=async u=>{try{const d=await (await fetch(u)).json();return d.error?null:d}catch(e){return null}};
  const [a,b]=await Promise.all([get('/api/prs?state=open'),get('/api/issues?state=open')]);
  if(a){prRows=a.prs;paintPrs()}else if(!prRows)$('prl').innerHTML='<div class="dim">GitHub did not answer. Trying again in a minute.</div>';
@@ -1125,7 +1140,7 @@ const root=document.documentElement,side=document.querySelector('.side'),grid=do
 const box=id=>({get:()=>$(id).offsetHeight,min:40,max:()=>1400,set:v=>{$(id).style.height=v==null?'':v+'px';$(id).style.maxHeight=v==null?'':'none'}});
 const RZ={sh:{get:()=>stage.offsetHeight,min:110,max:()=>innerHeight*.6,set:v=>v==null?root.style.removeProperty('--sh'):root.style.setProperty('--sh',v+'px')},
  sw:{x:1,get:()=>side.offsetWidth,min:240,max:()=>grid.offsetWidth-340,set:v=>v==null?root.style.removeProperty('--gc'):root.style.setProperty('--gc',`minmax(0,1fr) 26px ${v}px`)},
- qh:box('queue'),ph:box('prl'),ih:box('isl'),eh:box('ended'),lh:box('log'),
+ qh:box('queue'),ph:box('prl'),ih:box('isl'),eh:box('ended'),bh:box('batch'),lh:box('log'),
  fh:{get:()=>$('feed').offsetHeight,min:120,max:()=>2400,set:v=>{const f=$('feed').style;f.height=v==null?'':v+'px';f.flex=v==null?'':'none';f.minHeight=v==null?'':'0';f.maxHeight=v==null?'':'none'}}};
 const tg=$('tg');let noTools=false;try{noTools=localStorage.getItem('board.tools')==='0'}catch(e){}
 const paintTg=()=>{$('feed').classList.toggle('nt',noTools);tg.textContent=noTools?'Show Tools':'Hide Tools'};paintTg();
@@ -1138,7 +1153,7 @@ document.querySelectorAll('.rz').forEach(h=>{const k=h.dataset.rz,r=RZ[k];let a=
  h.addEventListener('pointermove',e=>{if(!a)return;const d=(r.x?e.clientX:e.clientY)-a.p,v=Math.round(Math.max(r.min,Math.min(r.max(),a.v+(r.x?-d:d))));sizes[k]=v;r.set(v)});
  const end=()=>{if(a){a=null;h.classList.remove('on');keep()}};h.addEventListener('pointerup',end);h.addEventListener('pointercancel',end);
  h.addEventListener('dblclick',()=>{delete sizes[k];r.set(null);keep()})});
-tick();setInterval(tick,3000);lists();setInterval(lists,60000);
+tick();setInterval(tick,3000);lists();setInterval(lists,60000);batchTick();setInterval(batchTick,10000);
 
 let THREE;try{THREE=await import('three')}catch(e){stage.classList.add('flat')}
 if(THREE){
@@ -1384,10 +1399,65 @@ def pr_list(which, fresh=False):
                         state=r["state"], merge=r.get("mergeStateStatus") or "", review=r.get("reviewDecision") or "",
                         labels=[x["name"] for x in r.get("labels") or []], at=r.get("mergedAt") or r.get("closedAt") or r["updatedAt"],
                         add=r["additions"], rem=r["deletions"], files=r["changedFiles"], ok=c["ok"], fail=c["fail"], wait=c["wait"],
-                        chain=st.get("status", ""), ui=pick.get(n, {}).get("ui"), owner=pick.get(n, {}).get("owner", ""), tok=ptok.get(n, 0),
+                        chain=st.get("status", ""), batch=st.get("batch"), ui=pick.get(n, {}).get("ui"), owner=pick.get(n, {}).get("owner", ""), tok=ptok.get(n, 0),
                         usd=usd_maps()[0].get(n, 0)))
     out.sort(key=lambda x: x["at"], reverse=True)
     return dict(state=which, prs=out, age=int(time.time() - gh_cache["list:" + which][0]))
+
+
+# --- merge-flow batch: <work>/batch.json (the open batch PR), the BATCH-READY statuses, and the batch-* ledger rows (they carry no pr) ---
+batch_cache = {"key": None, "recent": []}
+
+
+def batch_open():
+    """batch.json as the open batch. None when the file is missing, does not parse, or says "pr": null (no batch is open)."""
+    try:
+        b = json.loads((WORK / "batch.json").read_text())
+    except (OSError, ValueError):
+        return None
+    return b if isinstance(b, dict) and b.get("pr") is not None else None
+
+
+def batch_ready():
+    """PR numbers whose STATE.json status is BATCH-READY: approved at the audited head, waiting for a batch."""
+    out = []
+    for d in (WORK / "prs").glob("*"):
+        if d.name.isdigit():
+            try:
+                st = json.loads((d / "STATE.json").read_text())
+            except (OSError, ValueError):
+                continue
+            if isinstance(st, dict) and st.get("status") == "BATCH-READY":
+                out.append(int(d.name))
+    return sorted(out)
+
+
+def batch_recent(n=10):
+    """The last n ledger rows whose stage starts with batch-, newest first. Rebuilt only when the ledger changes."""
+    f = WORK / "ledger.jsonl"
+    try:
+        st = f.stat()
+        key = (st.st_mtime_ns, st.st_size)
+        if batch_cache["key"] != key:
+            rows = []
+            for ln in f.read_text(errors="replace").splitlines():
+                if "batch-" not in ln:  # cheap test first: most ledger lines are not batch rows
+                    continue
+                try:
+                    r = json.loads(ln)
+                except ValueError:
+                    continue
+                if isinstance(r, dict) and str(r.get("stage", "")).startswith("batch-"):
+                    rows.append(r)
+            batch_cache.update(key=key, recent=rows[-n:][::-1])
+    except OSError:
+        return []
+    return batch_cache["recent"]
+
+
+def batch_view():
+    """GET /api/batch: the open batch (or null), the BATCH-READY PR numbers, and the last 10 batch ledger rows, newest first."""
+    return dict(open=batch_open(), ready=batch_ready(), recent=batch_recent())
 
 
 def note(who, at, kind, body, url="", extra=""):
@@ -1763,6 +1833,12 @@ class H(BaseHTTPRequestHandler):
                 data = spend_table()
             except Exception as e:
                 data = {"error": str(e)[:300]}
+            body, ctype = json.dumps(data).encode(), "application/json"
+        elif self.path.split("?")[0].rstrip("/") == "/api/batch":  # the merge-flow batch: open batch, BATCH-READY PRs, batch ledger rows
+            try:
+                data = batch_view()
+            except Exception:  # missing or broken files read as empty, never as a 500
+                data = dict(open=None, ready=[], recent=[])
             body, ctype = json.dumps(data).encode(), "application/json"
         elif self.path.split("?")[0].rstrip("/") == "/api/flow":  # the chain's program (pr-chain/flow.json); the wiki draws it
             try:

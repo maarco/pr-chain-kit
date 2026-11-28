@@ -616,7 +616,12 @@ def wait_ci(ctx, args):
 
 def land(ctx, args):
     pc, pr, tries = ctx.pc, ctx.pr, ctx.counts["land_laps"]
-    r = pc.land(pr, ctx.head, ctx.reviewer)
+    batch = pc.CFG.land_mode == "batch"
+    r = pc.land(pr, ctx.head, ctx.reviewer, approve_only=True) if batch else pc.land(pr, ctx.head, ctx.reviewer)
+    if r == "APPROVED":
+        pc.set_state(pr, gate_head=ctx.head, reviewer=ctx.reviewer)
+        ctx.why = f"approved at {ctx.head[:8]}; waits for a merge-flow batch"
+        return "batch_ready"
     if r.startswith("LAND-FAILED") and re.search(r"is (BEHIND|DIRTY)|not up to date with the base branch", r) and tries < pc.DRIFT_TRIES:
         pc.log(f"#{pr} main moved while CI ran (try {tries} of {pc.DRIFT_TRIES}): folding main in again")
         pc.ledger(pr=pr, stage="drift", where="land", head=ctx.head)

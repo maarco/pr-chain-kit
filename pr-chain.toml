@@ -49,6 +49,13 @@ blocked = ["wontfix", "duplicate", "invalid", "question", "status/blocked", "sta
 forbidden = ["CHANGELOG.md"]
 fragment_dir = "changes"
 
+# [land]
+# mode = "pr"                    # "pr": land each approved PR on its own (merging main in first). "batch": a chain ends
+#                                # BATCH-READY (approved, branch left alone) and `resume` lands ready PRs through one
+#                                # batch PR built on current main. Roll back with "pr".
+# max_base_age_hours = 48        # batch mode: a PR whose base (merge-base with main) is older than this takes main once
+# batch_branch_prefix = "merge-flow/batch"   # the batch PR's branch is <prefix>-<UTC yyyymmdd-HHMMSS>
+
 [ui]
 enabled = true                       # false: no UI vision review, no screenshots, no stack
 paths_regex = '(\.tsx$|\.css$|\.html$)'   # a diff touching these paths needs a UI review

@@ -118,7 +118,7 @@ function blocks(s){const out=[];let para=[],list=null;
   if(m=l.match(/^([A-Z][A-Za-z -]{1,22}): (.+)$/)){fp();out.push('<div class="kl"><span class="f">'+m[1]+'</span><span>'+m[2]+'</span></div>');return}
   if(/^(\u0000\d+\u0000)+$/.test(l)){fp();out.push(l);return}
   para.push(l)});fp();fl();return out.join('')}
-const vcls=v=>/PASS|APPROVED|^READY|SUCCESS|MERGED|CLEAN/.test(v)?'ok':/FAIL|CHANGES|NOT READY|ERROR|DIRTY|CONFLICT/.test(v)?'bad':/HUMAN|BEHIND|BLOCKED|TIMEOUT|UNSTABLE|REVIEW_REQUIRED|DRAFT/.test(v)?'warn':'dim';
+const vcls=v=>/PASS|APPROVED|^READY|BATCH-READY|SUCCESS|MERGED|CLEAN/.test(v)?'ok':/FAIL|CHANGES|NOT READY|ERROR|DIRTY|CONFLICT/.test(v)?'bad':/HUMAN|BEHIND|BLOCKED|TIMEOUT|UNSTABLE|REVIEW_REQUIRED|DRAFT/.test(v)?'warn':'dim';
 function ck(p){return p.fail?`<span class="bad">${p.fail} failing</span>`:p.wait?`<span class="warn">${p.wait} running</span>`:p.ok?`<span class="ok">checks pass</span>`:'no checks'}
 function listHtml(){const q=$('q').value.trim().toLowerCase(),rows=prs.filter(p=>(!q||('#'+p.n+' '+p.title+' '+p.branch+' '+p.author+' '+p.chain).toLowerCase().includes(q))&&(!P.flt.human||/human/i.test(p.chain||''))&&(!P.flt.fail||p.fail)&&(!P.flt.ui||p.ui));
  if(P.sort==='number')rows.sort((a,b)=>b.n-a.n);else if(P.sort==='size')rows.sort((a,b)=>b.add+b.rem-a.add-a.rem);

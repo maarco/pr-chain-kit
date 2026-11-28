@@ -85,6 +85,44 @@ and accounts you are fine handing to an agent.
 
 ![The loop page: every stage, its model and its prompt, editable in place](https://raw.githubusercontent.com/maarco/pr-chain-kit/main/docs/images/loop-wiki.png)
 
+## Batch landing
+
+For repos that require "branch up to date" and dismiss approvals on push: landing PRs one by one makes the chain merge
+main into every waiting PR each time main moves, which drops its approval and reruns its CI. With `[land] mode = "batch"`
+an approved PR's branch is left alone:
+
+1. A chain ends `BATCH-READY`: the status and the approval are posted at the audited head; nothing is merged.
+2. `resume` plans the ready PRs on current main (`chain/merge_flow.py`, `git merge-tree` only) and opens one batch PR.
+   GitHub marks each PR in it merged when the batch PR merges.
+3. Green checks (`SKIPPED` and `NEUTRAL` pass): the batch commit is verified to be exactly the approved heads on main,
+   then approved and merged, unless a PR in it has a required check that is not green: then the batch is closed and that
+   PR runs its chain. A batch that fails that verification, whose checks do not finish in `ci_wait_max_minutes`, or that
+   fails to land twice, is closed too.
+4. Main moves or a PR gets a new push: the batch PR is closed and planned again. A pushed PR runs its chain again. A
+   batch PR closed by someone else is planned again on the next lap. That close, like the three at the end of step 3,
+   is a strike for each waiting PR's head; a second strike at the same head rests the PR instead of planning it again.
+5. Red checks: the PRs are split in half and each half gets its own batch; a single red PR goes to a fixer, and rests
+   when the same head is red a second time.
+6. A PR that clashes with main, or whose base is older than the limit, takes main through the chain. A PR that clashes
+   only with another ready PR (or is stacked on another branch) waits; `batch.json` in the work folder lists it as held.
+
+While a PR waits, `<work>/exclude.txt` keeps it out of batches (it stays `BATCH-READY`). A hold or blocking label, a
+removed human-approval label, a draft or a withdrawn review ends it `NEEDS-PERSON`. Either one closes an open batch
+that holds the PR. A batch PR turned into a draft is left alone until it is ready again.
+
+Known limit: if main moves faster than one batch's CI takes, batches keep restarting and none lands.
+
+| `[land]` key | Default | Meaning |
+| --- | --- | --- |
+| `mode` | `"pr"` | `"pr"` lands each PR on its own; `"batch"` lands them together |
+| `max_base_age_hours` | `48` | a PR whose merge-base with main is older than this takes main once |
+| `batch_branch_prefix` | `"merge-flow/batch"` | the batch branch is `<prefix>-<UTC yyyymmdd-HHMMSS>` |
+
+The account that opens the batch PR (your default `gh` login) must differ from its approver
+(`[accounts] approver_of`, else `merger`).
+
+Roll back with `mode = "pr"`: `resume` then lands every `BATCH-READY` PR on its own. Close an open batch PR by hand first.
+
 ## Layout
 
 ```
