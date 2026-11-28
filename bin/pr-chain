@@ -340,16 +340,23 @@ def chain_pushed(head):
         return False
 
 
+def exclusion(n, branch):
+    """Why exclude.txt keeps PR n (head branch `branch`) out, or None."""
+    if n in excluded():
+        return "excluded: " + excluded()[n]
+    for prefix, why in excluded_branches().items():
+        if branch.startswith(prefix):
+            return f"excluded: branch {prefix}*: {why}"
+    return None
+
+
 def owner_reason(p, ps_text):
     """Why the PR is not free to take, or None. Heuristic: a running agent, a live claim, a fresh push, an unfinished lane."""
     n = p["number"]
     if p["author"]["login"] not in OUR_AUTHORS:
         return "not ours: outside contributor PR, the chain never touches it"
-    if n in excluded():
-        return "excluded: " + excluded()[n]
-    for prefix, why in excluded_branches().items():
-        if p.get("headRefName", "").startswith(prefix):
-            return f"excluded: branch {prefix}*: {why}"
+    if why := exclusion(n, p.get("headRefName", "")):
+        return why
     claim = CLAIMS / str(n)
     if claim.exists():
         pid = (claim / "pid").read_text().strip() if (claim / "pid").exists() else ""
@@ -785,7 +792,7 @@ def needs_main(head, main):
 def pr_info(pr):
     return gh_json("pr", "view", str(pr), "-R", REPO, "--json",
                    "number,state,title,body,isDraft,headRefName,headRefOid,mergeStateStatus,author,isCrossRepository,"
-                   "closingIssuesReferences,files,baseRefName,reviewDecision")
+                   "closingIssuesReferences,files,baseRefName,reviewDecision,labels")
 
 
 def live_head(pr):
@@ -1298,7 +1305,11 @@ def fix(pr, rnd, model, verdict_path, head, last_head, done_in=None, prompt="fix
         (d / "issues.md").write_text(issues_text(info))
         main = fetch(info)
         state = "main is already merged in; nothing to resolve."
-        if not contains_main(head, main):
+        # a batch-red seed must reproduce the combined batch; otherwise a clean, recent head stays as reviewed (batch mode)
+        take = not contains_main(head, main) and (needs_main(head, main) or verdict_path.name.startswith("batch-red-"))
+        if not take and not contains_main(head, main):
+            state = "origin/main was not merged in: the branch merges cleanly with it. Do not merge it."
+        if take:
             m = sh("git", "-C", str(wt), "merge", "--no-edit", "origin/main")
             if m.returncode:
                 files = sh("git", "-C", str(wt), "diff", "--name-only", "--diff-filter=U").stdout.split()
@@ -3028,10 +3039,11 @@ def batch_ready():
 
 
 def batch_save(b):
+    """pending: the intent to open a batch PR. fix: seeded fixer runs a red batch of one still owes."""
     if DRY:
         return
-    if not b.get("pr"):
-        b = dict(pr=None, queue=b.get("queue") or [], held=b.get("held") or [])
+    if not b.get("pr") and not b.get("pending"):
+        b = dict(pr=None, queue=b.get("queue") or [], held=b.get("held") or [], **({"fix": b["fix"]} if b.get("fix") else {}))
     write_json_atomic(BATCH, b, indent=1)
 
 
@@ -3040,9 +3052,58 @@ def batch_clear(b):
     for n in b.get("heads") or {}:
         if not DRY:
             set_state(int(n), batch=None)
-    after = dict(pr=None, queue=b.get("queue") or [], held=b.get("held") or [])
+    after = dict(pr=None, queue=b.get("queue") or [], held=b.get("held") or [], **({"fix": b["fix"]} if b.get("fix") else {}))
     batch_save(after)
     return after
+
+
+def batch_settle_red(b):
+    """The batch PR is closed: what its red checks decided (split halves, or one PR for a fixer) takes effect."""
+    red = b.get("red") or {}
+    b = {k: v for k, v in b.items() if k != "red"}
+    if "queue" in red:
+        b["queue"] = red["queue"]
+    if "fix" in red:
+        b["fix"] = (b.get("fix") or []) + [red["fix"]]
+    return batch_clear(b)
+
+
+def batch_forget_fix(n):
+    b = json.loads(BATCH.read_text())
+    batch_save(dict(b, fix=[f for f in b.get("fix") or [] if f["pr"] != n]))
+
+
+def batch_recover(b):
+    """A lap died between saving the intent and saving the opened batch. Adopt the open PR of that branch when it holds
+    the planned commit, close it otherwise; with none, drop the intent. Returns the state; still pending = try again."""
+    found = gh_json("pr", "list", "-R", REPO, "--head", b["branch"], "--state", "open", "--json", "number,url,headRefOid")
+    mine = next((p for p in found if p["headRefOid"] == b["commit"]), None)
+    if DRY:
+        log(f"[dry] would {'adopt batch #%s' % mine['number'] if mine else 'drop the unfinished batch ' + b['branch']}")
+        return b
+    keep = {"fix": b["fix"]} if b.get("fix") else {}
+    if mine:
+        opened = dict(pr=mine["number"], url=mine["url"], branch=b["branch"], base=b["base"], commit=b["commit"],
+                      heads=b["heads"], opened=b["opened"], queue=b.get("queue") or [], held=b.get("held") or [], **keep)
+        batch_opened(opened)
+        return opened
+    for p in found:
+        if not batch_close(dict(b, pr=p["number"]), "Closed: it does not hold the planned commit; planning again."):
+            return b
+    sh("git", "-C", str(CHECKOUT), "push", "-q", "origin", f":refs/heads/{b['branch']}")  # may be gone or never pushed
+    after = dict(pr=None, queue=b.get("requeue") or [], held=b.get("held") or [], **keep)
+    batch_save(after)
+    return after
+
+
+def batch_opened(b):
+    """Record an open batch PR: batch.json, each member's STATE, the ledger."""
+    batch_save(b)
+    prs = sorted(int(n) for n in b["heads"])
+    for n in prs:
+        set_state(n, batch=b["pr"])
+    ledger(stage="batch-open", batch=b["pr"], prs=prs, base=b["base"], commit=b["commit"])
+    log(f"batch #{b['pr']} opened for {', '.join(f'#{n}' for n in prs)}")
 
 
 def batch_close(b, why):
@@ -3059,9 +3120,9 @@ def batch_close(b, why):
     return True
 
 
-def batch_landed(b, live, rows):
-    """The batch PR merged: a PR whose approved head is on main is finished. One pushed to since, or one whose approved
-    head is not on main, is not: it stays BATCH-READY for the next lap."""
+def batch_landed(b, rows):
+    """The batch PR merged: a PR whose approved head is on main is finished. One still open at another head (read now,
+    after the merge), or one whose approved head is not on main, is not: it stays BATCH-READY for the next lap."""
     prs = sorted(int(n) for n in b["heads"])
     if DRY:
         log(f"[dry] batch #{b['pr']} is merged: {', '.join(f'#{n}' for n in prs)} would end MERGED")
@@ -3071,7 +3132,11 @@ def batch_landed(b, live, rows):
     ready = batch_ready()
     for n in prs:
         head = b["heads"][str(n)]
-        if n not in ready or live.get(n, head) != head:
+        if n not in ready:
+            continue
+        info = pr_info(n)
+        if info["state"] == "OPEN" and branch_head(info) != head:
+            log(f"#{n} was pushed to while batch #{b['pr']} landed; #{n} stays BATCH-READY")
             continue
         if sh("git", "-C", str(CHECKOUT), "merge-base", "--is-ancestor", head, f"origin/{CFG.branch}").returncode:
             log(f"#{n} is not on {CFG.branch}: batch #{b['pr']} merged without {head[:8]}; #{n} stays BATCH-READY")
@@ -3081,22 +3146,28 @@ def batch_landed(b, live, rows):
     batch_clear(b)
 
 
-def batch_red(b, bad, rollup, live, chains):
-    """Red batch CI. Several PRs: close it and queue both halves. One PR: close it and hand that PR to a fixer."""
+def batch_red(b, bad, rollup, live):
+    """Red batch CI. Several PRs: close it and queue both halves. One PR: close it and hand that PR to a fixer. The
+    decision is saved before the PR closes, so a lap that dies in between still carries it out."""
     prs = sorted(int(n) for n in b["heads"])
     names = ", ".join(bad)
-    if not batch_close(b, f"Closed: required checks failed ({names})."):
-        return
+    why = f"Closed: required checks failed ({names})."
     if len(prs) > 1:
         half = (len(prs) + 1) // 2
         halves = [prs[:half], prs[half:]]
         log(f"{'[dry] would split' if DRY else 'splitting'} batch #{b['pr']}: {halves}")
-        if not DRY:
+        if DRY:
+            batch_close(b, why)
+            return
+        b = dict(b, red=dict(queue=halves + (b.get("queue") or [])))
+        batch_save(b)
+        if batch_close(b, why):
             ledger(stage="batch-split", batch=b["pr"], prs=prs, groups=halves, failed=bad)
-            batch_clear(dict(b, queue=halves + (b.get("queue") or [])))
+            batch_settle_red(b)
         return
     n = prs[0]
     if DRY:
+        batch_close(b, why)
         log(f"[dry] would hand #{n} to a fixer: it fails {names} with main merged in")
         return
     urls = sorted({u for c in rollup if (c.get("name") or c.get("context")) in bad
@@ -3106,22 +3177,32 @@ def batch_red(b, bad, rollup, live, chains):
     seed.write_text(f"FAIL\nhead {live[n]}\nFindings:\n- P1 batch-ci:0 - the batch PR #{b['pr']} (this PR merged with main at "
                     f"{b['base']}) failed {names} ({' '.join(urls) or 'no run URL'}) - merge main into this branch, reproduce the "
                     "failure and fix it red-first, or end BLOCKED with the evidence\n")
-    batch_clear(b)
-    chains.append((n, seed))
+    b = dict(b, red=dict(fix=dict(pr=n, seed=str(seed), head=live[n])))
+    batch_save(b)
+    if batch_close(b, why):
+        batch_settle_red(b)
 
 
-def batch_open_step(b, live, ready, rows, chains, stacked):
+def batch_open_step(b, live, ready, rows, chains, stacked, skip=None):
     """Look at the open batch PR. Returns the state left behind and whether this lap may plan a new batch."""
     num = b["pr"]
-    view = gh_json("pr", "view", str(num), "-R", REPO, "--json", "state,headRefOid,baseRefName,statusCheckRollup")
+    view = gh_json("pr", "view", str(num), "-R", REPO, "--json", "state,isDraft,headRefOid,baseRefName,statusCheckRollup")
     if view["state"] == "MERGED":
-        batch_landed(b, live, rows)
+        batch_landed(b, rows)
         return b, False
     if view["state"] != "OPEN":
         if not DRY:
             ledger(stage="batch-close", batch=num, prs=sorted(int(n) for n in b["heads"]), why=f"found {view['state']}")
-            return batch_clear(b), True
+            return batch_settle_red(b), True
         return dict(b, pr=None), True
+    if view.get("isDraft"):  # a person holds it: no ready, no merge, no close, no second batch
+        if not b.get("draft"):
+            log(f"{'[dry] ' if DRY else ''}batch #{num} is a draft: a person is holding it; left as it is")
+            b = dict(b, draft=True)
+            batch_save(b)
+        return b, False
+    if b.pop("draft", None):
+        batch_save(b)
     sh("git", "-C", str(CHECKOUT), "fetch", "-q", "origin", CFG.branch, check=True)
     main = sh("git", "-C", str(CHECKOUT), "rev-parse", f"origin/{CFG.branch}", check=True).stdout.strip()
     moved = [int(n) for n, sha in b["heads"].items() if live.get(int(n)) != sha or ready[int(n)].get("gate_head") != sha]
@@ -3140,7 +3221,7 @@ def batch_open_step(b, live, ready, rows, chains, stacked):
     res = kit.check_results(rollup)
     bad = [c for c in kit.CHECKS if res.get(c) in BATCH_RED]
     if bad:
-        batch_red(b, bad, rollup, live, chains)
+        batch_red(b, bad, rollup, live)
         return b, False
     if any(res.get(c) != "SUCCESS" for c in kit.CHECKS):
         log(f"{'[dry] ' if DRY else ''}batch #{num}: waiting for its checks")
@@ -3153,13 +3234,25 @@ def batch_open_step(b, live, ready, rows, chains, stacked):
         if not DRY:  # left open and unmerged: main moving or a new push closes it
             ledger(stage="batch-land", batch=num, prs=sorted(heads), problems=problems)
         return b, False
+    red = []  # the batch's checks do not speak for a member whose own required check turned red since its approval
+    for n in sorted(heads):
+        res = kit.check_results(gh_json("pr", "view", str(n), "-R", REPO, "--json", "statusCheckRollup")["statusCheckRollup"] or [])
+        if any(res.get(c) in BATCH_RED for c in kit.CHECKS):
+            red.append(n)
+    if red:
+        if not batch_close(b, f"Closed: required checks of {', '.join(f'#{n}' for n in red)} failed; planning again."):
+            return b, False
+        chains += [(n, None) for n in red]
+        if skip is not None:
+            skip.update(red)
+        return (dict(b, pr=None) if DRY else batch_clear(b)), True
     reviewers = "; ".join(f"#{n}: {ready[n].get('reviewer') or 'reviewed'}" for n in sorted(heads))
     if DRY:
         log(f"[dry] would land batch #{num} at {b['commit'][:8]} ({reviewers})")
         return b, False
     r = land(num, b["commit"], f"merge-flow batch of {reviewers}")
     if r.startswith("MERGED") and pr_state(num) == "MERGED":
-        batch_landed(b, live, rows)
+        batch_landed(b, rows)
     elif r.startswith("LAND-FAILED") and re.search(r"is (BEHIND|DIRTY)|not up to date with the base branch", r):
         if batch_close(b, f"Closed: {CFG.branch} moved while the batch landed; planning again."):
             batch_clear(b)
@@ -3171,15 +3264,18 @@ def batch_open_step(b, live, ready, rows, chains, stacked):
 
 def batch_plan(b, live, ready, skip, stacked, rows, chains):
     """No batch open: plan the ready PRs (or the next queued group) on current main and open one batch PR."""
-    cands = {n: live[n] for n in ready if n in live and n not in skip and live[n] == ready[n].get("gate_head")}
-    queue = list(b.get("queue") or [])
+    keep = {"fix": b["fix"]} if b.get("fix") else {}
+    owed = {f["pr"] for f in b.get("fix") or []}  # a fixer takes these first
+    cands = {n: live[n] for n in ready if n in live and n not in skip | owed and live[n] == ready[n].get("gate_head")}
+    requeue = list(b.get("queue") or [])
+    queue = list(requeue)
     while queue:  # a split red batch is landed half by half
         group = {n: cands[n] for n in queue.pop(0) if n in cands}
         if group:
             cands = group
             break
     if not cands:
-        batch_save(dict(pr=None, queue=queue, held=[]))
+        batch_save(dict(pr=None, queue=queue, held=[], **keep))
         return
     order = [r["number"] for r in rank([p for p in list_prs() if p["number"] in cands])]
     order += [n for n in cands if n not in order]
@@ -3192,6 +3288,8 @@ def batch_plan(b, live, ready, skip, stacked, rows, chains):
         sha = cands[n]
         if n in stacked:
             continue
+        if len(heads) == 20:  # ponytail: cap 20 per batch; raise if planning time allows
+            break
         on_main = sh("git", "-C", str(CHECKOUT), "merge-base", "--is-ancestor", sha, main).returncode == 0
         if not on_main and needs_main(sha, main):  # clashes with main, or too old: the chain takes main in
             refresh.append(n)
@@ -3208,7 +3306,7 @@ def batch_plan(b, live, ready, skip, stacked, rows, chains):
         for n in result["already_on_base"]:
             rows.append((n, die(n, "MERGED", f"its head is already on {CFG.branch}")))
     chains += [(n, None) for n in refresh]
-    opened = dict(pr=None, queue=queue, held=held)
+    opened = dict(pr=None, queue=queue, held=held, **keep)
     if landed and result["window_commit"]:
         commit = result["window_commit"]
         stamp = time.gmtime()
@@ -3221,6 +3319,10 @@ def batch_plan(b, live, ready, skip, stacked, rows, chains):
             return
         # merge_flow.open_window names its own branch, so push and open here with its body (PR table, linked issues)
         body = merge_flow.window_body(main, landed, merge_flow._linked_issues(REPO, landed))
+        intent = dict(pr=None, pending=True, branch=branch, base=main, commit=commit,
+                      heads={str(n): sha for n, sha in sorted(landed.items())},
+                      opened=time.strftime("%Y-%m-%dT%H:%M:%SZ", stamp), queue=queue, held=held, requeue=requeue, **keep)
+        batch_save(intent)  # on disk before GitHub hears of it: a lap that dies here finds its PR again (batch_recover)
         merge_flow.git(CHECKOUT, "push", "-q", "--no-follow-tags", "origin", f"{commit}:refs/heads/{branch}")
         try:
             url = merge_flow._gh("pr", "create", "--repo", REPO, "--base", CFG.branch, "--head", branch,
@@ -3229,22 +3331,31 @@ def batch_plan(b, live, ready, skip, stacked, rows, chains):
         except Exception as e:
             sh("git", "-C", str(CHECKOUT), "push", "-q", "origin", f":refs/heads/{branch}")  # no PR: no stray branch
             raise RuntimeError(f"could not open the batch PR: {str(e)[:200]}") from None
-        opened = dict(pr=num, url=url, branch=branch, base=main, commit=commit,
-                      heads={str(n): sha for n, sha in sorted(landed.items())},
-                      opened=time.strftime("%Y-%m-%dT%H:%M:%SZ", stamp), queue=queue, held=held)
-        batch_save(opened)
-        for n in landed:
-            set_state(n, batch=num)
-        ledger(stage="batch-open", batch=num, prs=sorted(landed), base=main, commit=commit)
-        log(f"batch #{num} opened for {', '.join(f'#{n}' for n in sorted(landed))}")
+        opened = dict(pr=num, url=url, branch=branch, base=main, commit=commit, heads=intent["heads"],
+                      opened=intent["opened"], queue=queue, held=held, **keep)
+        batch_opened(opened)
+        return
     batch_save(opened)
 
 
-def approval_withdrawn(info):
-    """Why a BATCH-READY PR's approval no longer stands on GitHub, or None: a draft, changes requested, or an approval
-    dismissed (review required again). An empty reviewDecision (no review required) withdraws nothing."""
+HOLD_LABELS = {"merge/hold", "hold", "do-not-merge", "status/blocked"}
+
+
+def held_label(info):
+    names = {lb["name"] for lb in info.get("labels") or []} & (HOLD_LABELS | BLOCK_LABELS)
+    return "label " + ", ".join(sorted(names)) if names else None
+
+
+def approval_withdrawn(info, st=None):
+    """Why a BATCH-READY PR's approval no longer stands on GitHub, or None: a draft, a hold or blocking label, the human
+    label gone from a PR that passed the human gate (STATE gate_at), changes requested, or an approval dismissed (review
+    required again). An empty reviewDecision (no review required) withdraws nothing."""
     if info.get("isDraft"):
         return "draft"
+    if held_label(info):
+        return held_label(info)
+    if (st or {}).get("gate_at") and HUMAN_LABEL not in {lb["name"] for lb in info.get("labels") or []}:
+        return f"the {HUMAN_LABEL} label was removed"
     return {"CHANGES_REQUESTED": "changes requested", "REVIEW_REQUIRED": "approval dismissed"}.get(info.get("reviewDecision") or "")
 
 
@@ -3254,7 +3365,7 @@ def batch_step(a):
     rows, chains = [], []
     try:
         b = json.loads(BATCH.read_text()) if BATCH.exists() else dict(pr=None, queue=[], held=[])
-        ready, live, skip, stacked = batch_ready(), {}, set(), set()
+        ready, live, skip, stacked, out = batch_ready(), {}, set(), set(), set()
         merged_batch = bool(b.get("pr")) and pr_state(b["pr"]) == "MERGED"
         for n in list(ready):
             in_batch = str(n) in (b.get("heads") or {})
@@ -3277,11 +3388,16 @@ def batch_step(a):
                 else:
                     rows.append((n, die(n, info["state"], f"PR is {info['state']}")))
                 del ready[n]
-            elif live[n] != ready[n].get("gate_head"):
+            elif (why := exclusion(n, info.get("headRefName", ""))):  # keeps its STATE; an open batch that holds it closes
+                log(f"{'[dry] ' if DRY else ''}#{n} {why}: it waits outside the batch")
+                del ready[n]
+                skip.add(n)
+                out.add(n)
+            elif live[n] != ready[n].get("gate_head") and not held_label(info):
                 log(f"{'[dry] ' if DRY else ''}#{n} has a new push since its approval: it leaves the batch flow")
                 chains.append((n, None))
                 skip.add(n)
-            elif (why := approval_withdrawn(info)):  # a person decides; an open batch that holds it closes as changed
+            elif (why := approval_withdrawn(info, ready[n])):  # a person decides; an open batch that holds it closes as changed
                 note = f"approval withdrawn after BATCH-READY: {why}; a person decides"
                 if DRY:
                     log(f"[dry] #{n} would end NEEDS-PERSON: {note}")
@@ -3289,14 +3405,24 @@ def batch_step(a):
                     rows.append((n, die(n, "NEEDS-PERSON", note)))
                 del ready[n]  # not planned; a batch member with no ready entry counts as changed (batch_open_step)
                 skip.add(n)  # DRY writes nothing, so batch_ready() still lists it after the open batch closes
-        plan_now = True
+        if b.get("pending"):
+            b = batch_recover(b)
+        plan_now = not b.get("pending")
         if b.get("pr"):
             for n in b["heads"]:  # a PR of the batch that stopped waiting (a manual run, closed) counts as changed
                 ready.setdefault(int(n), {})
-            b, plan_now = batch_open_step(b, live, ready, rows, chains, stacked)
+            b, plan_now = batch_open_step(b, live, ready, rows, chains, stacked, skip)
             ready = batch_ready()
         if plan_now:
             batch_plan(b, live, ready, skip, stacked, rows, chains)
+        saved = json.loads(BATCH.read_text()) if BATCH.exists() else {}
+        waiting = batch_ready()
+        for f in saved.get("fix") or []:  # kept in batch.json until its chain starts, so no lap loses it
+            n = f["pr"]
+            if n in waiting and n not in skip and live.get(n) == f["head"] == waiting[n].get("gate_head"):
+                chains.append((n, Path(f["seed"])))
+            elif n not in waiting or n in live and n not in out:  # left or moved; unreadable or excluded keeps its seed
+                batch_forget_fix(n)
     except (RuntimeError, ValueError, KeyError) as e:  # one bad lap ends no PR: the next one looks again
         log(f"batch step failed: {str(e)[:300]}")
         if not DRY:
@@ -3307,6 +3433,8 @@ def batch_step(a):
         if DRY:
             log(f"[dry] would run the chain for #{n}" + (" with the batch's failing checks" if seed else ""))
             continue
+        if seed:
+            batch_forget_fix(n)
         try:
             rows.append((n, run_chain(n, a, seed=seed) if seed else run_chain(n, a)))
         except RuntimeError as e:

@@ -100,6 +100,10 @@ an approved PR's branch is left alone:
 6. A PR that clashes with main, or whose base is older than the limit, takes main through the chain. A PR that clashes
    only with another ready PR (or is stacked on another branch) waits; `batch.json` in the work folder lists it as held.
 
+While a PR waits, `<work>/exclude.txt` keeps it out of batches (it stays `BATCH-READY`). A hold or blocking label, a
+removed human-approval label, a draft or a withdrawn review ends it `NEEDS-PERSON`. Either one closes an open batch
+that holds the PR. A batch PR turned into a draft is left alone until it is ready again.
+
 | `[land]` key | Default | Meaning |
 | --- | --- | --- |
 | `mode` | `"pr"` | `"pr"` lands each PR on its own; `"batch"` lands them together |
