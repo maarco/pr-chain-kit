@@ -710,7 +710,7 @@ with section("K: cap"):
     b = w.batch()
     check("K: one plan holds 20 PRs in rank order, the rest wait",
           (len(b["heads"]), b["held"], w.chains, st(21)["status"], st(22)["status"],
-           sorted(map(int, b["heads"])) == sorted([r["number"] for r in pc.rank(pc.list_prs())][:20])),
+           sorted(map(int, b["heads"])) == sorted([r["number"] for r in pc.rank([p for p in pc.list_prs() if p["number"] < 900])][:20])),
           (20, [], [], "BATCH-READY", "BATCH-READY", True))
 
 # ---------------------------------------------------------------- resume and doctor
