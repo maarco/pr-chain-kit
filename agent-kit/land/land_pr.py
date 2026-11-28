@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Approve, ready and merge one PR at an exact head. Stops on anything unexpected. Prints no tokens.
 
-Usage: land_pr.py <number> <full head sha> <approver account> <reviewed sha> <reviewer and verdict source>
+Usage: land_pr.py <number> <full head sha> <approver account> <reviewed sha> <reviewer and verdict source> [--approve-only]
+--approve-only (batch landing): the same checks without the BEHIND/DIRTY stop, then the status and the approval (none
+when the approver already approved this head), and exit 0 before marking ready or merging.
 WRITES to GitHub: a review/independent commit status, an approval (as the approver), ready-for-review and the merge
 (as KIT_MERGER); appends to $KIT_WORK/landings.jsonl.
 Refuses unless the reviewed sha IS the head. Appends PR, head, base, reviewer, the CI run links of the required
@@ -23,6 +25,7 @@ REPO = kit.REPO
 REQUIRED = set(kit.CHECKS)
 FIELDS = "state,isDraft,author,headRefOid,baseRefOid,mergeStateStatus,reviewDecision,statusCheckRollup,mergedBy,mergeCommit"
 LOG = kit.work("landings.jsonl")
+APPROVE_ONLY = "--approve-only" in sys.argv[6:]
 number, head, approver, reviewed, reviewer = sys.argv[1:6]
 if reviewed != head:
     sys.exit(f"STOP: reviewed {reviewed[:8]} is not the head {head[:8]}; the review must pin the exact head")
@@ -67,13 +70,19 @@ if missing:
 ci_runs = {c.get("name") or c.get("context"): c.get("detailsUrl") or c.get("targetUrl")
            for c in s["statusCheckRollup"] if (c.get("name") or c.get("context")) in REQUIRED}
 print(f"#{number} required checks green on {head[:8]}:", "; ".join(f"{k} {v}" for k, v in sorted(ci_runs.items())))
-if s["mergeStateStatus"] in ("BEHIND", "DIRTY"):
+if s["mergeStateStatus"] in ("BEHIND", "DIRTY") and not APPROVE_ONLY:
     sys.exit(f"STOP: #{number} is {s['mergeStateStatus']}")
 
 gh(approver, "api", "-X", "POST", f"repos/{REPO}/statuses/{head}", "-f", "state=success",
    "-f", "context=review/independent", "-f", "description=Independent review passed at this head")
-gh(approver, "pr", "review", number, "-R", REPO, "--approve", "--body", f"Reviewed at {head}")
-print("approved as", approver)
+approved = APPROVE_ONLY and f"{approver} {head}" in gh(
+    approver, "api", "--paginate", f"repos/{REPO}/pulls/{number}/reviews",
+    "--jq", '.[] | select(.state == "APPROVED") | "\\(.user.login) \\(.commit_id)"').splitlines()
+if not approved:
+    gh(approver, "pr", "review", number, "-R", REPO, "--approve", "--body", f"Reviewed at {head}")
+print("already approved by" if approved else "approved as", approver)
+if APPROVE_ONLY:
+    sys.exit(0)
 if s["isDraft"]:
     gh(kit.MERGER, "pr", "ready", number, "-R", REPO)
     print("marked ready")
